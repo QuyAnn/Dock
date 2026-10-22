@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use model::Stats;
 use ui::apps::{self, AppsState};
 use ui::control_center::{self, ControlState};
-use ui::dock::{self, RectF, Tile, TileView};
+use ui::dock::{self, RectF, Style, Tile, TileView};
 use ui::glass;
 use ui::popup;
 use ui::popup_content::{self, MediaAction as PopupMedia, PopupKind};
@@ -233,55 +233,69 @@ fn run() -> windows::core::Result<()> {
     Ok(())
 }
 
-/// Dock tiles in display order. The apps tile width follows the number of open windows.
-fn layout_tiles(app_count: usize) -> Vec<Tile> {
-    let apps_w = (16.0 + app_count as f32 * 40.0).max(72.0);
-    vec![
-        Tile { id: "clock", width: 150.0 },
-        Tile { id: "apps", width: apps_w },
-        Tile { id: "git", width: 130.0 },
-        Tile { id: "ai", width: 150.0 },
-        Tile { id: "weather", width: 150.0 },
-        Tile { id: "media", width: 200.0 },
-        Tile { id: "cpu", width: 110.0 },
-        Tile { id: "ram", width: 150.0 },
-        Tile { id: "vol", width: 110.0 },
-    ]
+/// Tiles per zone, in display order. Left: git, AI providers, media. Center: running apps.
+/// Right: Control Center, settings, CPU, RAM, clock. The apps width follows the open window count.
+struct Zones {
+    left: Vec<Tile>,
+    center: Vec<Tile>,
+    right: Vec<Tile>,
+}
+
+fn layout_tiles(app_count: usize) -> Zones {
+    let apps_w = (16.0 + app_count as f32 * 38.0).max(72.0);
+    let t = |id, width| Tile { id, width, height: 0.0 };
+    Zones {
+        left: vec![t("git", 110.0), t("claude", 110.0), t("codex", 110.0), t("media", 142.0)],
+        center: vec![Tile { id: "apps", width: apps_w, height: 44.0 }],
+        right: vec![t("cc", 60.0), t("gear", 22.0), t("cpu", 34.0), t("ram", 34.0), t("clock", 64.0)],
+    }
+}
+
+fn ai_view(data: &DataState, name: &str) -> TileView {
+    let value = match data.ai.iter().find(|a| a.name == name) {
+        Some(a) if !a.session_pct.is_nan() => format!("{:.0}%", a.session_pct),
+        Some(a) => a.reset_text.clone(),
+        None => "—".into(),
+    };
+    TileView { style: Style::Card, title: name.into(), value, sub: String::new(), icon: None }
 }
 
 fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) -> TileView {
     let now = Local::now();
+    let card = |title: &str, value: String| TileView {
+        style: Style::Card,
+        title: title.into(),
+        value,
+        sub: String::new(),
+        icon: None,
+    };
     match id {
-        "clock" => TileView {
-            title: now.format("%a %d/%m").to_string(),
-            value: now.format("%H:%M").to_string(),
-            progress: None,
-            icon: None,
-        },
         "git" => tiles::git_tile(data),
-        "ai" => tiles::ai_tile(data),
-        "weather" => tiles::weather_tile(data),
+        "claude" => ai_view(data, "Claude"),
+        "codex" => ai_view(data, "Codex"),
         "media" => tiles::media_tile(data),
+        "cc" => card("Control", format!("Vol {:.0}%", control.volume * 100.0)),
+        "gear" => TileView { style: Style::Bare, title: String::new(), value: "⚙".into(), sub: String::new(), icon: None },
         "cpu" => TileView {
-            title: "CPU".into(),
-            value: format!("{:.0}%", stats.cpu_pct),
-            progress: Some(stats.cpu_pct / 100.0),
+            style: Style::Ring,
+            title: String::new(),
+            value: format!("{:.0}", stats.cpu_pct),
+            sub: String::new(),
             icon: None,
         },
-        "ram" => TileView {
-            title: "RAM".into(),
-            value: format!("{} / {} MB", stats.ram_used_mb, stats.ram_total_mb),
-            progress: (stats.ram_total_mb > 0).then(|| stats.ram_used_mb as f32 / stats.ram_total_mb as f32),
+        "ram" => {
+            let pct = if stats.ram_total_mb > 0 { stats.ram_used_mb as f32 * 100.0 / stats.ram_total_mb as f32 } else { 0.0 };
+            TileView { style: Style::Ring, title: String::new(), value: format!("{pct:.0}"), sub: String::new(), icon: None }
+        }
+        "clock" => TileView {
+            style: Style::Clock,
+            title: now.format("%d/%m").to_string(),
+            value: now.format("%H:%M").to_string(),
+            sub: data.weather.as_ref().map(|w| format!("{:.0}°", w.current.temp)).unwrap_or_default(),
             icon: None,
         },
-        "vol" => TileView {
-            title: "VOL".into(),
-            value: if control.muted { "Muted".into() } else { format!("{:.0}%", control.volume * 100.0) },
-            progress: Some(control.volume),
-            icon: None,
-        },
-        // The apps tile is drawn by apps::draw_apps on top of its background.
-        _ => TileView { title: String::new(), value: String::new(), progress: None, icon: None },
+        // The apps zone is drawn by apps::draw_apps; it has no background of its own.
+        _ => TileView { style: Style::Bare, title: String::new(), value: String::new(), sub: String::new(), icon: None },
     }
 }
 
@@ -294,10 +308,11 @@ fn repaint() {
         let data = app.shared.data.lock().unwrap().clone();
         let control = app.shared.control.lock().unwrap().clone();
 
-        let tile_defs = layout_tiles(app.apps.windows.len());
-        let views: Vec<TileView> = tile_defs.iter().map(|t| tile_view(t.id, &data, &control, &stats)).collect();
-        let rects = dock::layout(&tile_defs, false, app.width as i32);
-        app.tiles = tile_defs.iter().zip(rects.iter()).map(|(t, r)| (t.id, *r)).collect();
+        let zones = layout_tiles(app.apps.windows.len());
+        let rects = dock::layout(&zones.left, &zones.center, &zones.right, app.width);
+        let defs: Vec<&Tile> = zones.left.iter().chain(&zones.center).chain(&zones.right).collect();
+        let views: Vec<TileView> = defs.iter().map(|t| tile_view(t.id, &data, &control, &stats)).collect();
+        app.tiles = defs.iter().zip(rects.iter()).map(|(t, r)| (t.id, *r)).collect();
 
         let apps_rect = app.tiles.iter().find(|(id, _)| *id == "apps").map(|(_, r)| *r);
         let res = app
@@ -326,10 +341,9 @@ fn dock_click(x: f32, y: f32) -> Click {
         match id {
             "apps" => apps::hit_app(x, y, rect, &app.apps).map_or(Click::None, Click::Activate),
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
-            "ai" => Click::Open(OpenPopup::Data("ai"), anchor),
-            "weather" => Click::Open(OpenPopup::Data("weather"), anchor),
+            "claude" | "codex" => Click::Open(OpenPopup::Data("ai"), anchor),
             "media" => Click::Open(OpenPopup::Data("media"), anchor),
-            "vol" => Click::Open(OpenPopup::Control, anchor),
+            "cc" => Click::Open(OpenPopup::Control, anchor),
             _ => Click::None,
         }
     })

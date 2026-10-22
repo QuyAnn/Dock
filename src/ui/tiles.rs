@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use chrono::{Datelike, Local};
 use windows::core::Result;
 
-use super::dock::{RectF, TileView};
+use super::dock::{RectF, Style, TileView};
 use super::renderer::Renderer;
 use crate::data::ai::refresh_ai;
 use crate::data::git::{refresh_git, GitSummary};
@@ -55,8 +55,8 @@ impl DataState {
     }
 }
 
-fn tile(title: &str, value: String, progress: Option<f32>) -> TileView {
-    TileView { title: title.to_owned(), value, progress, icon: None }
+fn tile(title: &str, value: String, _progress: Option<f32>) -> TileView {
+    TileView { style: Style::Card, title: title.to_owned(), value, sub: String::new(), icon: None }
 }
 
 pub fn git_tile(d: &DataState) -> TileView {

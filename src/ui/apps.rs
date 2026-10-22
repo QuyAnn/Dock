@@ -14,8 +14,8 @@ use crate::model::WindowEntry;
 use crate::win::icons::icon_for_exe;
 use crate::win::tasks::{list_windows, Attention};
 
-const ICON: f32 = 36.0;
-const GAP: f32 = 6.0;
+const ICON: f32 = 30.0;
+const GAP: f32 = 8.0; // slot 36 px wide + 2 px gap, as in .app / .apps
 const PITCH: f32 = ICON + GAP;
 /// Icon is lifted a little so the running dot fits below it.
 const ICON_LIFT: f32 = 2.0;
