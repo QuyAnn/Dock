@@ -397,10 +397,10 @@ fn cursor() -> AiUsage {
             return no_data(NAME, &e);
         }
     };
-    let usage = json.get("planUsage").unwrap_or(&Value::Null);
-    let spend = usage.get("totalSpend").and_then(Value::as_f64);
-    let limit = usage.get("limit").and_then(Value::as_f64);
-    let total_pct = usage
+    let plan_usage = json.get("planUsage").unwrap_or(&Value::Null);
+    let spend = plan_usage.get("totalSpend").and_then(Value::as_f64);
+    let limit = plan_usage.get("limit").and_then(Value::as_f64);
+    let total_pct = plan_usage
         .get("totalPercentUsed")
         .and_then(Value::as_f64)
         .or_else(|| Some(spend? / limit? * 100.0));

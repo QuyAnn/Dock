@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use windows::core::{w, PCWSTR};
 use windows::Win32::System::Registry::{
-    RegDeleteValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
+    RegDeleteKeyValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,7 +113,7 @@ pub fn sync_startup(enabled: bool) {
                 (wide.len() * 2) as u32,
             );
         } else {
-            let _ = RegDeleteValueW(
+            let _ = RegDeleteKeyValueW(
                 HKEY_CURRENT_USER,
                 w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
                 PCWSTR(value_name.as_ptr()),
