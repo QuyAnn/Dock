@@ -9,6 +9,7 @@ mod win;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -58,6 +59,8 @@ struct Shared {
     control: Mutex<ControlState>,
     /// Liquid Glass backdrop for the dock bar, rendered off the UI thread when the wallpaper changes.
     liquid: Mutex<Option<Arc<LiquidBitmap>>>,
+    /// Set by WM_DISPLAYCHANGE so monitor/virtual-screen geometry is sampled again.
+    refresh_liquid: AtomicBool,
 }
 
 struct App {
@@ -184,13 +187,13 @@ fn main() {
     appbar::ensure_restored_on_exit();
 }
 
-/// Appends a line to `%APPDATA%\SmartDock\smartdock.log`. The GUI build has no console to print to.
+/// Appends a line to `%APPDATA%\SmartDock\log.txt`. The GUI build has no console to print to.
 fn log(msg: &str) {
     use std::io::Write;
     let Ok(appdata) = std::env::var("APPDATA") else { return };
     let dir = std::path::Path::new(&appdata).join("SmartDock");
     let _ = std::fs::create_dir_all(&dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("smartdock.log")) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.txt")) {
         let _ = writeln!(f, "{msg}");
     }
 }
@@ -209,7 +212,7 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> BOOL {
     std::process::exit(0);
 }
 
-fn start_background_refresh(shared: Arc<Shared>, screen: (i32, i32), dock_height_px: i32) {
+fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
     thread::spawn(move || {
         let repos = default_repos();
         let mut tick: u64 = 0;
@@ -232,15 +235,54 @@ fn start_background_refresh(shared: Arc<Shared>, screen: (i32, i32), dock_height
                 *shared.data.lock().unwrap() = local;
             }
             // Liquid Glass backdrop: load and render on the first pass, then only when the wallpaper changes.
-            if tick % 15 == 0 && (tick == 0 || wallpaper::wallpaper_changed()) {
-                match wallpaper::load(screen.0 as u32) {
+            if tick % 15 == 0
+                && (tick == 0
+                    || shared.refresh_liquid.swap(false, Ordering::SeqCst)
+                    || wallpaper::wallpaper_changed())
+            {
+                let monitor = appbar::primary_monitor_rect().unwrap_or(RECT {
+                    left: 0,
+                    top: 0,
+                    right: unsafe { GetSystemMetrics(SM_CXSCREEN) },
+                    bottom: unsafe { GetSystemMetrics(SM_CYSCREEN) },
+                });
+                let virtual_screen = RECT {
+                    left: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
+                    top: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
+                    right: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) },
+                    bottom: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) },
+                };
+                let virtual_size = (virtual_screen.right - virtual_screen.left, virtual_screen.bottom - virtual_screen.top);
+                match wallpaper::load(virtual_size.0.max(monitor.right - monitor.left) as u32) {
                     Ok(wp) => {
-                        let bar = RectF {
-                            x: 0.0,
-                            y: (screen.1 - dock_height_px) as f32,
-                            w: screen.0 as f32,
-                            h: dock_height_px as f32,
+                        let (bar, screen) = if wp.mode == wallpaper::FitMode::Span {
+                            (
+                                RectF {
+                                    x: (monitor.left - virtual_screen.left) as f32,
+                                    y: (monitor.bottom - virtual_screen.top - dock_height_px) as f32,
+                                    w: (monitor.right - monitor.left) as f32,
+                                    h: dock_height_px as f32,
+                                },
+                                virtual_size,
+                            )
+                        } else {
+                            (
+                                RectF {
+                                    x: 0.0,
+                                    y: (monitor.bottom - monitor.top - dock_height_px) as f32,
+                                    w: (monitor.right - monitor.left) as f32,
+                                    h: dock_height_px as f32,
+                                },
+                                (monitor.right - monitor.left, monitor.bottom - monitor.top),
+                            )
                         };
+                        log(&format!(
+                            "wallpaper source={} mode={:?} decoded={}x{} original={}x{} monitor=({},{}..{},{}) virtual=({},{}..{},{}) bar=({:.0},{:.0},{:.0},{:.0})",
+                            wp.source.display(), wp.mode, wp.w, wp.h, wp.orig_w, wp.orig_h,
+                            monitor.left, monitor.top, monitor.right, monitor.bottom,
+                            virtual_screen.left, virtual_screen.top, virtual_screen.right, virtual_screen.bottom,
+                            bar.x, bar.y, bar.w, bar.h,
+                        ));
                         let bitmap = liquid::render_liquid(&wp, bar, screen);
                         *shared.liquid.lock().unwrap() = Some(Arc::new(bitmap));
                         log("liquid backdrop rendered");
@@ -359,8 +401,9 @@ fn run() -> windows::core::Result<()> {
         data: Mutex::new(DataState::default()),
         control: Mutex::new(ControlState::read()),
         liquid: Mutex::new(None),
+        refresh_liquid: AtomicBool::new(false),
     });
-    start_background_refresh(shared.clone(), (screen_w, screen_h), dock_height_px);
+    start_background_refresh(shared.clone(), dock_height_px);
 
     let mut apps = AppsState::default();
     let attention = Attention::default();
@@ -422,7 +465,7 @@ fn layout_tiles(app_count: usize) -> Zones {
             t("codex", 100.0),
             t("cursor", 100.0),
             t("grok", 100.0),
-            t("media", 142.0),
+            t("media", 165.0),
         ],
         center: vec![Tile { id: "apps", width: apps_w, height: 44.0 }],
         right: vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)],
@@ -476,9 +519,10 @@ fn ai_view(data: &DataState, name: &str) -> TileView {
 fn short_ai_status(status: &str) -> &'static str {
     let s = status.to_ascii_lowercase();
     if s.contains("sign in") || s.contains("đăng nhập") {
-        "Chưa đăng nhập"
+        "Đăng nhập"
     } else if s.contains("network") {
-        "Mất mạng"
+        // A provider/TLS/proxy failure is not proof that Windows has lost connectivity.
+        "Lỗi API"
     } else if s.contains("expired") {
         "Hết phiên"
     } else if s.contains("rate limit") {
@@ -516,7 +560,12 @@ fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) 
         "grok" => ai_view(data, "Grok"),
         "media" => tiles::media_tile(data),
         // .cc-btn: Wi-Fi and volume glyphs (Segoe MDL2 Assets).
-        "cc" => TileView { style: Style::Button, value: "\u{E701}\u{E767}".into(), ..TileView::card("", "") },
+        "cc" => TileView {
+            style: Style::Button,
+            value: "\u{E701}\u{E767}".into(),
+            progress: control.wifi.map(|on| if on { 1.0 } else { 0.0 }),
+            ..TileView::card("", "")
+        },
         "gear" => TileView::bare("\u{E713}"),
         "cpu" => TileView {
             style: Style::Ring,
@@ -886,8 +935,34 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             repaint();
             LRESULT(0)
         }
-        WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
-            // The shell may move the taskbar back; keep it hidden while we own the bottom edge.
+        WM_DISPLAYCHANGE => {
+            APP.with(|a| {
+                if let Some(app) = a.borrow_mut().as_mut() {
+                    let dpi_value = dpi::window_dpi(hwnd);
+                    let dock_h = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
+                    if let Ok(rect) = appbar::reposition_appbar(hwnd, AbEdge::Bottom, dock_h) {
+                        let pixel_w = rect.right - rect.left;
+                        let window_h = dock_h + dpi::dip_to_px(16.0, dpi_value);
+                        let _ = SetWindowPos(
+                            hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_w, window_h, SWP_NOACTIVATE,
+                        );
+                        app.origin = (rect.left as f32, rect.top as f32);
+                        app.dpi = dpi_value;
+                        app.width = dpi::px_to_dip(pixel_w, dpi_value);
+                        app.renderer.resize(pixel_w, window_h, dpi_value);
+                        app.shared.refresh_liquid.store(true, Ordering::SeqCst);
+                        log(&format!(
+                            "display change: appbar=({},{}..{},{}) dpi={dpi_value}",
+                            rect.left, rect.top, rect.right, rect.bottom
+                        ));
+                    }
+                }
+            });
+            appbar::enforce_taskbar_hidden();
+            repaint();
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
             appbar::enforce_taskbar_hidden();
             LRESULT(0)
         }

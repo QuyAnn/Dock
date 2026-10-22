@@ -35,6 +35,7 @@ pub enum FitMode {
 /// Decoded wallpaper. `w`/`h` can be smaller than `orig_w`/`orig_h` (width is capped at load time),
 /// so placement must scale by `orig / w` for center/tile.
 pub struct WallpaperPixels {
+    pub source: PathBuf,
     pub w: u32,
     pub h: u32,
     /// Straight (non-premultiplied) RGBA, `w * h * 4` bytes.
@@ -82,7 +83,16 @@ pub fn load(max_w: u32) -> Result<WallpaperPixels> {
     }
     let Some(src) = source else { return Err(E_FAIL.into()) };
     let (w, h, orig_w, orig_h, rgba) = decode(&src.path, max_w)?;
-    Ok(WallpaperPixels { w, h, rgba, orig_w, orig_h, mode: src.mode, background: src.background })
+    Ok(WallpaperPixels {
+        source: src.path,
+        w,
+        h,
+        rgba,
+        orig_w,
+        orig_h,
+        mode: src.mode,
+        background: src.background,
+    })
 }
 
 fn current_source() -> Option<Source> {

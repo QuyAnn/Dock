@@ -48,7 +48,7 @@ fn abd(hwnd: HWND, edge: u32, rc: RECT) -> APPBARDATA {
     }
 }
 
-fn primary_monitor_rect() -> Result<RECT> {
+pub fn primary_monitor_rect() -> Result<RECT> {
     let mut mi = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -108,6 +108,28 @@ pub fn register_appbar(hwnd: HWND, edge: AbEdge, height_px: i32) -> Result<RECT>
     Ok(data.rc)
 }
 
+/// Re-applies the primary monitor edge after a topology/resolution change.
+pub fn reposition_appbar(hwnd: HWND, edge: AbEdge, height_px: i32) -> Result<RECT> {
+    let mon = primary_monitor_rect()?;
+    let (edge_raw, rc) = match edge {
+        AbEdge::Top => (
+            ABE_TOP,
+            RECT { left: mon.left, top: mon.top, right: mon.right, bottom: mon.top + height_px },
+        ),
+        AbEdge::Bottom => (
+            ABE_BOTTOM,
+            RECT { left: mon.left, top: mon.bottom - height_px, right: mon.right, bottom: mon.bottom },
+        ),
+    };
+    let mut data = abd(hwnd, edge_raw, rc);
+    unsafe {
+        SHAppBarMessage(ABM_QUERYPOS, &mut data);
+        data.rc = rc;
+        SHAppBarMessage(ABM_SETPOS, &mut data);
+    }
+    Ok(data.rc)
+}
+
 /// Releases the reserved strip. Safe to call when not registered.
 pub fn unregister_appbar(hwnd: HWND) {
     let mut data = abd(hwnd, ABE_TOP, RECT::default());
@@ -154,10 +176,11 @@ fn set_taskbar_state(tray: HWND, state: u32) {
     }
 }
 
-fn show_trays(show: bool) {
+fn show_primary_tray(show: bool) {
     let cmd = if show { SW_SHOW } else { SW_HIDE };
-    for h in tray_windows() {
-        // SAFETY: h is a live tray window handle from the enumeration above.
+    if let Some(h) = primary_tray() {
+        // SAFETY: h is the live primary tray window. This process has no secondary dock, so it
+        // must not hide Shell_SecondaryTrayWnd.
         unsafe {
             let _ = ShowWindow(h, cmd);
         }
@@ -186,7 +209,7 @@ fn remove_state_file() {
     }
 }
 
-/// Auto-hides the taskbar on all monitors and hides its windows (as the old app did).
+/// Auto-hides the primary taskbar and hides only its window.
 /// The original state is saved to disk first; if that fails, nothing is changed.
 /// No-op if already hidden.
 pub fn hide_taskbar() {
@@ -202,7 +225,7 @@ pub fn hide_taskbar() {
     ORIGINAL_STATE.store(original, Ordering::SeqCst);
     APPLIED.store(true, Ordering::SeqCst);
     set_taskbar_state(tray, ABS_AUTOHIDE);
-    show_trays(false);
+    show_primary_tray(false);
 }
 
 /// Restores the taskbar saved by `hide_taskbar`. Idempotent and synchronous: safe to call
@@ -214,7 +237,7 @@ pub fn restore_taskbar() {
     if let Some(tray) = primary_tray() {
         set_taskbar_state(tray, ORIGINAL_STATE.load(Ordering::SeqCst));
     }
-    show_trays(true);
+    show_primary_tray(true);
     APPLIED.store(false, Ordering::SeqCst);
     remove_state_file();
 }
@@ -228,7 +251,7 @@ pub fn ensure_restored_on_exit() {
 /// No-op unless the taskbar is hidden by us.
 pub fn enforce_taskbar_hidden() {
     if APPLIED.load(Ordering::SeqCst) {
-        show_trays(false);
+        show_primary_tray(false);
     }
 }
 
@@ -262,6 +285,11 @@ pub fn recover_from_previous_crash() {
     if let Some(tray) = primary_tray() {
         set_taskbar_state(tray, state);
     }
-    show_trays(true);
+    // Older builds hid secondary taskbars too; recover all tray windows after a stale state file.
+    for h in tray_windows() {
+        unsafe {
+            let _ = ShowWindow(h, SW_SHOW);
+        }
+    }
     let _ = std::fs::remove_file(&path);
 }

@@ -11,7 +11,7 @@ pub const DOCK_H: f32 = 46.0;
 const BAR_RADIUS: f32 = 16.0;
 const TILE_H: f32 = 34.0;
 const TILE_RADIUS: f32 = 10.0;
-const ROW_PAD: f32 = 5.0; // .dock-row padding
+const ROW_PAD: f32 = 7.0; // equal optical inset at both ends; keeps edge strokes unclipped
 const ZONE_GAP: f32 = 5.0; // .zone gap
 const ROW_GAP: f32 = 6.0; // .dock-row gap between zones
 
@@ -180,7 +180,7 @@ pub fn draw_dock(
     }
     let tint = glass_fill_color(opacity_pct);
     r.fill_rounded_rect(bar, BAR_RADIUS, tint)?;
-    r.fill_rect(RectF { x: bar.x, y: bar.y + BAR_RADIUS, w: bar.w, h: bar.h - BAR_RADIUS }, tint)?;
+    // A second fill below y=16 doubled the tint alpha and created a hard horizontal seam.
     r.fill_rounded_rect_gradient(bar, BAR_RADIUS, GLASS_SHEEN_TOP, 0xFFFF_FF00)?;
     r.stroke_rounded_rect(bar, BAR_RADIUS, BAR_BORDER, 1.0)?;
 
@@ -351,9 +351,18 @@ fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resu
     r.stroke_rounded_rect(rc, 8.0, BTN_BORDER, 1.0)?;
     // Glyphs sit side by side, 14 px each with a 7 px gap.
     let mut x = rc.x + 9.0;
-    for glyph in t.value.chars() {
+    for (index, glyph) in t.value.chars().enumerate() {
         let g = RectF { x, y: rc.y, w: 14.0, h: rc.h };
-        r.draw_text_styled(&glyph.to_string(), g, 13.0, 0xFFFF_FFE0, Align::Center, TextStyle::Icon)?;
+        let color = if index == 0 {
+            match t.progress {
+                Some(p) if p > 0.5 => 0xFFFF_FFFF,
+                Some(_) => 0xFFFF_FF73,
+                None => 0xFFFF_FFC4,
+            }
+        } else {
+            0xFFFF_FFE8
+        };
+        r.draw_text_styled(&glyph.to_string(), g, 13.0, color, Align::Center, TextStyle::Icon)?;
         x += 14.0 + 7.0;
     }
     Ok(())
