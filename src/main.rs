@@ -129,6 +129,8 @@ enum Click {
     Start,
     GrokBot,
     Open(OpenPopup, RectF),
+    /// Tray chevron: toggle Windows' own hidden-icons flyout (anchor in physical px).
+    TrayOverflow(RectF),
 }
 
 thread_local! {
@@ -729,7 +731,7 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     if enabled.grok { left.push(t("grok", dock::USAGE_W)); }
     if enabled.music { left.push(t("media", dock::MEDIA_W)); }
     if enabled.weather && settings.weather_position == "tile" { left.push(t("weather", 100.0)); }
-    let mut right = vec![t("cc", 56.0), t("gear", 22.0)];
+    let mut right = vec![t("chevron", 26.0), t("cc", 56.0), t("gear", 22.0)];
     // Wide enough for a tiny CPU/RAM label above the percent inside the ring.
     if enabled.cpu { right.push(t("cpu", 42.0)); }
     if enabled.ram { right.push(t("ram", 42.0)); }
@@ -893,6 +895,12 @@ fn tile_view(
                 volume: control.volume,
                 muted: control.muted,
             }),
+            ..TileView::card("", "")
+        },
+        // macOS-style "^" that opens Windows' hidden tray icons; points down while open.
+        "chevron" => TileView {
+            style: Style::Button,
+            chevron: Some(win::overflow::is_open()),
             ..TileView::card("", "")
         },
         "start" => TileView { style: Style::Start, ..TileView::card("", "") },
@@ -1232,6 +1240,7 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
             "cpu" => Click::Open(OpenPopup::Data("cpu"), anchor),
             "ram" => Click::Open(OpenPopup::Data("ram"), anchor),
             "cc" => Click::Open(OpenPopup::Control, anchor),
+            "chevron" => Click::TrayOverflow(anchor),
             "gear" => Click::Open(OpenPopup::Data("settings"), anchor),
             _ => Click::None,
         }
@@ -1758,6 +1767,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_LBUTTONDOWN => {
             // Snapshot foreground + Start state before the click can change them.
             tasks::capture_click_state();
+            win::overflow::capture_click();
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONUP => {
@@ -1770,6 +1780,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::Start => "open Start",
                 Click::GrokBot => "grok bot",
                 Click::Open(..) => "open popup",
+                Click::TrayOverflow(_) => "tray overflow",
             }));
             match click {
                 Click::None => tasks::dismiss_start_if_open(),
@@ -1778,6 +1789,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::Start => tasks::open_start_menu(),
                 Click::GrokBot => grokbot::open_or_focus(),
                 Click::Open(which, anchor) => open_popup(which, anchor),
+                Click::TrayOverflow(a) => {
+                    win::overflow::toggle(a.x.round() as i32, (a.x + a.w).round() as i32, a.y.round() as i32)
+                }
             }
             LRESULT(0)
         }

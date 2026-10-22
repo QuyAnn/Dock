@@ -101,6 +101,8 @@ pub struct TileView {
     pub mini: Vec<(f32, u32)>,
     /// Control Center button: SF-style Wi-Fi + speaker icons (None draws `value` glyphs).
     pub status: Option<StatusIcons>,
+    /// Tray-overflow chevron; `Some(open)` (points down while the flyout is open).
+    pub chevron: Option<bool>,
 }
 
 /// State for the dock's Wi-Fi / speaker status icons.
@@ -128,6 +130,7 @@ impl TileView {
             glyph: None,
             mini: Vec::new(),
             status: None,
+            chevron: None,
         }
     }
 
@@ -475,6 +478,10 @@ fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
 fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     // .cc-btn: 34 px, radius 8, faint fill; hover brightens it.
     card_frame(r, rc, hovered)?;
+    if let Some(open) = t.chevron {
+        let g = RectF { x: rc.x + (rc.w - 12.0) / 2.0, y: rc.y + (rc.h - 12.0) / 2.0, w: 12.0, h: 12.0 };
+        return super::sficons::draw_chevron(r, g, !open, 0xFFFF_FFF0);
+    }
     if let Some(st) = t.status {
         // macOS menu-bar look: Wi-Fi fan (15 px) then speaker (17x15), white, vector.
         let cy = rc.y + rc.h / 2.0;
