@@ -105,7 +105,7 @@ fn run() -> windows::core::Result<()> {
             hwnd,
             HWND_TOPMOST,
             rect.left,
-            rect.bottom,
+            rect.top,
             rect.right - rect.left,
             DOCK_HEIGHT,
             SWP_NOACTIVATE,
