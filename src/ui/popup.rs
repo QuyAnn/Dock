@@ -101,7 +101,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
             );
         }
         apply_dwm_rounding(pw.hwnd);
-        apply_acrylic(pw.hwnd, 0x8C28_282C);
+        apply_acrylic(pw.hwnd, super::glass::PANEL_ACRYLIC_TINT);
         unsafe {
             let _ = ShowWindow(pw.hwnd, SW_SHOWNOACTIVATE);
             SetTimer(pw.hwnd, TIMER_ID, POLL_MS, None);
@@ -138,7 +138,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         esc_down: true,
     };
     apply_dwm_rounding(hwnd);
-    apply_acrylic(hwnd, 0x8C28_282C);
+    apply_acrylic(hwnd, super::glass::PANEL_ACRYLIC_TINT);
     POPUP.with(|p| *p.borrow_mut() = Some(pw));
 
     // SAFETY: hwnd is a live window owned by POPUP.
@@ -279,9 +279,8 @@ fn paint() {
             let rect = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
             let _ = pw.renderer.begin().and_then(|_| {
                 // .popup: gradient fill (rgba(30,31,36,.62) to rgba(18,18,22,.74)), inset top highlight, 1px border.
-                pw.renderer.fill_rounded_rect_gradient(rect, RADIUS, 0x1E1F_249E, 0x1212_16BD)?;
-                pw.renderer.fill_rect(RectF { x: rect.x + 4.0, y: rect.y + 0.5, w: rect.w - 8.0, h: 1.0 }, 0xFFFF_FF14)?;
-                pw.renderer.stroke_rounded_rect(rect, RADIUS, 0xFFFF_FF21, 1.0)?;
+                // Liquid Glass panel over live DWM acrylic: light dim, top highlight, specular rims.
+                super::glass::draw_panel(&mut pw.renderer, rect, RADIUS)?;
                 if let Some(f) = PAINTER.with(Cell::get) {
                     f(&mut pw.renderer, rect);
                 }

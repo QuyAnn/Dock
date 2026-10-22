@@ -5,20 +5,21 @@ use std::sync::Once;
 
 use windows::core::w;
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, SetBkMode,
-    SetTextColor, TextOutW, HDC, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, EndPaint, InvalidateRect, HDC, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, GetWindowRect, KillTimer,
+    CreateWindowExW, DefWindowProcW, GetCursorPos, GetWindowRect, KillTimer,
     RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, MA_NOACTIVATE, SW_HIDE,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_PAINT,
     WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use super::dock::RectF;
+use super::renderer::{apply_acrylic, apply_dwm_rounding, Align, Renderer};
 use crate::win::dpi;
 use crate::win::tasks::focus_window;
 
@@ -72,6 +73,8 @@ struct Thumb {
 /// The single peek window. Created once, then only shown/hidden/moved.
 struct Host {
     hwnd: HWND,
+    /// D2D surface for the glass panel and titles (window is reused, so is the renderer).
+    renderer: Renderer,
     visible: bool,
     thumbs: Vec<Thumb>,
     anchor: RECT,
@@ -208,9 +211,12 @@ fn host_hwnd() -> Option<HWND> {
         )
     }
     .ok()?;
+    apply_dwm_rounding(hwnd);
+    apply_acrylic(hwnd, super::glass::PANEL_ACRYLIC_TINT);
     HOST.with(|h| {
         *h.borrow_mut() = Some(Host {
             hwnd,
+            renderer: Renderer::new(hwnd, 1, 1, dpi::system_dpi()),
             visible: false,
             thumbs: Vec::new(),
             anchor: RECT::default(),
@@ -279,6 +285,7 @@ fn show(pending: Pending) {
     HOST.with(|h| {
         if let Some(host) = h.borrow_mut().as_mut() {
             host.thumbs = thumbs;
+            host.renderer.resize(width, height, dpi);
             host.anchor = pending.anchor;
             host.dock = pending.dock;
             host.visible = true;
@@ -414,33 +421,43 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
-fn paint(hwnd: HWND, hdc: HDC) {
+fn paint(hwnd: HWND, _hdc: HDC) {
     HOST.with(|h| {
-        let Ok(g) = h.try_borrow() else {
+        let Ok(mut g) = h.try_borrow_mut() else {
             return;
         };
-        let Some(host) = g.as_ref() else {
+        let Some(host) = g.as_mut() else {
             return;
         };
         if host.hwnd != hwnd {
             return;
         }
-        unsafe {
-            let mut client = RECT::default();
-            let _ = GetClientRect(hwnd, &mut client);
-            let brush = CreateSolidBrush(COLORREF(0x0028_282C));
-            FillRect(hdc, &client, brush);
-            let _ = DeleteObject(brush);
-            let _ = SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(0x00F1_F1F4));
-            for t in &host.thumbs {
-                let mut wide: Vec<u16> = t.title.encode_utf16().take(28).collect();
-                if wide.len() == 28 {
-                    wide.pop();
-                    wide.extend("…".encode_utf16());
-                }
-                let _ = TextOutW(hdc, t.dest.left, t.dest.top - 18, &wide);
+        let scale = dpi::scale(host.renderer.dpi());
+        let (w, hgt) = host.renderer.size();
+        let titles: Vec<(String, RectF)> = host
+            .thumbs
+            .iter()
+            .map(|t| {
+                (
+                    t.title.clone(),
+                    RectF {
+                        x: t.dest.left as f32 / scale,
+                        y: t.dest.top as f32 / scale - 20.0,
+                        w: (t.dest.right - t.dest.left) as f32 / scale,
+                        h: 18.0,
+                    },
+                )
+            })
+            .collect();
+        let r = &mut host.renderer;
+        let panel = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: hgt - 1.0 };
+        let _ = r.begin().and_then(|_| {
+            super::glass::draw_panel(r, panel, 12.0)?;
+            for (title, rc) in &titles {
+                // DirectWrite: full Unicode (Vietnamese) titles, ellipsized to the thumbnail width.
+                r.draw_text(title, *rc, 11.0, 0xF4F4_F7FF, Align::Left)?;
             }
-        }
+            r.end()
+        });
     });
 }
