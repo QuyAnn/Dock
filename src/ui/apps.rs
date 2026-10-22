@@ -17,7 +17,7 @@ use crate::model::WindowEntry;
 use crate::win::icons::{icon_for_window, IconBitmap};
 use crate::win::tasks::{list_windows, Attention};
 
-/// macOS-style icon size inside the 46-DIP bar (Variant A).
+/// macOS-style icon size inside the 48-DIP bar (Variant A).
 pub const ICON: f32 = 38.0;
 /// Icon top inside the 44-DIP apps / Start tile (tile y = 1, so the icon spans y 2..40).
 pub const ICON_TOP: f32 = 1.0;
@@ -42,7 +42,7 @@ const BADGE_FONT: f32 = 9.5;
 const ATTN_PERIOD: f32 = 1.4; // animation: attn 1.4s ease-in-out infinite
 const MAG_RANGE: f32 = 40.0; // magnify falloff distance, px
 // Hover only lifts slightly (scales around the bottom centre, ~2 DIP taller at most) so the
-// icon never leaves the 46-DIP bar and nothing else moves.
+// icon never leaves the 48-DIP bar and nothing else moves.
 const MAG_MAX: f32 = 0.05;
 
 thread_local! {
@@ -165,7 +165,7 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
             draw_badge(r, ico, badge, t)?;
         }
         // Small white running dot under the icon.
-        let dot = RectF { x: cx - DOT / 2.0, y: base_bottom + 1.5, w: DOT, h: DOT };
+        let dot = RectF { x: cx - DOT / 2.0, y: base_bottom + 1.0, w: DOT, h: DOT };
         r.fill_rounded_rect(dot, DOT / 2.0, DOT_RGBA)?;
     }
     Ok(())
@@ -429,6 +429,30 @@ mod tests {
 
     fn mid(r: RectF) -> (f32, f32) {
         (r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
+    #[test]
+    fn dock_layout_shelf_icons_and_dots_vertically_centred_with_margin() {
+        use crate::ui::dock::{shelf_for, DOCK_H};
+        let (rects, start, apps) = centred(5, 1920.0);
+        let shelf = shelf_for(rects[start], rects[apps]);
+        // Clear margin above the shelf rim and below it; shelf centred in the bar.
+        assert!(shelf.y >= 2.0, "shelf top {}", shelf.y);
+        assert!((shelf.y - (DOCK_H - shelf.y - shelf.h)).abs() < 0.01, "shelf not centred: {shelf:?}");
+        let icon_top = rects[apps].y + ICON_TOP;
+        let icon_bottom = icon_top + ICON;
+        // A hovered icon grows upward by MAG_MAX but stays inside the bar.
+        assert!(icon_bottom - ICON * (1.0 + MAG_MAX) >= 0.0);
+        assert!(icon_top >= shelf.y && icon_bottom <= shelf.y + shelf.h);
+        let dot_bottom = icon_bottom + 1.0 + DOT;
+        assert!(dot_bottom <= shelf.y + shelf.h, "dot {dot_bottom} outside shelf {shelf:?}");
+        // Side tiles are vertically centred too.
+        for (i, r) in rects.iter().enumerate() {
+            if i == start + 1 {
+                continue;
+            }
+            assert!((r.y - (DOCK_H - r.y - r.h)).abs() < 0.01, "tile {i} not centred: {r:?}");
+        }
     }
 
     #[test]

@@ -10,7 +10,9 @@ use super::liquid::{glass_fill_color, LiquidBitmap, GLASS_SHEEN_TOP};
 use super::renderer::{Align, Renderer, TextStyle};
 use super::svgpath;
 
-pub const DOCK_H: f32 = 46.0;
+/// Bar height in DIPs. 48 leaves a 2-DIP clear margin above and below the 44-DIP centre
+/// cluster (shelf + 38 px icons + running dots), so the shelf's top rim is never clipped.
+pub const DOCK_H: f32 = 48.0;
 const BAR_RADIUS: f32 = 18.0;
 const TILE_H: f32 = 34.0;
 const ROW_PAD: f32 = 5.0; // styles.css .dock-row padding: 0 5px
@@ -502,11 +504,12 @@ pub fn set_shelf(rect: Option<RectF>) {
 }
 
 /// Shelf geometry for a centre cluster spanning `first..last` (dock-local DIPs): symmetric
-/// padding keeps it centred with the cluster; it spans nearly the full bar height so the
-/// running dots sit inside.
+/// horizontal padding keeps it centred with the cluster; vertically it is exactly the
+/// cluster's 44-DIP band, which the layout centres in the bar (clear margin above the rim),
+/// so icons and running dots sit inside it.
 pub fn shelf_for(first: RectF, last: RectF) -> RectF {
     let pad = SHELF_PAD;
-    RectF { x: first.x - pad, y: 1.0, w: last.x + last.w - first.x + 2.0 * pad, h: DOCK_H - 2.0 }
+    RectF { x: first.x - pad, y: first.y, w: last.x + last.w - first.x + 2.0 * pad, h: first.h }
 }
 
 const SHELF_PAD: f32 = 5.0;

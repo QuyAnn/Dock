@@ -52,7 +52,7 @@ use win::system::{self, MediaAction};
 use win::tasks::{self, Attention, ShellEvent};
 use win::{monitors, wallpaper};
 
-const DOCK_HEIGHT: f32 = 46.0;
+const DOCK_HEIGHT: f32 = dock::DOCK_H;
 const POPUP_W: f32 = 320.0;
 const CONTROL_POPUP_W: f32 = 340.0;
 const SETTINGS_POPUP_W: f32 = 460.0;
@@ -576,7 +576,7 @@ fn run() -> windows::core::Result<()> {
     let dock_height_px = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
     let corner_px = dpi::dip_to_px(16.0, dpi_value);
     // Extend the HWND below rcMonitor so DWM's lower rounded corners are off-screen. Only the
-    // 46-DIP dock surface is visible; its upper corners retain compositor antialiasing.
+    // 48-DIP dock surface is visible; its upper corners retain compositor antialiasing.
     let dock_window_height_px = dock_height_px + corner_px;
 
     // Remove the taskbar's edge claim before asking the shell to place our AppBar. Otherwise
