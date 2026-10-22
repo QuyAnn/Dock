@@ -1,13 +1,14 @@
 //! AI usage for Claude and Codex (plus a Grok placeholder), read from the user's own local sign-ins.
 //! Credentials are read at request time only, never logged, cached to disk, or sent anywhere but the provider.
 use std::path::{Path, PathBuf};
+use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
+use std::ptr;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::model::{AiUsage, AiWindow};
@@ -55,6 +56,66 @@ fn log_provider(provider: &str, message: &str) {
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.txt")) {
         let _ = writeln!(file, "AI {provider}: {message}");
+    }
+}
+
+#[link(name = "winsqlite3")]
+unsafe extern "C" {
+    fn sqlite3_open_v2(filename: *const c_char, db: *mut *mut c_void, flags: c_int, vfs: *const c_char) -> c_int;
+    fn sqlite3_prepare_v2(
+        db: *mut c_void,
+        sql: *const c_char,
+        bytes: c_int,
+        statement: *mut *mut c_void,
+        tail: *mut *const c_char,
+    ) -> c_int;
+    fn sqlite3_step(statement: *mut c_void) -> c_int;
+    fn sqlite3_column_text(statement: *mut c_void, column: c_int) -> *const c_uchar;
+    fn sqlite3_finalize(statement: *mut c_void) -> c_int;
+    fn sqlite3_close(db: *mut c_void) -> c_int;
+}
+
+/// Reads Cursor's ItemTable through Windows' inbox SQLite implementation. The connection is
+/// read-only and the returned map never leaves this process.
+fn cursor_auth(path: &Path) -> Result<Vec<(String, String)>, String> {
+    const SQLITE_OK: c_int = 0;
+    const SQLITE_ROW: c_int = 100;
+    const SQLITE_OPEN_READONLY: c_int = 1;
+    let filename = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| "invalid database path".to_owned())?;
+    let query = CString::new("SELECT key, value FROM ItemTable WHERE key LIKE 'cursorAuth/%'").unwrap();
+    let mut db = ptr::null_mut();
+    let mut statement = ptr::null_mut();
+    unsafe {
+        if sqlite3_open_v2(filename.as_ptr(), &mut db, SQLITE_OPEN_READONLY, ptr::null()) != SQLITE_OK || db.is_null() {
+            return Err("cannot open state.vscdb".to_owned());
+        }
+        if sqlite3_prepare_v2(db, query.as_ptr(), -1, &mut statement, ptr::null_mut()) != SQLITE_OK || statement.is_null() {
+            let _ = sqlite3_close(db);
+            return Err("cannot query state.vscdb".to_owned());
+        }
+        let mut out = Vec::new();
+        loop {
+            let result = sqlite3_step(statement);
+            if result != SQLITE_ROW {
+                if result != 101 {
+                    let _ = sqlite3_finalize(statement);
+                    let _ = sqlite3_close(db);
+                    return Err(format!("state.vscdb step error {result}"));
+                }
+                break;
+            }
+            let key = sqlite3_column_text(statement, 0);
+            let value = sqlite3_column_text(statement, 1);
+            if !key.is_null() && !value.is_null() {
+                out.push((
+                    CStr::from_ptr(key.cast()).to_string_lossy().into_owned(),
+                    CStr::from_ptr(value.cast()).to_string_lossy().into_owned(),
+                ));
+            }
+        }
+        let _ = sqlite3_finalize(statement);
+        let _ = sqlite3_close(db);
+        Ok(out)
     }
 }
 
@@ -292,20 +353,12 @@ fn cursor() -> AiUsage {
         return no_data(NAME, "sign in to Cursor");
     }
     let read_auth = || -> Result<(String, Option<String>), String> {
-        let db = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| format!("cannot open state.vscdb: {e}"))?;
-        let mut stmt = db
-            .prepare("SELECT key, value FROM ItemTable WHERE key LIKE 'cursorAuth/%'")
-            .map_err(|e| format!("cannot query state.vscdb: {e}"))?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-            .map_err(|e| format!("cannot read state.vscdb: {e}"))?;
         let mut token = None;
         let mut plan = None;
-        for row in rows.flatten() {
-            match row.0.as_str() {
-                "cursorAuth/accessToken" => token = Some(row.1),
-                "cursorAuth/stripeMembershipType" => plan = Some(row.1),
+        for (key, value) in cursor_auth(&db_path)? {
+            match key.as_str() {
+                "cursorAuth/accessToken" => token = Some(value),
+                "cursorAuth/stripeMembershipType" => plan = Some(value),
                 _ => {}
             }
         }
