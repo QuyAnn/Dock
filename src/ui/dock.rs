@@ -10,24 +10,17 @@ use super::renderer::{Align, Renderer, TextStyle};
 use super::svgpath;
 
 pub const DOCK_H: f32 = 46.0;
-const BAR_RADIUS: f32 = 16.0;
+const BAR_RADIUS: f32 = 18.0;
 const TILE_H: f32 = 34.0;
-const TILE_RADIUS: f32 = 10.0;
 const ROW_PAD: f32 = 5.0; // styles.css .dock-row padding: 0 5px
 const ZONE_GAP: f32 = 5.0; // .zone gap
 const ROW_GAP: f32 = 6.0; // .dock-row gap between zones
 
 // Colors from styles.css, 0xRRGGBBAA.
 const BAR_BORDER: u32 = 0xFFFF_FF42; // liquid rim top, rgba(255,255,255,.26)
-const TILE_FILL: u32 = 0x2C2C_30A1; // rgba(44,44,48,.63): --gt at default --ga .55
-const TILE_BORDER: u32 = 0xFFFF_FF1F; // rgba(255,255,255,.12)
-const TILE_HOVER_FILL: u32 = 0x1E1E_23A1; // rgba(30,30,35,.63)
-const TILE_HOVER_BORDER: u32 = 0xFFFF_FF24; // rgba(255,255,255,.14)
 const TEXT: u32 = 0xF1F1_F4FF;
-const MUTED: u32 = 0xFFFF_FF8C; // rgba(255,255,255,.55)
+const MUTED: u32 = 0xFFFF_FFC0; // rgba(255,255,255,.75) — brighter on clear glass
 const RING_TRACK: u32 = 0xFFFF_FF33; // rgba(255,255,255,.20) — visible grey track behind accent arc
-const BTN_FILL: u32 = 0xFFFF_FF12; // .cc-btn background, rgba(255,255,255,.07)
-const BTN_BORDER: u32 = 0xFFFF_FF14; // rgba(255,255,255,.08)
 const NO_BACKDROP_TOP: u32 = 0x6E68_62FF;
 const NO_BACKDROP_BOTTOM: u32 = 0x5A55_50FF;
 const CLOCK_TOP: u32 = 0xFF5A_3CFF;
@@ -233,13 +226,21 @@ pub fn draw_dock(
         // shows as black. Paint a neutral mid-tone glass base instead of a near-black bar.
         None => r.fill_top_rounded_rect_gradient(bar, BAR_RADIUS, NO_BACKDROP_TOP, NO_BACKDROP_BOTTOM)?,
     }
-    let tint = glass_fill_color(opacity_pct);
-    // Flush to the monitor edge: round only the top corners. Rounding the bottom lets a few
-    // sharp wallpaper pixels show through at the lower left/right.
-    r.fill_top_rounded_rect(bar, BAR_RADIUS, tint)?;
-    // A second fill below y=16 doubled the tint alpha and created a hard horizontal seam.
-    r.fill_top_rounded_rect_gradient(bar, BAR_RADIUS, GLASS_SHEEN_TOP, 0xFFFF_FF00)?;
-    r.stroke_top_rounded_rect(bar, BAR_RADIUS, BAR_BORDER, 1.0)?;
+    // Liquid Glass bar: the refracted wallpaper stays visible. Only a light neutral dim (scaled
+    // from the Glass opacity setting) for legibility, never a dark slab. Flush to the monitor
+    // edge: round only the top corners.
+    let dim_alpha = (opacity_pct.min(95) as u32 * 45 / 100).min(60);
+    r.fill_top_rounded_rect(bar, BAR_RADIUS, 0x1416_1C00 | dim_alpha)?;
+    // Soft inner highlight across the top of the bar.
+    r.fill_top_rounded_rect_gradient(
+        RectF { h: DOCK_H * 0.45, ..bar },
+        BAR_RADIUS,
+        0xFFFF_FF2A,
+        0xFFFF_FF00,
+    )?;
+    // Specular rim: brightest at the top-left, fading to the right.
+    r.stroke_top_rounded_rect_linear(bar, BAR_RADIUS, (0.0, 0.0), 0xFFFF_FFA0, (w * 0.6, DOCK_H), 0xFFFF_FF2E, 1.0)?;
+    let _ = (glass_fill_color(opacity_pct), GLASS_SHEEN_TOP, BAR_BORDER);
 
     for (i, (t, rc)) in tiles.iter().zip(rects).enumerate() {
         let hovered = hover == Some(i);
@@ -257,17 +258,10 @@ pub fn draw_dock(
     Ok(())
 }
 
-/// Card background shared by every boxed tile, with the hover state of `.tile:hover`.
+/// Card background shared by every boxed tile: a Liquid Glass piece sampled from the bar's
+/// backdrop at the tile's own position. Hover glows brighter; geometry never changes.
 fn card_frame(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
-    let (fill, border) = if hovered { (TILE_HOVER_FILL, TILE_HOVER_BORDER) } else { (TILE_FILL, TILE_BORDER) };
-    r.fill_rounded_rect(rc, TILE_RADIUS, fill)?;
-    r.fill_rounded_rect_gradient(
-        rc,
-        TILE_RADIUS,
-        if hovered { 0xFFFF_FF24 } else { 0xFFFF_FF12 },
-        if hovered { 0xFFFF_FF0D } else { 0xFFFF_FF05 },
-    )?;
-    r.stroke_rounded_rect(rc, TILE_RADIUS, border, 1.0)
+    super::glass::draw_glass(r, rc, super::glass::GLASS_RADIUS, super::glass::Layer::Tile, hovered)
 }
 
 fn draw_bare(r: &mut Renderer, t: &TileView, rc: RectF) -> Result<()> {
@@ -447,9 +441,7 @@ fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
 
 fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     // .cc-btn: 34 px, radius 8, faint fill; hover brightens it.
-    let fill = if hovered { 0xFFFF_FF26 } else { BTN_FILL };
-    r.fill_rounded_rect(rc, 8.0, fill)?;
-    r.stroke_rounded_rect(rc, 8.0, BTN_BORDER, 1.0)?;
+    card_frame(r, rc, hovered)?;
     // Glyphs sit side by side, 14 px each with a 7 px gap.
     let mut x = rc.x + 9.0;
     for (index, glyph) in t.value.chars().enumerate() {

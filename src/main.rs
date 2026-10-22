@@ -913,7 +913,7 @@ fn paint_surface(
     control: &ControlState,
     audio_peak: f32,
     settings: &settings::Settings,
-    backdrop: Option<&LiquidBitmap>,
+    backdrop: Option<&Arc<LiquidBitmap>>,
 ) {
     let zones = layout_tiles(apps_state.windows.len(), settings);
     let rects = dock::layout(&zones.left, &zones.center, &zones.right, width);
@@ -926,12 +926,17 @@ fn paint_surface(
     let apps_rect = tiles_out.iter().find(|(id, _)| *id == "apps").map(|(_, r)| *r);
     let res = renderer
         .begin()
-        .and_then(|_| dock::draw_dock(renderer, &views, &rects, hover, backdrop, settings.glass_opacity))
+        .and_then(|_| {
+            // Glass tiles/plates sample this dock's own wallpaper crop at their positions.
+            glass::set_backdrop(backdrop.cloned(), width, dock::DOCK_H);
+            dock::draw_dock(renderer, &views, &rects, hover, backdrop.map(|b| b.as_ref()), settings.glass_opacity)
+        })
         .and_then(|_| match apps_rect {
             Some(r) => apps::draw_apps(renderer, r, apps_state),
             None => Ok(()),
         })
         .and_then(|_| renderer.end());
+    glass::set_backdrop(None, width, dock::DOCK_H);
     if let Err(e) = res {
         log(&format!("paint failed: {e}"));
     }
@@ -999,7 +1004,7 @@ fn repaint_docks(only: Option<HWND>) {
             &control,
             audio_peak,
             &settings,
-            primary_bg.as_deref(),
+            primary_bg.as_ref(),
         );
         }
         for sec in app.secondaries.iter_mut().filter(|s| only.is_none_or(|h| h == s.hwnd)) {
@@ -1015,7 +1020,7 @@ fn repaint_docks(only: Option<HWND>) {
                 &control,
                 audio_peak,
                 &settings,
-                bg.as_deref(),
+                bg.as_ref(),
             );
         }
     });

@@ -257,7 +257,8 @@ fn draw_app_plate(r: &mut Renderer, ico: RectF) -> Result<()> {
         w: size,
         h: size,
     };
-    glass::draw_liquid_plate(r, plate, radius, false)
+    // Magnified (pointer-near) plates glow like a hovered tile.
+    glass::draw_liquid_plate(r, plate, radius, k > 1.06)
 }
 
 /// Source size used for the fallback shadow bitmap.

@@ -672,6 +672,100 @@ pub fn apply_acrylic(hwnd: HWND, tint_argb: u32) -> bool {
     }
 }
 
+/// Arbitrary-direction gradients for Liquid Glass rims and highlights.
+impl Renderer {
+    fn linear_brush(
+        &mut self,
+        p0: (f32, f32),
+        c0: u32,
+        p1: (f32, f32),
+        c1: u32,
+    ) -> Result<windows::Win32::Graphics::Direct2D::ID2D1LinearGradientBrush> {
+        let (rt, _) = self.parts()?;
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: color(c0) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: color(c1) },
+        ];
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+            startPoint: D2D_POINT_2F { x: p0.0, y: p0.1 },
+            endPoint: D2D_POINT_2F { x: p1.0, y: p1.1 },
+        };
+        // SAFETY: stops and props live for the calls.
+        unsafe {
+            let coll = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            rt.CreateLinearGradientBrush(&props, None, &coll)
+        }
+    }
+
+    /// Fills a rounded rect with a gradient from `p0` (`c0`) to `p1` (`c1`).
+    pub fn fill_rounded_rect_linear(
+        &mut self,
+        rect: RectF,
+        radius: f32,
+        p0: (f32, f32),
+        c0: u32,
+        p1: (f32, f32),
+        c1: u32,
+    ) -> Result<()> {
+        let brush = self.linear_brush(p0, c0, p1, c1)?;
+        let (rt, _) = self.parts()?;
+        let rr = rounded(rect, radius);
+        // SAFETY: `rr` and the brush live for the call.
+        unsafe { rt.FillRoundedRectangle(&rr, &brush) };
+        Ok(())
+    }
+
+    /// Strokes a rounded rect (centred on `rect` inset by half the width) with a gradient.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stroke_rounded_rect_linear(
+        &mut self,
+        rect: RectF,
+        radius: f32,
+        p0: (f32, f32),
+        c0: u32,
+        p1: (f32, f32),
+        c1: u32,
+        width: f32,
+    ) -> Result<()> {
+        let brush = self.linear_brush(p0, c0, p1, c1)?;
+        let (rt, _) = self.parts()?;
+        let h = width / 2.0;
+        let inset = RectF { x: rect.x + h, y: rect.y + h, w: (rect.w - width).max(0.0), h: (rect.h - width).max(0.0) };
+        let rr = rounded(inset, (radius - h).max(0.0));
+        // SAFETY: `rr` and the brush live for the call.
+        unsafe { rt.DrawRoundedRectangle(&rr, &brush, width, None::<&ID2D1StrokeStyle>) };
+        Ok(())
+    }
+
+    /// Strokes the dock bar outline (top corners rounded) with a gradient.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stroke_top_rounded_rect_linear(
+        &mut self,
+        rect: RectF,
+        radius: f32,
+        p0: (f32, f32),
+        c0: u32,
+        p1: (f32, f32),
+        c1: u32,
+        width: f32,
+    ) -> Result<()> {
+        let brush = self.linear_brush(p0, c0, p1, c1)?;
+        let half = width / 2.0;
+        let inset = RectF { x: rect.x + half, y: rect.y + half, w: rect.w - width, h: rect.h - width };
+        let r = radius.max(0.0).min(inset.w / 2.0).min(inset.h);
+        self.with_top_rounded_path(
+            inset,
+            r,
+            move |rt, _, geo| {
+                // SAFETY: geo and brush live for the call.
+                unsafe { rt.DrawGeometry(geo, &brush, width, None::<&ID2D1StrokeStyle>) };
+                Ok(())
+            },
+            0,
+        )
+    }
+}
+
 /// Path-geometry drawing used by `svgpath`. Kept in its own block so it does not touch the core API.
 impl Renderer {
     /// Builds a path geometry through `build` (which drives an open sink), then fills it
