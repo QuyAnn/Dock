@@ -1441,6 +1441,7 @@ fn on_popup_click(x: f32, y: f32) {
                     }
                     popup_content::SettingsAction::ToggleAutoPin => {
                         settings.auto_pin = !settings.auto_pin;
+                        log(&format!("autopin: {} from Settings", if settings.auto_pin { "turned on" } else { "turned off" }));
                     }
                     popup_content::SettingsAction::CycleAutoPinCount => {
                         settings.auto_pin = true;

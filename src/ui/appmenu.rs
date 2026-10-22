@@ -41,6 +41,8 @@ pub enum AppMenuAction {
     Focus(isize),
     Pin,
     Unpin,
+    /// Turn auto-pinning off for all apps (Settings › "Tự động ghim app").
+    DisableAutoPin,
     CloseAll,
 }
 
@@ -92,8 +94,11 @@ pub fn content_height(menu: &AppMenuData) -> f32 {
     if menu.windows.len() > 1 {
         h += menu.windows.len() as f32 * ROW_H + GROUP_GAP;
     }
-    // launch + pin/unpin
+    // launch + pin/unpin (+ "turn off auto-pin" for auto-pinned apps)
     h += ROW_H * 2.0 + GROUP_GAP;
+    if is_auto(menu) {
+        h += ROW_H;
+    }
     if !menu.windows.is_empty() {
         h += ROW_H + GROUP_GAP;
     }
@@ -153,6 +158,13 @@ pub fn paint(r: &mut Renderer, rect: RectF) -> Result<()> {
         y += ROW_H;
     }
 
+    if is_auto(&menu) {
+        let row = RectF { x: rect.x + 6.0, y, w: rect.w - 12.0, h: ROW_H };
+        r.draw_text("Tắt tự động ghim app", inset_label(row), 11.5, TEXT, Align::Left)?;
+        rows.push((AppMenuAction::DisableAutoPin, row, false));
+        y += ROW_H;
+    }
+
     if !menu.windows.is_empty() {
         y += GROUP_GAP;
         r.fill_rect(RectF { x: rect.x + 8.0, y: y - 4.0, w: rect.w - 16.0, h: 1.0 }, DIVIDER)?;
@@ -168,6 +180,11 @@ pub fn paint(r: &mut Renderer, rect: RectF) -> Result<()> {
 
     ROWS.with(|r| *r.borrow_mut() = rows);
     Ok(())
+}
+
+/// The app is on the dock only because of auto-pin (not a manual pin).
+fn is_auto(menu: &AppMenuData) -> bool {
+    menu.pin_id.as_deref().is_some_and(|id| id.starts_with("auto:"))
 }
 
 fn inset_label(row: RectF) -> RectF {
@@ -216,6 +233,10 @@ pub fn apply(action: AppMenuAction, settings: &mut Settings) {
             if auto && !settings.auto_pin_hidden.iter().any(|h| h.eq_ignore_ascii_case(&menu.exe)) {
                 settings.auto_pin_hidden.push(menu.exe.clone());
             }
+        }
+        AppMenuAction::DisableAutoPin => {
+            settings.auto_pin = false;
+            crate::log("autopin: turned off from the app menu");
         }
         AppMenuAction::CloseAll => {
             crate::log(&format!("appmenu: close {} window(s) of {}", menu.windows.len(), menu.name));

@@ -2,7 +2,7 @@
 //! ClockTile, MusicTile, SystemTiles, styles.css `.popup*`). Pure drawing: the caller supplies data and the rect.
 //! Layout runs through `Ctx`, either drawing (`Some(renderer)`) or dry (`None`, used by `content_height`),
 //! so the window height and the drawn content always agree.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use chrono::{Datelike, Local, NaiveDate};
 use windows::core::Result;
@@ -210,8 +210,10 @@ pub fn hit_settings(x: f32, y: f32, rect: RectF) -> Option<SettingsAction> {
     }
     let auto = rect_at(inner_x, top + 447.0, inner_w, 30.0);
     if contains(auto, x, y) {
-        // Left half toggles; the value on the right cycles the count.
-        return Some(if x < auto.x + auto.w * 0.6 { SettingsAction::ToggleAutoPin } else { SettingsAction::CycleAutoPinCount });
+        // The count chip (left of the switch) cycles the count; anywhere else toggles on/off.
+        let chip = autopin_chip(auto);
+        let on = SETTINGS_AUTO_ON.with(Cell::get);
+        return Some(if on && contains(chip, x, y) { SettingsAction::CycleAutoPinCount } else { SettingsAction::ToggleAutoPin });
     }
     None
 }
@@ -818,8 +820,7 @@ fn draw_settings(c: &mut Ctx<'_>, y: f32, data: &DataState) -> Result<f32> {
         if settings.launch_at_startup { "Bật" } else { "Tắt" },
     )?;
     setting_value(c, rect_at(x, y + 409.0, w, 30.0), "Phím tắt ẩn / hiện", &settings.shortcut)?;
-    let auto = if settings.auto_pin { format!("Bật · {} app", settings.auto_pin_count) } else { "Tắt".to_owned() };
-    setting_value(c, rect_at(x, y + 447.0, w, 30.0), "Tự ghim app hay dùng", &auto)?;
+    autopin_row(c, rect_at(x, y + 447.0, w, 30.0), settings.auto_pin, settings.auto_pin_count)?;
     let git_hint = data
         .git
         .as_ref()
@@ -827,6 +828,43 @@ fn draw_settings(c: &mut Ctx<'_>, y: f32, data: &DataState) -> Result<f32> {
         .unwrap_or("Bấm Địa điểm hoặc Git / email để sửa settings.json.");
     c.text(git_hint, rect_at(x, y + 485.0, w, 28.0), font(9.0, MUTED))?;
     Ok(y + 522.0)
+}
+
+thread_local! {
+    /// Auto-pin state as last drawn (the hit test needs to know whether the chip is shown).
+    static SETTINGS_AUTO_ON: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Switch geometry inside the auto-pin row (right side, iOS-style pill).
+fn autopin_switch(area: RectF) -> RectF {
+    rect_at(area.x + area.w - 10.0 - 34.0, area.y + (area.h - 18.0) / 2.0, 34.0, 18.0)
+}
+
+/// "N app" chip left of the switch; click cycles 4/6/8/10/12.
+fn autopin_chip(area: RectF) -> RectF {
+    let sw = autopin_switch(area);
+    rect_at(sw.x - 8.0 - 54.0, area.y + (area.h - 20.0) / 2.0, 54.0, 20.0)
+}
+
+/// "Tự động ghim app" with a clear on/off switch and the count chip.
+fn autopin_row(c: &mut Ctx<'_>, area: RectF, on: bool, count: u32) -> Result<()> {
+    SETTINGS_AUTO_ON.with(|s| s.set(on));
+    c.round(area, 8.0, 0xFFFF_FF0B)?;
+    c.text("Tự động ghim app", rect_at(area.x + 10.0, area.y, area.w * 0.5, area.h), font(10.0, TEXT))?;
+    let sw = autopin_switch(area);
+    c.round(sw, sw.h / 2.0, if on { 0x34C7_59FF } else { 0xFFFF_FF2E })?;
+    let knob = 14.0;
+    let kx = if on { sw.x + sw.w - 2.0 - knob } else { sw.x + 2.0 };
+    c.round(rect_at(kx, sw.y + 2.0, knob, knob), knob / 2.0, 0xFFFF_FFFF)?;
+    if on {
+        let chip = autopin_chip(area);
+        c.round(chip, 6.0, 0xFFFF_FF14)?;
+        c.text(&format!("{count} app ▾"), chip, font(9.5, TEXT).center())?;
+    } else {
+        let label = rect_at(sw.x - 8.0 - 54.0, area.y, 54.0, area.h);
+        c.text("Tắt", label, font(9.5, MUTED).right())?;
+    }
+    Ok(())
 }
 
 fn setting_value(c: &mut Ctx<'_>, area: RectF, label: &str, value: &str) -> Result<()> {
