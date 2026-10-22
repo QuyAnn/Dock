@@ -950,6 +950,11 @@ fn liquid_for(map: &HashMap<(i32, i32, i32, i32), Arc<LiquidBitmap>>, mon: RECT)
 }
 
 fn repaint() {
+    repaint_docks(None);
+}
+
+/// Repaints every dock, or only the dock whose HWND is `only` (pointer moves).
+fn repaint_docks(only: Option<HWND>) {
     APP.with(|a| {
         let mut slot = a.borrow_mut();
         let Some(app) = slot.as_mut() else { return };
@@ -968,6 +973,7 @@ fn repaint() {
         });
         let primary_bg = liquid_for(&liquids, primary_mon);
 
+        if only.is_none_or(|h| h == app.hwnd) {
         paint_surface(
             &mut app.renderer,
             app.width,
@@ -981,7 +987,8 @@ fn repaint() {
             &settings,
             primary_bg.as_deref(),
         );
-        for sec in &mut app.secondaries {
+        }
+        for sec in app.secondaries.iter_mut().filter(|s| only.is_none_or(|h| h == s.hwnd)) {
             let bg = liquid_for(&liquids, sec.monitor);
             paint_surface(
                 &mut sec.renderer,
@@ -1020,6 +1027,30 @@ fn set_hover_on(hwnd: HWND, hover_at: Option<(f32, f32)>) -> bool {
             return changed;
         }
         false
+    })
+}
+
+thread_local! {
+    /// Whether the last pointer move was close enough to the app icons to magnify them.
+    static NEAR_APPS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True when `x` (dock-local DIP) is within magnification range of this dock's app icons.
+fn near_apps(hwnd: HWND, x: f32) -> bool {
+    APP.with(|a| {
+        let Ok(slot) = a.try_borrow() else { return true };
+        let Some(app) = slot.as_ref() else { return false };
+        let tiles = if app.hwnd == hwnd {
+            &app.tiles
+        } else if let Some(sec) = app.secondaries.iter().find(|s| s.hwnd == hwnd) {
+            &sec.tiles
+        } else {
+            return false;
+        };
+        tiles
+            .iter()
+            .find(|(id, _)| *id == "apps")
+            .is_some_and(|(_, r)| x >= r.x - 70.0 && x <= r.x + r.w + 70.0)
     })
 }
 
@@ -1525,11 +1556,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             };
             // SAFETY: tme is a valid local struct for the call.
             let _ = TrackMouseEvent(&mut tme);
-            // The app icons magnify under the pointer, so every move repaints.
+            // Only this dock repaints, and only when something visible changes: the hovered
+            // tile, or icon magnification near the apps zone (also once after leaving it).
             apps::set_pointer(Some(x));
-            set_hover_on(hwnd, Some((x, y)));
+            let hover_changed = set_hover_on(hwnd, Some((x, y)));
+            let near = near_apps(hwnd, x);
+            let was_near = NEAR_APPS.with(|c| c.replace(near));
             update_app_thumbnails(hwnd, x, y);
-            repaint();
+            if hover_changed || near || was_near {
+                repaint_docks(Some(hwnd));
+            }
             LRESULT(0)
         }
         WM_NCHITTEST => {
@@ -1538,6 +1574,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(HTCLIENT as isize)
         }
         WM_MOUSELEAVE => {
+            NEAR_APPS.with(|c| c.set(false));
             apps::set_pointer(None);
             set_hover_on(hwnd, None);
             thumbnails::cancel_pending(hwnd);

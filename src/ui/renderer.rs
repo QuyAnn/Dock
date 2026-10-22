@@ -156,6 +156,10 @@ pub struct Renderer {
     dpi: u32,
     target: Option<ID2D1HwndRenderTarget>,
     brush: Option<ID2D1SolidColorBrush>,
+    /// GPU bitmaps reused across frames (liquid backdrop, app icons). Keyed by the source
+    /// buffer address/size plus a content fingerprint; dropped with the render target.
+    bitmaps: std::collections::HashMap<(usize, usize, u32, u32, u64), (ID2D1Bitmap, u64)>,
+    frame: u64,
 }
 
 impl Renderer {
@@ -168,6 +172,8 @@ impl Renderer {
             dpi: dpi.max(96),
             target: None,
             brush: None,
+            bitmaps: std::collections::HashMap::new(),
+            frame: 0,
         }
     }
 
@@ -198,6 +204,7 @@ impl Renderer {
 
     /// Drops the render target and brush. Call when the window is hidden.
     pub fn release(&mut self) {
+        self.bitmaps.clear();
         self.brush = None;
         self.target = None;
     }
@@ -250,6 +257,12 @@ impl Renderer {
         unsafe {
             rt.BeginDraw();
             rt.Clear(Some(&clear as *const D2D1_COLOR_F));
+        }
+        self.frame += 1;
+        // Forget bitmaps not drawn in the last 120 frames (closed apps, old wallpaper, temp buffers).
+        if self.frame % 32 == 0 || self.bitmaps.len() > 256 {
+            let f = self.frame;
+            self.bitmaps.retain(|_, (_, used)| f.saturating_sub(*used) < 120);
         }
         Ok(())
     }
@@ -526,11 +539,44 @@ impl Renderer {
     }
 
     /// Draws straight (non-premultiplied) RGBA pixels scaled into `rect`.
-    /// The bitmap is created per call and released right after drawing.
+    /// The GPU bitmap is cached per source buffer, so redraws (hover, magnify) do not
+    /// re-convert and re-upload the 1920x46 backdrop on every mouse move.
     pub fn draw_bitmap(&mut self, w: u32, h: u32, rgba: &[u8], rect: RectF) -> Result<()> {
         if rgba.len() != w as usize * h as usize * 4 {
             return Err(E_INVALIDARG.into());
         }
+        let key = (rgba.as_ptr() as usize, rgba.len(), w, h, fingerprint(rgba));
+        let frame = self.frame;
+        let cached = self.bitmaps.get_mut(&key).map(|(b, used)| {
+            *used = frame;
+            b.clone()
+        });
+        let bitmap = match cached {
+            Some(b) => b,
+            None => {
+                let b = self.create_bitmap(w, h, rgba)?;
+                self.bitmaps.insert(key, (b.clone(), frame));
+                b
+            }
+        };
+        let (rt, _) = self.parts()?;
+        let r = d2d_rect(rect);
+        // SAFETY: `r` lives for the call.
+        unsafe {
+            rt.DrawBitmap(
+                &bitmap,
+                Some(&r as *const D2D_RECT_F),
+                1.0,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                None,
+            )
+        };
+        Ok(())
+    }
+}
+
+impl Renderer {
+    fn create_bitmap(&mut self, w: u32, h: u32, rgba: &[u8]) -> Result<ID2D1Bitmap> {
         // D2D wants premultiplied BGRA.
         let mut bgra = Vec::with_capacity(rgba.len());
         for px in rgba.chunks_exact(4) {
@@ -549,21 +595,21 @@ impl Renderer {
         };
         let size = D2D_SIZE_U { width: w, height: h };
         // SAFETY: `bgra` holds w*h*4 bytes and lives for the call; `props` likewise.
-        let bitmap: ID2D1Bitmap =
-            unsafe { rt.CreateBitmap(size, Some(bgra.as_ptr().cast::<c_void>()), w * 4, &props)? };
-        let r = d2d_rect(rect);
-        // SAFETY: `r` lives for the call.
-        unsafe {
-            rt.DrawBitmap(
-                &bitmap,
-                Some(&r as *const D2D_RECT_F),
-                1.0,
-                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                None,
-            )
-        };
-        Ok(())
+        unsafe { rt.CreateBitmap(size, Some(bgra.as_ptr().cast::<c_void>()), w * 4, &props) }
     }
+}
+
+/// Cheap content hash over ~256 evenly spaced bytes: a freed buffer reused at the same
+/// address with other pixels gets a new cache entry instead of a stale image.
+fn fingerprint(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let step = (data.len() / 256).max(1);
+    let mut i = 0;
+    while i < data.len() {
+        h = (h ^ data[i] as u64).wrapping_mul(0x0100_0000_01b3);
+        i += step;
+    }
+    h
 }
 
 /// Asks the Windows 11 compositor for anti-aliased rounded corners.
