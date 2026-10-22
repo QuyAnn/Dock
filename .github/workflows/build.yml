@@ -16,8 +16,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: ilammy/msvc-dev-cmd@v1
+
       - name: Build release
         run: cargo build --release --locked
+
+      - name: Verify static CRT dependencies
+        shell: pwsh
+        run: |
+          $dependencies = (& dumpbin /dependents target/release/smartdock.exe | Out-String)
+          $dependencies
+          $dynamicCrt = [regex]::Matches(
+            $dependencies,
+            '(?im)^\s*(VCRUNTIME140\S*\.dll|api-ms-win-crt-\S*\.dll)\s*$'
+          ).Value
+          if ($dynamicCrt.Count -gt 0) {
+            throw "Dynamic Visual C++ CRT dependencies remain: $($dynamicCrt -join ', ')"
+          }
+          Write-Host "Static CRT verified: no VCRUNTIME140*.dll or api-ms-win-crt-*.dll dependencies."
 
       - uses: actions/upload-artifact@v4
         with:
