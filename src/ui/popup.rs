@@ -1,7 +1,7 @@
 //! The single popup window. Created on `show`, destroyed on `hide` (or when dismissed).
 //! Never activates: WS_EX_NOACTIVATE, so keyboard focus stays where it was.
 //! Dismissal is polled (GetAsyncKeyState / GetCursorPos) because the window never gets input focus.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::sync::Once;
 
@@ -15,7 +15,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetSystemMetrics, GetWindowRect,
     KillTimer, RegisterClassExW, SetTimer, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
-    SW_SHOWNOACTIVATE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SW_SHOWNOACTIVATE, WM_LBUTTONUP, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -50,6 +50,18 @@ impl Drop for Popup {
 
 thread_local! {
     static POPUP: RefCell<Option<Popup>> = const { RefCell::new(None) };
+    static PAINTER: Cell<Option<fn(&mut Renderer, RectF)>> = const { Cell::new(None) };
+    static CLICK: Cell<Option<fn(f32, f32)>> = const { Cell::new(None) };
+}
+
+/// Sets the body painter, called inside each frame after the background (see `paint`).
+/// Receives left clicks inside the popup, in popup client coordinates.
+pub fn set_click_handler(f: fn(f32, f32)) {
+    CLICK.with(|c| c.set(Some(f)));
+}
+
+pub fn set_painter(f: fn(&mut Renderer, RectF)) {
+    PAINTER.with(|p| p.set(Some(f)));
 }
 
 /// Opens the popup above (or below, if the anchor is in the top half) `anchor`, centered on it.
@@ -149,6 +161,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             poll();
             LRESULT(0)
         }
+        WM_LBUTTONUP => {
+            let x = (lp.0 & 0xffff) as i16 as f32;
+            let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
+            if let Some(f) = CLICK.with(Cell::get) {
+                f(x, y);
+            }
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
 }
@@ -163,6 +183,9 @@ fn paint() {
             let _ = pw.renderer.begin().and_then(|_| {
                 pw.renderer.fill_rounded_rect(rect, RADIUS, 0x1E1F_249E)?;
                 pw.renderer.stroke_rounded_rect(rect, RADIUS, 0xFFFF_FF21, 1.0)?;
+                if let Some(f) = PAINTER.with(Cell::get) {
+                    f(&mut pw.renderer, rect);
+                }
                 pw.renderer.end()
             });
         }
