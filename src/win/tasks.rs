@@ -2,6 +2,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use windows::core::{w, PCWSTR, PWSTR};
@@ -18,6 +19,7 @@ use windows::Win32::Storage::Packaging::Appx::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_LWIN,
 };
+use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow,
@@ -26,7 +28,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, DeregisterShellHookWindow, GWL_EXSTYLE, GW_OWNER, SW_MINIMIZE,
     SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     AllowSetForegroundWindow, FindWindowW, ShowWindowAsync, SwitchToThisWindow, ASFW_ANY, SC_TASKLIST,
-    WM_SYSCOMMAND,
+    WM_SYSCOMMAND, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, SC_MINIMIZE,
+    ShowWindow, IsWindow, GetDesktopWindow, GetShellWindow,
 };
 
 use crate::model::WindowEntry;
@@ -369,24 +372,151 @@ pub fn note_foreign_foreground(hwnd: isize) {
         return;
     }
     if let Ok(mut g) = LAST_FOREIGN.lock() {
+        if *g != hwnd {
+            if let Ok(mut b) = LAST_FOREIGN_BEFORE.lock() {
+                *b = *g;
+            }
+        }
         *g = hwnd;
     }
 }
+
+/// The foreign foreground window before `LAST_FOREIGN` (where focus goes back to).
+static LAST_FOREIGN_BEFORE: Mutex<isize> = Mutex::new(0);
 
 fn last_foreign() -> isize {
     LAST_FOREIGN.lock().map(|g| *g).unwrap_or(0)
 }
 
-/// Taskbar-style click: focused (or last-foreign when fg is 0) → minimize; otherwise restore+focus.
-pub fn activate_window(hwnd: isize) {
+/// Foreground as reported by EVENT_SYSTEM_FOREGROUND (never a SmartDock window).
+static HOOK_FG: AtomicIsize = AtomicIsize::new(0);
+/// Last foreground *app* window that is not the Start/Search host (used to dismiss Start).
+static LAST_APP: AtomicIsize = AtomicIsize::new(0);
+/// Foreground captured when the mouse went down on the dock, before any activation.
+static CLICK_FG: AtomicIsize = AtomicIsize::new(0);
+/// Whether Start was open when the mouse went down on the dock.
+static CLICK_START_OPEN: AtomicBool = AtomicBool::new(false);
+/// Optional observer of foreground changes (usage tracking for auto-pins).
+static FG_OBSERVER: Mutex<Option<fn(isize)>> = Mutex::new(None);
+
+/// Tracks the foreground window with an out-of-context WinEvent hook (skips our own process),
+/// so toggle decisions never depend on a racy GetForegroundWindow at click time.
+/// Call once on the UI thread (needs its message loop).
+pub fn install_foreground_hook(observer: Option<fn(isize)>) {
+    if let Ok(mut o) = FG_OBSERVER.lock() {
+        *o = observer;
+    }
+    // SAFETY: the hook lives for the process; the callback only touches atomics.
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(on_foreground),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        )
+    };
     let fg = foreground_hwnd();
+    if fg != 0 && !is_own(fg) {
+        HOOK_FG.store(fg, Ordering::SeqCst);
+    }
+    crate::log(&format!("foreground hook installed={}", !hook.is_invalid()));
+}
+
+unsafe extern "system" fn on_foreground(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    let h = hwnd.0 as isize;
+    if h == 0 {
+        return;
+    }
+    HOOK_FG.store(h, Ordering::SeqCst);
+    note_foreign_foreground(h);
+    if !is_start_host(hwnd) {
+        LAST_APP.store(h, Ordering::SeqCst);
+    }
+    let observer = FG_OBSERVER.lock().ok().and_then(|o| *o);
+    if let Some(f) = observer {
+        f(h);
+    }
+}
+
+fn is_own(hwnd: isize) -> bool {
+    let mut pid = 0u32;
+    // SAFETY: plain query.
+    unsafe { GetWindowThreadProcessId(HWND(hwnd as _), Some(&mut pid)) };
+    pid == unsafe { GetCurrentProcessId() }
+}
+
+/// The foreground app right now: the real foreground unless it is SmartDock itself, then the
+/// hook's last foreign foreground.
+fn effective_foreground() -> isize {
+    let fg = foreground_hwnd();
+    if fg != 0 && !is_own(fg) {
+        return fg;
+    }
+    let hooked = HOOK_FG.load(Ordering::SeqCst);
+    if hooked != 0 {
+        hooked
+    } else {
+        last_foreign()
+    }
+}
+
+/// Call on WM_LBUTTONDOWN on the dock: snapshot foreground + Start state before anything
+/// the click does can change them.
+pub fn capture_click_state() {
+    let fg = effective_foreground();
+    CLICK_FG.store(fg, Ordering::SeqCst);
+    let start = start_window().is_some();
+    CLICK_START_OPEN.store(start, Ordering::SeqCst);
+}
+
+/// Whether Start was open when the current click began.
+pub fn start_was_open_at_click() -> bool {
+    CLICK_START_OPEN.load(Ordering::SeqCst)
+}
+
+/// Taskbar-style click: the app that was active at mouse-down (and not minimized) is
+/// minimized; anything else is restored + focused.
+pub fn activate_window(hwnd: isize) {
+    let captured = CLICK_FG.swap(0, Ordering::SeqCst);
+    let fg = if captured != 0 { captured } else { effective_foreground() };
     // SAFETY: IsIconic on a possibly stale handle just returns false.
     let iconic = unsafe { IsIconic(HWND(hwnd as _)).as_bool() };
-    if !iconic && (fg == hwnd || (fg == 0 && last_foreign() == hwnd)) {
+    let active = fg == hwnd || owner_root(fg) == hwnd;
+    crate::log(&format!(
+        "toggle hwnd={hwnd:#x} fg_at_down={fg:#x} iconic={iconic} -> {}",
+        if active && !iconic { "minimize" } else { "focus" }
+    ));
+    if active && !iconic {
         minimize_window(hwnd);
         return;
     }
     focus_window(hwnd);
+}
+
+/// Top-level owner of `hwnd` (dialogs / owned windows belong to their app window).
+fn owner_root(hwnd: isize) -> isize {
+    let mut h = HWND(hwnd as _);
+    // SAFETY: GetWindow on possibly stale handles just fails.
+    unsafe {
+        for _ in 0..8 {
+            match GetWindow(h, GW_OWNER) {
+                Ok(o) if !o.is_invalid() => h = o,
+                _ => break,
+            }
+        }
+    }
+    h.0 as isize
 }
 
 /// Brings a window to the front (restoring it if minimized). Never activates SmartDock.
@@ -435,19 +565,62 @@ pub fn focus_window(hwnd: isize) {
     }
 }
 
-/// Minimizes a user window without activating SmartDock. Async so an elevated or hung
-/// window (e.g. Task Manager) can never block the dock.
+/// Minimizes a user window without activating SmartDock.
+///
+/// ShowWindowAsync first (never blocks). Elevated windows (Task Manager) can refuse calls from
+/// our medium-integrity process, so a worker verifies with IsIconic and falls back to
+/// ShowWindow, then WM_SYSCOMMAND/SC_MINIMIZE, and finally hands the foreground back to the
+/// previous app so the elevated window at least stops being the active one. Every step is logged.
 pub fn minimize_window(hwnd: isize) {
     let target = HWND(hwnd as _);
-    unsafe {
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(target, Some(&mut pid as *mut u32));
-        if pid == 0 || pid == GetCurrentProcessId() {
+    let mut pid = 0u32;
+    // SAFETY: plain query on a possibly stale handle.
+    unsafe { GetWindowThreadProcessId(target, Some(&mut pid as *mut u32)) };
+    if pid == 0 || pid == unsafe { GetCurrentProcessId() } {
+        return;
+    }
+    // SAFETY: async show command on a foreign top-level window.
+    let posted = unsafe { ShowWindowAsync(target, SW_MINIMIZE).as_bool() };
+    let prev = LAST_FOREIGN_BEFORE.lock().map(|g| *g).unwrap_or(0);
+    std::thread::spawn(move || {
+        let target = HWND(hwnd as _);
+        let iconic = || unsafe { IsIconic(target).as_bool() };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if iconic() {
+            crate::log(&format!("minimize hwnd={hwnd:#x} async={posted} ok"));
             return;
         }
-        let ok = ShowWindowAsync(target, SW_MINIMIZE).as_bool();
-        crate::log(&format!("minimize hwnd={hwnd:#x} posted={ok}"));
-    }
+        // SAFETY: synchronous variant on a worker thread, so a hung target can't stall the UI.
+        unsafe {
+            let _ = ShowWindow(target, SW_MINIMIZE);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if iconic() {
+            crate::log(&format!("minimize hwnd={hwnd:#x} async={posted} sync=ok"));
+            return;
+        }
+        let sc = unsafe { PostMessageW(target, WM_SYSCOMMAND, WPARAM(SC_MINIMIZE as usize), LPARAM(0)).is_ok() };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if iconic() {
+            crate::log(&format!("minimize hwnd={hwnd:#x} async={posted} sc_minimize={sc} ok"));
+            return;
+        }
+        // Blocked (UIPI). Give the foreground to the previous app instead.
+        let back = if prev != 0 && prev != hwnd && unsafe { IsWindow(HWND(prev as _)).as_bool() } {
+            prev
+        } else {
+            unsafe { GetShellWindow().0 as isize }
+        };
+        crate::log(&format!(
+            "minimize hwnd={hwnd:#x} blocked (async={posted} sc_minimize={sc}); focusing previous {back:#x}"
+        ));
+        if back != 0 {
+            unsafe {
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+                let _ = SetForegroundWindow(HWND(back as _));
+            }
+        }
+    });
 }
 
 /// Graceful close via WM_CLOSE (never TerminateProcess / taskkill).
@@ -481,13 +654,18 @@ pub fn launch_exe(exe: &str) {
     }
 }
 
-/// Opens the Start menu from the dock's Start button.
+/// Dock Start button: toggles the Start menu.
 ///
-/// Primary path: post WM_SYSCOMMAND/SC_TASKLIST to the shell's Shell_TrayWnd (what the taskbar
-/// Start button itself does; works with the taskbar hidden and is not subject to UIPI input
-/// blocking). If Start is not in the foreground shortly after, fall back to one Win-key press
-/// on behalf of this explicit user click.
+/// If Start was open when the mouse went down, it is closed. Otherwise WM_SYSCOMMAND/SC_TASKLIST
+/// is posted to Shell_TrayWnd; after 450 ms, if Start is visible but not foreground it is made
+/// foreground (so a click elsewhere dismisses it normally); if it is not visible at all, one
+/// Win-key press is the fallback for this explicit click.
 pub fn open_start_menu() {
+    if start_was_open_at_click() || start_window().is_some() {
+        crate::log("start: open at click -> closing");
+        close_start_menu();
+        return;
+    }
     // SAFETY: FindWindowW/PostMessageW with static strings; the tray HWND may be absent.
     let posted = unsafe {
         let _ = AllowSetForegroundWindow(ASFW_ANY);
@@ -501,27 +679,104 @@ pub fn open_start_menu() {
     crate::log(&format!("start: SC_TASKLIST posted={posted}"));
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(450));
-        if start_in_foreground() {
-            crate::log("start: menu open");
-            return;
+        match start_window() {
+            Some(h) => {
+                let fg = unsafe { GetForegroundWindow() };
+                if fg == h {
+                    crate::log("start: menu open (foreground)");
+                } else {
+                    // Visible without focus never sees the outside click; give it the foreground.
+                    let ok = unsafe { SetForegroundWindow(h).as_bool() };
+                    crate::log(&format!("start: menu open, not foreground (fg class {}); set_fg={ok}", class_of(fg)));
+                }
+            }
+            None => {
+                crate::log(&format!(
+                    "start: not open after SC_TASKLIST (fg class {}), sending Win key",
+                    class_of(unsafe { GetForegroundWindow() })
+                ));
+                send_win_key();
+            }
         }
-        crate::log("start: not open after SC_TASKLIST, sending Win key");
-        send_win_key();
     });
 }
 
-/// True when the Start/Search host owns the foreground (Windows 10/11 CoreWindow host).
-fn start_in_foreground() -> bool {
-    unsafe {
-        let fg = GetForegroundWindow();
-        if fg.is_invalid() {
-            return false;
+/// Closes Start: hand the foreground back to the last app (Start dismisses itself on losing
+/// focus, exactly like clicking the desktop); if it is still open 250 ms later, one Win key.
+pub fn close_start_menu() {
+    let back = LAST_APP.load(Ordering::SeqCst);
+    let target = if back != 0 && unsafe { IsWindow(HWND(back as _)).as_bool() } {
+        HWND(back as _)
+    } else {
+        unsafe { GetShellWindow() }
+    };
+    let ok = unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        SetForegroundWindow(target).as_bool()
+    };
+    crate::log(&format!("start: closing via foreground -> {:#x} ({}) ok={ok}", target.0 as isize, class_of(target)));
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if start_window().is_some() {
+            crate::log("start: still open, sending Win key");
+            send_win_key();
+        } else {
+            crate::log("start: closed");
         }
-        let mut buf = [0u16; 64];
-        let n = GetClassNameW(fg, &mut buf);
-        let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
-        class == "Windows.UI.Core.CoreWindow" || class == "Xaml_WindowedPopupClass"
+    });
+}
+
+/// Called for a dock click that hit nothing: like clicking the desktop, it dismisses Start.
+pub fn dismiss_start_if_open() {
+    if start_was_open_at_click() || start_window().is_some() {
+        crate::log("start: empty dock click while open -> closing");
+        close_start_menu();
     }
+}
+
+fn class_of(hwnd: HWND) -> String {
+    let mut buf = [0u16; 64];
+    // SAFETY: valid buffer; stale handles return 0.
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+/// The Start / Search host window (Windows.UI.Core.CoreWindow owned by
+/// StartMenuExperienceHost.exe or SearchHost.exe).
+fn is_start_host(hwnd: HWND) -> bool {
+    if class_of(hwnd) != "Windows.UI.Core.CoreWindow" {
+        return false;
+    }
+    let mut pid = 0u32;
+    // SAFETY: plain query.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    let exe = process_identity(pid).0.to_ascii_lowercase();
+    ["startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe"]
+        .iter()
+        .any(|n| exe.ends_with(n))
+}
+
+/// The visible (not cloaked) Start/Search host window, if Start is open.
+fn start_window() -> Option<HWND> {
+    unsafe extern "system" fn each(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let out = &mut *(lp.0 as *mut Option<HWND>);
+        if !IsWindowVisible(hwnd).as_bool() || !is_start_host(hwnd) {
+            return BOOL::from(true);
+        }
+        let mut cloaked: u32 = 0;
+        if DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), 4).is_ok() && cloaked != 0 {
+            return BOOL::from(true);
+        }
+        *out = Some(hwnd);
+        BOOL::from(false)
+    }
+    let mut found: Option<HWND> = None;
+    // SAFETY: the callback only runs during EnumWindows with a pointer to `found`.
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&mut found as *mut Option<HWND> as isize));
+    }
+    let _ = GetDesktopWindow;
+    found
 }
 
 fn send_win_key() {

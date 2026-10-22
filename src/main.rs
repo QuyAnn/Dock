@@ -583,6 +583,7 @@ fn run() -> windows::core::Result<()> {
     // ABM_QUERYPOS can return a rect one taskbar-height above rcMonitor.bottom.
     appbar::hide_taskbar(initial_settings.taskbar_mode == "hidden");
     appbar::install_tray_show_hook();
+    tasks::install_foreground_hook(None);
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
     let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, dock_height_px)?;
@@ -1574,6 +1575,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        WM_LBUTTONDOWN => {
+            // Snapshot foreground + Start state before the click can change them.
+            tasks::capture_click_state();
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_LBUTTONUP => {
             let (x, y) = client_point(lparam);
             let click = dock_click_on(hwnd, x, y);
@@ -1586,7 +1592,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::Open(..) => "open popup",
             }));
             match click {
-                Click::None => {}
+                Click::None => tasks::dismiss_start_if_open(),
                 Click::Activate(h) => tasks::activate_window(h),
                 Click::Launch(exe) => tasks::launch_exe(&exe),
                 Click::Start => tasks::open_start_menu(),
