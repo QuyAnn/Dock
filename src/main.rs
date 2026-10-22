@@ -124,6 +124,8 @@ enum OpenPopup {
 enum Click {
     None,
     Activate(isize),
+    /// Pinned app with no open window.
+    Launch(String),
     Start,
     GrokBot,
     Open(OpenPopup, RectF),
@@ -621,6 +623,7 @@ fn run() -> windows::core::Result<()> {
     start_audio_meter(shared.clone());
 
     let mut apps = AppsState::default();
+    apps.pins = pins_of(&initial_settings);
     let attention = Attention::default();
     apps.refresh(&attention);
 
@@ -1138,8 +1141,12 @@ fn update_app_thumbnails(hwnd: HWND, x: f32, y: f32) {
         let w = &app.apps.windows[idx];
         let wins: Vec<(isize, String)> = apps::group_windows(&app.apps, w)
             .into_iter()
+            .filter(|e| e.hwnd != 0) // pinned launchers have nothing to preview
             .map(|e| (e.hwnd, e.title.clone()))
             .collect();
+        if wins.is_empty() {
+            return None;
+        }
         let scale = dpi::scale(dpi_value);
         let slot = apps::slot_rect(*rect, &app.apps, idx)?;
         let anchor = RECT {
@@ -1154,6 +1161,10 @@ fn update_app_thumbnails(hwnd: HWND, x: f32, y: f32) {
         Some((wins, anchor)) => thumbnails::schedule(hwnd, anchor, wins),
         None => thumbnails::cancel_pending(hwnd),
     }
+}
+
+fn pins_of(settings: &settings::Settings) -> Vec<(String, String)> {
+    settings.dock_pins.iter().map(|p| (p.exe.clone(), p.name.clone())).collect()
 }
 
 fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
@@ -1178,7 +1189,11 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
             h: DOCK_HEIGHT * scale,
         };
         match id {
-            "apps" => apps::hit_app(x, y, rect, &app.apps).map_or(Click::None, Click::Activate),
+            "apps" => match apps::hit_app_index(x, y, rect, &app.apps).map(|i| &app.apps.windows[i]) {
+                Some(w) if w.hwnd == 0 => Click::Launch(w.exe.clone()),
+                Some(w) => Click::Activate(w.hwnd),
+                None => Click::None,
+            },
             "start" => Click::Start,
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
             "claude" | "codex" | "cursor" => Click::Open(OpenPopup::Data(id), anchor),
@@ -1493,6 +1508,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                                     *current_settings = disk_settings;
                                     app.shared.refresh_slow.store(true, Ordering::SeqCst);
                                 }
+                                app.apps.pins = pins_of(&current_settings);
                                 drop(current_settings);
                                 app.apps.refresh(&app.attention);
                                 app.stats = data::stats::read_stats();
@@ -1563,6 +1579,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             log(&format!("click at ({x},{y}) -> {}", match &click {
                 Click::None => "none",
                 Click::Activate(_) => "activate",
+                Click::Launch(_) => "launch pinned",
                 Click::Start => "open Start",
                 Click::GrokBot => "grok bot",
                 Click::Open(..) => "open popup",
@@ -1570,6 +1587,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             match click {
                 Click::None => {}
                 Click::Activate(h) => tasks::activate_window(h),
+                Click::Launch(exe) => tasks::launch_exe(&exe),
                 Click::Start => tasks::open_start_menu(),
                 Click::GrokBot => grokbot::open_or_focus(),
                 Click::Open(which, anchor) => open_popup(which, anchor),

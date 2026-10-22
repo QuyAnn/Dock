@@ -78,6 +78,9 @@ pub struct AppsState {
     pub windows: Vec<WindowEntry>,
     /// Composed icons keyed by exe path. Pruned to the exes that are still open.
     icons: HashMap<String, AppIcon>,
+    /// Pinned apps (exe path, display name). Pins with no open window get a launcher slot
+    /// (`hwnd == 0`) after the running windows.
+    pub pins: Vec<(String, String)>,
 }
 
 impl AppsState {
@@ -93,6 +96,8 @@ impl AppsState {
         for w in &mut self.windows {
             w.attention = attention.contains(w.hwnd);
         }
+        let launchers = pinned_launchers(&self.pins, &self.windows);
+        self.windows.extend(launchers);
         for w in &self.windows {
             let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
             if w.exe.is_empty() || self.icons.contains_key(key) {
@@ -109,6 +114,22 @@ impl AppsState {
             .collect();
         self.icons.retain(|k, _| live.contains(k.as_str()));
     }
+}
+
+/// Launcher entries for pins whose exe has no open window.
+fn pinned_launchers(pins: &[(String, String)], open: &[WindowEntry]) -> Vec<WindowEntry> {
+    pins.iter()
+        .filter(|(exe, _)| !exe.is_empty() && !open.iter().any(|w| w.exe.eq_ignore_ascii_case(exe)))
+        .map(|(exe, name)| WindowEntry {
+            hwnd: 0,
+            title: name.clone(),
+            exe: exe.clone(),
+            aumid: String::new(),
+            package_path: String::new(),
+            attention: false,
+            minimized: false,
+        })
+        .collect()
 }
 
 /// Draws one slot per window that fits in `rect`, centered. Extra windows are clipped.
@@ -133,6 +154,9 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
             Some(icon) => draw_icon(r, icon, ico)?,
             None => draw_fallback(r, ico, &initial(w))?,
         }
+        if w.hwnd == 0 {
+            continue; // pinned launcher: no badge, no running dot
+        }
         if let Some(badge) = badge_of(w) {
             draw_badge(r, ico, badge, t)?;
         }
@@ -146,11 +170,6 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
         r.fill_rounded_rect(dot, DOT / 2.0, DOT_RGBA)?;
     }
     Ok(())
-}
-
-/// HWND of the window whose slot contains (x, y), if any.
-pub fn hit_app(x: f32, y: f32, rect: RectF, state: &AppsState) -> Option<isize> {
-    hit_app_index(x, y, rect, state).map(|i| state.windows[i].hwnd)
 }
 
 /// Index into `state.windows` for the slot under (x, y).
@@ -380,4 +399,83 @@ fn with_alpha(rgba: u32, a: f32) -> u32 {
 fn now_secs() -> f32 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_secs_f32()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::dock::{layout, Tile};
+
+    fn entry(hwnd: isize, exe: &str) -> WindowEntry {
+        WindowEntry {
+            hwnd,
+            title: String::new(),
+            exe: exe.to_owned(),
+            aumid: String::new(),
+            package_path: String::new(),
+            attention: false,
+            minimized: false,
+        }
+    }
+
+    fn t(id: &'static str, width: f32) -> Tile {
+        Tile { id, width, height: 0.0 }
+    }
+
+    /// Lays out the home-PC dock (1080p) with `n` apps; returns (rects, start index, apps index).
+    fn centred(n: usize, screen_w: f32) -> (Vec<RectF>, usize, usize) {
+        let left = vec![t("git", 118.0), t("cursor", 112.0), t("media", 200.0)];
+        let center = vec![t("start", 38.0), Tile { id: "apps", width: cluster_width(n), height: 44.0 }];
+        let right = vec![t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
+        (layout(&left, &center, &right, screen_w), left.len(), left.len() + 1)
+    }
+
+    fn mid(r: RectF) -> (f32, f32) {
+        (r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
+    #[test]
+    fn dock_layout_hit_start_button_on_centred_layout() {
+        for &(n, w) in &[(1usize, 1920.0f32), (5, 1920.0), (9, 2560.0)] {
+            let (rects, start, _) = centred(n, w);
+            let (x, y) = mid(rects[start]);
+            assert_eq!(hit_test(x, y, &rects), Some(start), "n={n} w={w}");
+            // The cluster straddles the screen centre, so Start sits left of it.
+            assert!(rects[start].x < w / 2.0);
+        }
+    }
+
+    #[test]
+    fn dock_layout_hit_every_app_slot_on_centred_layout() {
+        for &(n, w) in &[(1usize, 1920.0f32), (5, 1920.0), (12, 1920.0), (9, 2560.0)] {
+            let (rects, _, apps) = centred(n, w);
+            let mut state = AppsState::default();
+            state.windows = (0..n).map(|i| entry(100 + i as isize, "x.exe")).collect();
+            let rect = rects[apps];
+            for i in 0..n {
+                let slot = slot_rect(rect, &state, i).expect("slot fits");
+                let (x, y) = mid(slot);
+                assert_eq!(hit_test(x, y, &rects), Some(apps), "tile n={n} i={i}");
+                assert_eq!(hit_app_index(x, y, rect, &state), Some(i), "slot n={n} i={i}");
+                assert_eq!(state.windows[hit_app_index(x, y, rect, &state).unwrap()].hwnd, 100 + i as isize);
+            }
+            // Outside the cluster nothing is hit.
+            let y = rect.y + rect.h / 2.0;
+            assert_eq!(hit_app_index(rect.x - 1.0, y, rect, &state), None);
+            assert_eq!(hit_app_index(rect.x + rect.w + 1.0, y, rect, &state), None);
+        }
+    }
+
+    #[test]
+    fn dock_layout_pinned_not_running_gets_launcher_slot() {
+        let pins = vec![
+            ("C:\\Apps\\Code.exe".to_owned(), "Code".to_owned()),
+            ("C:\\Apps\\Notes.exe".to_owned(), "Notes".to_owned()),
+        ];
+        let open = vec![entry(7, "c:\\apps\\code.exe")];
+        let launchers = pinned_launchers(&pins, &open);
+        assert_eq!(launchers.len(), 1, "running pin is not duplicated");
+        assert_eq!(launchers[0].hwnd, 0);
+        assert_eq!(launchers[0].exe, "C:\\Apps\\Notes.exe");
+    }
 }
