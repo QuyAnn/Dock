@@ -200,6 +200,37 @@ pub fn install_tray_show_hook() {
         }
         let hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, Some(on_tray_show), pid, 0, WINEVENT_OUTOFCONTEXT);
         crate::log(&format!("taskbar: show hook installed={}", !hook.is_invalid()));
+        use windows::Win32::UI::WindowsAndMessaging::{EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER};
+        let moved = SetWinEventHook(
+            EVENT_OBJECT_REORDER,
+            EVENT_OBJECT_LOCATIONCHANGE,
+            None,
+            Some(on_tray_moved),
+            pid,
+            0,
+            WINEVENT_OUTOFCONTEXT,
+        );
+        crate::log(&format!("taskbar: peek z-order hook installed={}", !moved.is_invalid()));
+    }
+}
+
+/// While the overflow peek is active, any move/raise of the tray puts it back under the dock.
+unsafe extern "system" fn on_tray_moved(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if id_object != OBJID_WINDOW.0 || !TRAY_PEEK.load(Ordering::SeqCst) {
+        return;
+    }
+    let tray = PEEK_TRAY.load(Ordering::SeqCst);
+    let dock = PEEK_DOCK.load(Ordering::SeqCst);
+    if tray != 0 && dock != 0 && hwnd.0 as isize == tray {
+        keep_tray_under(HWND(tray as _), HWND(dock as _));
     }
 }
 
@@ -226,13 +257,17 @@ unsafe extern "system" fn on_tray_show(
 
 /// Set while the tray-overflow flyout is opening/open (see `win::overflow`).
 static TRAY_PEEK: AtomicBool = AtomicBool::new(false);
-/// We added WS_EX_LAYERED (alpha 0) to the primary tray for the current peek.
+/// We added WS_EX_LAYERED (alpha 0) to the primary tray (older builds only; cleaned up).
 static PEEK_LAYERED: AtomicBool = AtomicBool::new(false);
+/// Dock / tray of the current peek (for the location-change hook).
+static PEEK_DOCK: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+static PEEK_TRAY: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
-/// Temporarily "shows" the hidden primary taskbar so UI Automation can reach its XAML tray
-/// (a hidden window's XAML content is not in the UIA tree) and the overflow flyout it owns
-/// can stay open — but never visibly: it is made fully transparent (layered, alpha 0)
-/// *before* it is shown, never activated, and kept just under our topmost dock.
+/// Temporarily shows the hidden primary taskbar so UI Automation can reach its XAML tray
+/// (a hidden — or alpha-0 layered — window's XAML content is not in the UIA tree) and the
+/// overflow flyout it owns can stay open. It is never activated and is kept just under our
+/// topmost dock, whose opaque bar fully covers the taskbar's rect (re-applied from a
+/// location-change hook the moment Explorer slides/raises it).
 /// Returns the tray hwnd and whether it was hidden.
 pub fn peek_primary_tray(dock: HWND) -> Option<(HWND, bool)> {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA;
@@ -240,8 +275,11 @@ pub fn peek_primary_tray(dock: HWND) -> Option<(HWND, bool)> {
     TRAY_PEEK.store(true, Ordering::SeqCst);
     // SAFETY: plain queries/updates on the live shell window.
     let was_hidden = unsafe { !IsWindowVisible(tray).as_bool() };
+    PEEK_DOCK.store(dock.0 as isize, Ordering::SeqCst);
+    PEEK_TRAY.store(tray.0 as isize, Ordering::SeqCst);
     if was_hidden {
-        ghost_tray(tray, true);
+        // Order it under the dock first, then show it there (SW_SHOWNA keeps the z-order).
+        keep_tray_under(tray, dock);
         unsafe {
             let _ = ShowWindow(tray, SW_SHOWNA);
         }
@@ -313,6 +351,7 @@ pub fn clear_stale_tray_ghost() {
 /// Ends `peek_primary_tray`: re-hides the taskbar (hidden mode), then drops the transparency.
 pub fn end_tray_peek() {
     TRAY_PEEK.store(false, Ordering::SeqCst);
+    PEEK_TRAY.store(0, Ordering::SeqCst);
     enforce_taskbar_hidden();
     if let Some(tray) = primary_tray() {
         ghost_tray(tray, false);
