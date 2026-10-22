@@ -1,31 +1,83 @@
-//! Popup body drawing per tile kind. Pure drawing: the caller supplies data and the rect.
-//! `rect` is the whole popup area; content is inset by PAD.
+//! Popup body drawing per kind, matching the old Electron popups (Popup.tsx, GitTile, AiTiles,
+//! ClockTile, MusicTile, SystemTiles, styles.css `.popup*`). Pure drawing: the caller supplies data and the rect.
+//! Layout runs through `Ctx`, either drawing (`Some(renderer)`) or dry (`None`, used by `content_height`),
+//! so the window height and the drawn content always agree.
 use std::cell::RefCell;
 
+use chrono::{Datelike, Local, NaiveDate};
 use windows::core::Result;
 
 use super::dock::RectF;
-use super::renderer::{Align, Renderer};
+use super::renderer::{Align, Renderer, TextStyle};
 use crate::data::git::GitSummary;
 use crate::data::weather::Weather;
-use crate::model::{AiUsage, Media};
+use crate::model::{AiUsage, GitDay, Media};
 
-const PAD: f32 = 14.0;
-const ROW_H: f32 = 22.0;
-const CELL: f32 = 12.0;
-const CELL_GAP: f32 = 3.0;
-const BTN_H: f32 = 28.0;
-const BTN_GAP: f32 = 6.0;
+pub use super::tiles::DataState;
+
+/// Popup client width minus the 1px border (popup.rs uses 320 px).
+const WIDTH: f32 = 319.0;
+const PAD_X: f32 = 14.0;
+const HEAD_H: f32 = 47.0; // header incl. its 1px divider
+const SEC_TITLE_H: f32 = 29.0; // psection-title: 10 top, 13 text, 6 bottom
+const SEC_END_H: f32 = 5.0; // psection: 4 bottom padding, 1px divider
+const ROW_H: f32 = 29.0; // prow without bar: 7 + 15 + 7
+const ROW_BAR_H: f32 = 39.0; // prow with bar: 7 + 15 + 6 + 4 + 7
+const VALUE_W: f32 = 48.0;
+const BAR_FRAC: f32 = 0.6; // .pbar is 60% wide
+const HM_CELL: f32 = 13.0;
+const HM_GAP: f32 = 1.5;
+const HM_COLS: usize = 17;
+const HM_ROWS: usize = 7;
+const HM_H: f32 = HM_ROWS as f32 * HM_CELL + (HM_ROWS - 1) as f32 * HM_GAP;
+const SPARK_H: f32 = 40.0;
+const BTN_D: f32 = 38.0;
+const BTN_GAP: f32 = 10.0;
+/// Media buttons sit this far below the top of the body (fixed, so hit testing needs no data).
+const MEDIA_BTN_Y: f32 = SEC_TITLE_H + 109.0;
 
 const TEXT: u32 = 0xFFFF_FFE6;
-const DIM: u32 = 0xFFFF_FF99;
-const FAINT: u32 = 0xFFFF_FF55;
-const TRACK: u32 = 0xFFFF_FF33;
-const BTN: u32 = 0xFFFF_FF1F;
-const BTN_STROKE: u32 = 0xFFFF_FF2E;
+const MUTED: u32 = 0xFFFF_FF8C; // rgba(255,255,255,.55)
+const FAINT: u32 = 0xFFFF_FF66; // weekday headers of the month grid
+const EMPTY_TEXT: u32 = 0xFFFF_FF99;
+const TRACK: u32 = 0xFFFF_FF14; // bar track, .08
+const STRIPE: u32 = 0xFFFF_FF06; // even rows, .025
+const DIVIDER: u32 = 0xFFFF_FF0F; // psection border, .06
+const HEAD_DIVIDER: u32 = 0xFFFF_FF12; // phead border, .07
+const BADGE_BG: u32 = 0xFFFF_FF1A;
+const BADGE_TEXT: u32 = 0xFFFF_FFBF;
+const WHITE: u32 = 0xFFFF_FFFF;
+const BTN: u32 = 0xFFFF_FF14; // .mctl span, .08
+const BTN_BIG: u32 = 0xFFFF_FFEB; // .mctl span.big, .92
+const BTN_BIG_TEXT: u32 = 0x1111_11FF;
+const WAVE_COLOR: u32 = 0xC7A6_FFFF;
+const WAVE_COLOR_IDLE: u32 = 0xC7A6_FF8C;
+const TODAY: u32 = 0xE832_1EFF; // .month .today
+const GREEN: u32 = 0x3FD2_7FFF;
+const ORANGE: u32 = 0xFFB3_40FF;
+const RED: u32 = 0xFF5D_5DFF;
+const BLUE: u32 = 0x4AA8_FFFF;
+/// Heatmap levels: empty, then 4 greens (.hm.l0..l4).
+const HEAT: [u32; 5] = [0xFFFF_FF14, 0x0E44_29FF, 0x006D_32FF, 0x26A6_41FF, 0x39D3_53FF];
+const WAVE: [f32; 14] = [8.0, 14.0, 22.0, 10.0, 26.0, 16.0, 6.0, 18.0, 28.0, 12.0, 20.0, 8.0, 16.0, 24.0];
 
-/// Heatmap levels: 0 (none) then 4 green shades for 1, 2, 3, 4+ commits.
-const HEAT: [u32; 5] = [0xFFFF_FF14, 0x4ADE_8055, 0x4ADE_8099, 0x4ADE_80CC, 0x4ADE_80FF];
+const PREV: &str = "\u{E892}";
+const NEXT: &str = "\u{E893}";
+const PLAY: &str = "\u{E768}";
+const PAUSE: &str = "\u{E769}";
+
+const WEEKDAYS: [&str; 7] = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
+const AI_NOTE: &str = "Đọc từ đăng nhập cục bộ của bạn trên máy này; token chỉ gửi tới endpoint của chính nhà cung cấp. Claude: tối đa 15 phút/lần do giới hạn API.";
+const OPEN_METEO: &str = "Thời tiết: Open-Meteo (không cần key).";
+const LOCAL_NOTE: &str = "Đo cục bộ mỗi 2 giây.";
+
+/// Settings placeholder rows: (label, on).
+const SETTINGS: [(&str, bool); 4] = [
+    ("Start with Windows", true),
+    ("Full-width dock", false),
+    ("Dark mode", true),
+    ("Show attention dots", true),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PopupKind {
@@ -33,6 +85,9 @@ pub enum PopupKind {
     Ai,
     Weather,
     Media,
+    Clock,
+    Cpu,
+    Ram,
     Settings,
 }
 
@@ -43,37 +98,27 @@ pub enum MediaAction {
     Next,
 }
 
-pub use super::tiles::DataState;
 
-/// Settings placeholder rows: (label, on).
-const SETTINGS: [(&str, bool); 4] = [
-    ("Start with Windows", true),
-    ("Full-width dock", false),
-    ("Dark mode", true),
-    ("Show attention dots", true),
-];
-
-/// Draws the body of one popup into `rect`. Call between `Renderer::begin` and `end`.
-pub fn draw_popup(r: &mut Renderer, kind: PopupKind, rect: RectF, data: &DataState) -> Result<()> {
-    let inner = RectF { x: rect.x + PAD, y: rect.y + PAD, w: (rect.w - 2.0 * PAD).max(0.0), h: (rect.h - 2.0 * PAD).max(0.0) };
-    match kind {
-        PopupKind::Git => draw_git(r, inner, data.git.as_ref()),
-        PopupKind::Ai => draw_ai(r, inner, &data.ai),
-        PopupKind::Weather => draw_weather(r, inner, data.weather.as_ref()),
-        PopupKind::Media => draw_media(r, inner, data.media.as_ref()),
-        PopupKind::Settings => draw_settings(r, inner),
-    }
+thread_local! {
+    static CONTENT: RefCell<Option<(PopupKind, DataState)>> = const { RefCell::new(None) };
+    /// Sample history per kind (Cpu, Ram), percent 0..=100, oldest first.
+    static HISTORY: RefCell<Vec<(PopupKind, Vec<f32>)>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Hit test for the media buttons. `rect` must match the one passed to `draw_popup`.
-pub fn hit_media_button(x: f32, y: f32, rect: RectF) -> Option<MediaAction> {
-    let inner = inset(rect);
-    let [prev, play, next] = media_buttons(inner);
-    let actions = [(prev, MediaAction::Previous), (play, MediaAction::PlayPause), (next, MediaAction::Next)];
-    actions
-        .into_iter()
-        .find(|(b, _)| x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h)
-        .map(|(_, a)| a)
+/// Stores the samples for a sparkline (Cpu or Ram). Call `popup::invalidate` after updating while open.
+pub fn set_history(kind: PopupKind, samples: Vec<f32>) {
+    HISTORY.with(|h| {
+        let mut h = h.borrow_mut();
+        match h.iter().position(|(k, _)| *k == kind) {
+            Some(i) => h[i].1 = samples,
+            None => h.push((kind, samples)),
+        }
+    });
+}
+
+/// Stores what `paint_content` draws. Call before `popup::show` and after each data refresh.
+pub fn set_content(kind: PopupKind, data: DataState) {
+    CONTENT.with(|c| *c.borrow_mut() = Some((kind, data)));
 }
 
 /// Painter with the signature `popup::set_painter` expects. Draws the content stored by `set_content`.
@@ -86,162 +131,555 @@ pub fn paint_content(r: &mut Renderer, rect: RectF) {
     });
 }
 
-thread_local! {
-    static CONTENT: RefCell<Option<(PopupKind, DataState)>> = const { RefCell::new(None) };
+/// Draws the whole popup (header, body, footer) into `rect`. Call between `Renderer::begin` and `end`.
+pub fn draw_popup(r: &mut Renderer, kind: PopupKind, rect: RectF, data: &DataState) -> Result<()> {
+    let mut c = Ctx { r: Some(r), rect };
+    draw_all(&mut c, kind, data).map(|_| ())
 }
 
-/// Stores what `paint_content` draws. Call before `popup::show` and after each data refresh.
-pub fn set_content(kind: PopupKind, data: DataState) {
-    CONTENT.with(|c| *c.borrow_mut() = Some((kind, data)));
+/// Total popup height for this content, in DIPs. Use it as the window height (and in the click hit test).
+pub fn content_height(kind: PopupKind, data: &DataState) -> f32 {
+    let mut c = Ctx { r: None, rect: RectF { x: 0.0, y: 0.0, w: WIDTH, h: 0.0 } };
+    draw_all(&mut c, kind, data).unwrap_or(0.0)
 }
 
-fn inset(rect: RectF) -> RectF {
-    RectF { x: rect.x + PAD, y: rect.y + PAD, w: (rect.w - 2.0 * PAD).max(0.0), h: (rect.h - 2.0 * PAD).max(0.0) }
+/// Hit test for the media buttons. `rect` must match the one passed to `draw_popup`.
+pub fn hit_media_button(x: f32, y: f32, rect: RectF) -> Option<MediaAction> {
+    let [prev, play, next] = media_buttons(rect);
+    let actions = [(prev, MediaAction::Previous), (play, MediaAction::PlayPause), (next, MediaAction::Next)];
+    actions
+        .into_iter()
+        .find(|(b, _)| x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h)
+        .map(|(_, a)| a)
 }
 
-/// Row `i` of the inner area, full width.
-fn row(inner: RectF, i: f32) -> RectF {
-    RectF { x: inner.x, y: inner.y + i * ROW_H, w: inner.w, h: ROW_H }
+fn media_buttons(rect: RectF) -> [RectF; 3] {
+    let y = rect.y + HEAD_H + MEDIA_BTN_Y;
+    [0.0, 1.0, 2.0].map(|i| rect_at(rect.x + PAD_X + i * (BTN_D + BTN_GAP), y, BTN_D, BTN_D))
 }
 
-fn title(r: &mut Renderer, rc: RectF, text: &str) -> Result<()> {
-    r.draw_text(text, rc, 14.0, TEXT, Align::Left)
+// ---------------------------------------------------------------- drawing context
+
+/// Drawing target. With `r == None` it only advances the layout (dry run for `content_height`).
+struct Ctx<'a> {
+    r: Option<&'a mut Renderer>,
+    rect: RectF,
 }
 
-/// Label on the left, value on the right.
-fn kv(r: &mut Renderer, rc: RectF, key: &str, value: &str) -> Result<()> {
-    r.draw_text(key, rc, 13.0, DIM, Align::Left)?;
-    r.draw_text(value, rc, 13.0, TEXT, Align::Right)
+#[derive(Clone, Copy)]
+struct Font {
+    size: f32,
+    rgba: u32,
+    align: Align,
+    style: TextStyle,
 }
 
-fn draw_git(r: &mut Renderer, inner: RectF, git: Option<&GitSummary>) -> Result<()> {
-    title(r, row(inner, 0.0), "Git activity")?;
-    let Some(g) = git else {
-        return r.draw_text("Loading...", row(inner, 1.0), 13.0, DIM, Align::Left);
-    };
-    if let Some(err) = &g.error {
-        r.draw_text(err, row(inner, 1.0), 12.0, DIM, Align::Left)?;
-    } else {
-        // Three numbers across one row: value then label.
-        let col_w = inner.w / 3.0;
-        for (i, (value, label)) in [(g.today, "today"), (g.week, "week"), (g.streak, "streak")].iter().enumerate() {
-            let x = inner.x + i as f32 * col_w;
-            let rc = row(inner, 1.0);
-            r.draw_text(&value.to_string(), RectF { x, w: 36.0, ..rc }, 14.0, TEXT, Align::Left)?;
-            r.draw_text(label, RectF { x: x + 36.0, w: col_w - 36.0, ..rc }, 12.0, DIM, Align::Left)?;
+fn font(size: f32, rgba: u32) -> Font {
+    Font { size, rgba, align: Align::Left, style: TextStyle::Ui }
+}
+
+impl Font {
+    fn bold(self) -> Self {
+        Font { style: TextStyle::Bold, ..self }
+    }
+    fn center(self) -> Self {
+        Font { align: Align::Center, ..self }
+    }
+    fn right(self) -> Self {
+        Font { align: Align::Right, ..self }
+    }
+    fn icon(self) -> Self {
+        Font { style: TextStyle::Icon, ..self }
+    }
+}
+
+fn rect_at(x: f32, y: f32, w: f32, h: f32) -> RectF {
+    RectF { x, y, w, h }
+}
+
+impl Ctx<'_> {
+    fn inner_x(&self) -> f32 {
+        self.rect.x + PAD_X
+    }
+
+    fn inner_w(&self) -> f32 {
+        self.rect.w - 2.0 * PAD_X
+    }
+
+    fn fill(&mut self, area: RectF, rgba: u32) -> Result<()> {
+        match self.r.as_deref_mut() {
+            Some(r) => r.fill_rect(area, rgba),
+            None => Ok(()),
         }
     }
-    let top = inner.y + 2.0 * ROW_H + 8.0;
-    draw_heatmap(r, inner.x, top, &g.heatmap)
+
+    fn round(&mut self, area: RectF, radius: f32, rgba: u32) -> Result<()> {
+        match self.r.as_deref_mut() {
+            Some(r) => r.fill_rounded_rect(area, radius, rgba),
+            None => Ok(()),
+        }
+    }
+
+    fn text(&mut self, s: &str, area: RectF, f: Font) -> Result<()> {
+        match self.r.as_deref_mut() {
+            Some(r) => r.draw_text_styled(s, area, f.size, f.rgba, f.align, f.style),
+            None => Ok(()),
+        }
+    }
 }
 
-/// 7 rows (weekdays) by N columns (weeks), oldest day first, drawn column by column.
-fn draw_heatmap(r: &mut Renderer, x: f32, y: f32, days: &[crate::model::GitDay]) -> Result<()> {
-    let max = days.iter().map(|d| d.commits).max().unwrap_or(0).max(1);
-    for (i, day) in days.iter().enumerate() {
-        let col = (i / 7) as f32;
-        let row_i = (i % 7) as f32;
-        let level = match day.commits {
-            0 => 0,
-            c => {
-                // Scale against the busiest day, then map to 1..=4.
-                let s = (c as f32 / max as f32 * 4.0).ceil() as usize;
-                s.clamp(1, 4)
+// ---------------------------------------------------------------- shared pieces
+
+struct Meta {
+    glyph: &'static str,
+    color: u32,
+    title: &'static str,
+    badge: Option<String>,
+    note: &'static str,
+}
+
+fn meta(kind: PopupKind) -> Meta {
+    match kind {
+        PopupKind::Git => Meta {
+            glyph: "⎇",
+            color: 0x2EA0_43FF,
+            title: "Git activity",
+            badge: None,
+            note: "Đếm commit của bạn từ git log trong các thư mục đã cấu hình.",
+        },
+        PopupKind::Ai => Meta { glyph: "✦", color: 0xD977_57FF, title: "AI usage", badge: None, note: AI_NOTE },
+        PopupKind::Weather => Meta { glyph: "☀", color: 0xF5A5_24FF, title: "Thời tiết", badge: None, note: "Open-Meteo." },
+        PopupKind::Media => Meta {
+            glyph: "♪",
+            color: 0xE548_4DFF,
+            title: "Đang phát",
+            badge: None,
+            note: "Từ Windows Media Controls (Spotify, trình duyệt, …).",
+        },
+        PopupKind::Clock => {
+            let t = Local::now().date_naive();
+            Meta {
+                glyph: "◷",
+                color: 0xE54D_2EFF,
+                title: "Hôm nay",
+                badge: Some(format!("{:02}/{:02}/{}", t.day(), t.month(), t.year())),
+                note: OPEN_METEO,
             }
-        };
-        let rc = RectF { x: x + col * (CELL + CELL_GAP), y: y + row_i * (CELL + CELL_GAP), w: CELL, h: CELL };
-        r.fill_rounded_rect(rc, 2.0, HEAT[level])?;
-    }
-    Ok(())
-}
-
-fn draw_ai(r: &mut Renderer, inner: RectF, ai: &[AiUsage]) -> Result<()> {
-    title(r, row(inner, 0.0), "AI usage")?;
-    if ai.is_empty() {
-        return r.draw_text("No providers", row(inner, 1.0), 13.0, DIM, Align::Left);
-    }
-    const NAME_W: f32 = 88.0;
-    const RESET_W: f32 = 96.0;
-    for (i, u) in ai.iter().enumerate() {
-        let rc = row(inner, i as f32 + 1.0);
-        r.draw_text(&u.name, RectF { w: NAME_W, ..rc }, 13.0, TEXT, Align::Left)?;
-        let bar_x = inner.x + NAME_W + 4.0;
-        let bar_w = (inner.w - NAME_W - RESET_W - 8.0).max(0.0);
-        if u.session_pct.is_nan() {
-            // No data: reset_text holds the status (sign-in needed, error, ...).
-            let status = RectF { x: bar_x, w: inner.w - NAME_W - 4.0, ..rc };
-            r.draw_text(&u.reset_text, status, 12.0, DIM, Align::Left)?;
-            continue;
         }
-        let track = RectF { x: bar_x, y: rc.y + (ROW_H - 4.0) / 2.0, w: bar_w, h: 4.0 };
-        r.fill_rect(track, TRACK)?;
-        let frac = (u.session_pct / 100.0).clamp(0.0, 1.0);
-        r.fill_rect(RectF { w: bar_w * frac, ..track }, TEXT)?;
-        r.draw_text(&u.reset_text, RectF { x: inner.x + inner.w - RESET_W, w: RESET_W, ..rc }, 12.0, DIM, Align::Right)?;
+        PopupKind::Cpu => Meta { glyph: "◔", color: 0x30A4_6CFF, title: "CPU", badge: None, note: LOCAL_NOTE },
+        PopupKind::Ram => Meta { glyph: "◔", color: 0x3E63_DDFF, title: "RAM", badge: None, note: LOCAL_NOTE },
+        PopupKind::Settings => Meta { glyph: "⚙", color: 0x6B6B_75FF, title: "Settings", badge: None, note: "" },
+    }
+}
+
+/// .phead: 24px colored icon, 13.5px title, optional badge at the right edge.
+fn header(c: &mut Ctx<'_>, m: &Meta) -> Result<()> {
+    let (x, y) = (c.rect.x + PAD_X, c.rect.y + 12.0);
+    c.round(rect_at(x, y, 24.0, 24.0), 7.0, m.color)?;
+    c.text(m.glyph, rect_at(x, y, 24.0, 24.0), font(13.0, WHITE).center())?;
+
+    // Badge width is estimated: the renderer cannot measure text.
+    let badge_w = m.badge.as_ref().map(|b| b.chars().count() as f32 * 5.4 + 14.0);
+    let title_w = c.rect.w - 47.0 - PAD_X - badge_w.unwrap_or(0.0);
+    c.text(m.title, rect_at(c.rect.x + 47.0, y, title_w, 24.0), font(13.5, TEXT).bold())?;
+    if let (Some(b), Some(bw)) = (&m.badge, badge_w) {
+        let bx = c.rect.x + c.rect.w - PAD_X - bw;
+        c.round(rect_at(bx, y + 4.0, bw, 16.0), 6.0, BADGE_BG)?;
+        c.text(b, rect_at(bx, y + 4.0, bw, 16.0), font(10.0, BADGE_TEXT).center())?;
+    }
+    c.fill(rect_at(c.rect.x, c.rect.y + HEAD_H - 1.0, c.rect.w, 1.0), HEAD_DIVIDER)
+}
+
+/// .pfoot: wrapped note text. Returns the bottom of the popup.
+fn footer(c: &mut Ctx<'_>, y: f32, note: &str) -> Result<f32> {
+    if note.is_empty() {
+        return Ok(y);
+    }
+    let max_chars = (c.inner_w() / 5.0) as usize;
+    let top = y + 10.0;
+    let lines = wrap(note, max_chars);
+    for (i, line) in lines.iter().enumerate() {
+        c.text(line, rect_at(c.inner_x(), top + i as f32 * 13.0, c.inner_w(), 13.0), font(9.5, MUTED))?;
+    }
+    Ok(top + lines.len() as f32 * 13.0 + 12.0)
+}
+
+/// Greedy word wrap by character count.
+fn wrap(text: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > max_chars {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
+/// .psection-title. Returns the y where the section content starts.
+fn section(c: &mut Ctx<'_>, y: f32, title: &str) -> Result<f32> {
+    c.text(title, rect_at(c.inner_x(), y + 10.0, c.inner_w(), 13.0), font(9.5, MUTED).bold())?;
+    Ok(y + SEC_TITLE_H)
+}
+
+/// Bottom padding and divider of a section. Returns the y after the section.
+fn section_end(c: &mut Ctx<'_>, y: f32) -> Result<f32> {
+    c.fill(rect_at(c.rect.x, y + 4.0, c.rect.w, 1.0), DIVIDER)?;
+    Ok(y + SEC_END_H)
+}
+
+/// .pempty: centered-left message block with no section.
+fn empty(c: &mut Ctx<'_>, y: f32, text: &str) -> Result<f32> {
+    c.text(text, rect_at(c.inner_x(), y + 16.0, c.inner_w(), 16.0), font(11.0, EMPTY_TEXT))?;
+    Ok(y + 48.0)
+}
+
+/// .prow: label left, optional hint right of it, bold value at the right, optional 60% bar below.
+/// Even rows get the zebra stripe, like `.prow:nth-child(even)`.
+fn row(
+    c: &mut Ctx<'_>,
+    y: f32,
+    i: usize,
+    label: &str,
+    hint: Option<&str>,
+    value: Option<&str>,
+    bar: Option<(f32, u32)>,
+) -> Result<f32> {
+    let h = if bar.is_some() { ROW_BAR_H } else { ROW_H };
+    if i % 2 == 0 {
+        c.fill(rect_at(c.rect.x, y, c.rect.w, h), STRIPE)?;
+    }
+    let (x, w) = (c.inner_x(), c.inner_w());
+    c.text(label, rect_at(x, y + 7.0, w * 0.5, 15.0), font(11.0, TEXT))?;
+    if let Some(hint) = hint {
+        let hint_w = if value.is_some() { w - VALUE_W } else { w };
+        c.text(hint, rect_at(x, y + 7.0, hint_w, 15.0), font(9.5, MUTED).right())?;
+    }
+    if let Some(v) = value {
+        c.text(v, rect_at(x + w - VALUE_W, y + 7.0, VALUE_W, 15.0), font(11.0, TEXT).bold().right())?;
+    }
+    if let Some((frac, color)) = bar {
+        let track = rect_at(x, y + 28.0, w * BAR_FRAC, 4.0);
+        c.round(track, 2.0, TRACK)?;
+        let fill_w = track.w * frac.clamp(0.0, 1.0);
+        if fill_w > 0.0 {
+            c.round(rect_at(track.x, track.y, fill_w, 4.0), 2.0, color)?;
+        }
+    }
+    Ok(y + h)
+}
+
+/// Thresholds of the system panels (pctColor in common.tsx).
+fn pct_color(v: f32) -> u32 {
+    if v > 85.0 {
+        RED
+    } else if v > 65.0 {
+        ORANGE
+    } else {
+        GREEN
+    }
+}
+
+/// Thresholds of the AI usage bars (barColor in AiTiles.tsx).
+fn ai_color(v: f32) -> u32 {
+    if v >= 90.0 {
+        RED
+    } else if v >= 70.0 {
+        ORANGE
+    } else {
+        GREEN
+    }
+}
+
+// ---------------------------------------------------------------- kinds
+
+fn draw_all(c: &mut Ctx<'_>, kind: PopupKind, data: &DataState) -> Result<f32> {
+    let m = meta(kind);
+    header(c, &m)?;
+    let top = c.rect.y + HEAD_H;
+    let hist = history(kind);
+    let y = match kind {
+        PopupKind::Git => draw_git(c, top, data.git.as_ref())?,
+        PopupKind::Ai => draw_ai(c, top, &data.ai)?,
+        PopupKind::Weather => draw_weather(c, top, data.weather.as_ref())?,
+        PopupKind::Media => draw_media(c, top, data.media.as_ref())?,
+        PopupKind::Clock => {
+            let y = draw_month(c, top)?;
+            draw_weather(c, y, data.weather.as_ref())?
+        }
+        PopupKind::Cpu | PopupKind::Ram => draw_system(c, top, kind, &hist)?,
+        PopupKind::Settings => draw_settings(c, top)?,
+    };
+    footer(c, y, m.note)
+}
+
+fn history(kind: PopupKind) -> Vec<f32> {
+    HISTORY.with(|h| h.borrow().iter().find(|(k, _)| *k == kind).map(|(_, v)| v.clone()).unwrap_or_default())
+}
+
+fn draw_git(c: &mut Ctx<'_>, y: f32, git: Option<&GitSummary>) -> Result<f32> {
+    let Some(g) = git else { return empty(c, y, "Đang đọc git log…") };
+    if let Some(err) = &g.error {
+        return empty(c, y, err);
+    }
+    let mut y = section(c, y, "ACTIVITY · 17 TUẦN")?;
+    // .hm-big: padding 4px 14px 8px around the heatmap.
+    heatmap(c, rect_at(c.inner_x(), y + 4.0, c.inner_w(), HM_H), &g.heatmap)?;
+    y += 4.0 + HM_H + 8.0;
+
+    // .stat-grid: 4 equal columns, bold value over a muted label.
+    let total: u32 = g.heatmap.iter().map(|d| d.commits).sum();
+    let stats = [(g.today, "hôm nay"), (g.week, "7 ngày"), (g.streak, "streak"), (total, "119 ngày")];
+    let cw = c.inner_w() / 4.0;
+    for (i, (value, label)) in stats.iter().enumerate() {
+        let x = c.inner_x() + i as f32 * cw;
+        c.text(&value.to_string(), rect_at(x, y + 2.0, cw, 19.0), font(16.0, TEXT).bold())?;
+        c.text(label, rect_at(x, y + 21.0, cw, 13.0), font(9.5, MUTED))?;
+    }
+    y += 42.0;
+    // No REPOSITORIES section: GitSummary has no per-repo list yet.
+    section_end(c, y)
+}
+
+/// 17 week columns of 7 weekday rows, Monday on top, newest week last. Future days are not drawn.
+fn heatmap(c: &mut Ctx<'_>, area: RectF, days: &[GitDay]) -> Result<()> {
+    let today_row = Local::now().weekday().num_days_from_monday() as i64;
+    for col in 0..HM_COLS {
+        for row in 0..HM_ROWS {
+            // Days back from today for this cell; negative means a future day.
+            let back = ((HM_COLS - 1 - col) as i64) * 7 + today_row - row as i64;
+            if back < 0 {
+                continue;
+            }
+            let level = if (back as usize) < days.len() {
+                heat_level(days[days.len() - 1 - back as usize].commits)
+            } else {
+                0
+            };
+            let x = area.x + col as f32 * (HM_CELL + HM_GAP);
+            let y = area.y + row as f32 * (HM_CELL + HM_GAP);
+            c.round(rect_at(x, y, HM_CELL, HM_CELL), 1.5, HEAT[level])?;
+        }
     }
     Ok(())
 }
 
-fn draw_weather(r: &mut Renderer, inner: RectF, w: Option<&Weather>) -> Result<()> {
+/// Same buckets as `level()` in GitTile.tsx.
+fn heat_level(n: u32) -> usize {
+    match n {
+        0 => 0,
+        1 => 1,
+        2..=3 => 2,
+        4..=6 => 3,
+        _ => 4,
+    }
+}
+
+fn draw_ai(c: &mut Ctx<'_>, y: f32, ai: &[AiUsage]) -> Result<f32> {
+    if ai.is_empty() {
+        return empty(c, y, "Đang tải…");
+    }
+    let mut y = section(c, y, "USAGE")?;
+    for (i, u) in ai.iter().enumerate() {
+        y = if u.session_pct.is_nan() {
+            // No data: reset_text holds the status (sign-in needed, error, ...).
+            row(c, y, i, &u.name, Some(u.reset_text.as_str()), None, None)?
+        } else {
+            let pct = u.session_pct;
+            let value = format!("{pct:.0}%");
+            let hint = (!u.reset_text.is_empty()).then_some(u.reset_text.as_str());
+            row(c, y, i, &u.name, hint, Some(value.as_str()), Some(((pct / 100.0).clamp(0.0, 1.0), ai_color(pct))))?
+        };
+    }
+    // No SUBSCRIPTION section: AiUsage carries no plan info yet.
+    section_end(c, y)
+}
+
+fn draw_weather(c: &mut Ctx<'_>, y: f32, w: Option<&Weather>) -> Result<f32> {
     let Some(w) = w else {
-        return r.draw_text("Weather unavailable", row(inner, 0.0), 13.0, DIM, Align::Left);
+        let y = section(c, y, "THỜI TIẾT")?;
+        let y = empty(c, y, "Đang tải…")?;
+        return section_end(c, y);
     };
-    title(r, row(inner, 0.0), &w.location)?;
-    let c = &w.current;
-    kv(r, row(inner, 1.0), "Now", &format!("{:.0}°C  {}", c.temp, wmo_text(c.code)))?;
-    kv(r, row(inner, 2.0), "Feels like", &format!("{:.0}°C", c.feels))?;
-    kv(r, row(inner, 3.0), "Humidity", &format!("{:.0}%", c.humidity))?;
-    kv(r, row(inner, 4.0), "Wind", &format!("{:.0} km/h", c.wind))?;
-    for (i, d) in w.daily.iter().take(5).enumerate() {
-        let rc = row(inner, 5.0 + i as f32);
-        // Dates are YYYY-MM-DD; show MM-DD.
-        let short = d.date.get(5..).unwrap_or(&d.date);
-        r.draw_text(short, RectF { w: 52.0, ..rc }, 12.0, DIM, Align::Left)?;
-        r.draw_text(wmo_text(d.code), RectF { x: rc.x + 52.0, w: inner.w - 52.0 - 80.0, ..rc }, 12.0, DIM, Align::Left)?;
-        r.draw_text(&format!("{:.0}° / {:.0}°", d.max, d.min), RectF { x: rc.x + inner.w - 80.0, w: 80.0, ..rc }, 12.0, TEXT, Align::Right)?;
+    let mut y = section(c, y, &format!("THỜI TIẾT · {}", w.location.to_uppercase()))?;
+    let cur = &w.current;
+    let x = c.inner_x();
+    // .wx-now: big temperature, then condition and details.
+    c.text(&format!("{:.0}°", cur.temp), rect_at(x, y + 2.0, 74.0, 30.0), font(26.0, TEXT).bold())?;
+    let dx = x + 80.0;
+    let dw = c.inner_w() - 80.0;
+    c.text(wx_text(cur.code), rect_at(dx, y + 6.0, dw, 16.0), font(11.0, MUTED))?;
+    let details = format!("Cảm giác {:.0}° · Ẩm {:.0}% · Gió {:.0} km/h", cur.feels, cur.humidity, cur.wind);
+    c.text(&details, rect_at(dx, y + 22.0, dw, 16.0), font(11.0, MUTED))?;
+    y += 44.0;
+
+    // .wx-days: one slot per day, up to 7.
+    let slot = (c.inner_w() - 20.0) / 7.0;
+    for (i, d) in w.daily.iter().take(7).enumerate() {
+        let sx = x + 10.0 + i as f32 * slot;
+        c.text(&weekday_label(&d.date), rect_at(sx, y, slot, 13.0), font(9.5, MUTED).center())?;
+        c.text(&format!("{:.0}°", d.max), rect_at(sx, y + 15.0, slot, 15.0), font(11.0, TEXT).bold().center())?;
+        c.text(&format!("{:.0}°", d.min), rect_at(sx, y + 31.0, slot, 13.0), font(9.5, MUTED).center())?;
+    }
+    y += 52.0;
+    section_end(c, y)
+}
+
+/// Month title and a Monday-first grid with today highlighted.
+fn draw_month(c: &mut Ctx<'_>, y: f32) -> Result<f32> {
+    let today = Local::now().date_naive();
+    let (year, month) = (today.year(), today.month());
+    let y = section(c, y, &format!("THÁNG {month} {year}"))?;
+
+    let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(today);
+    let next = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .unwrap_or(first);
+    let days = (next - first).num_days() as u32;
+    let start = first.weekday().num_days_from_monday() as usize;
+    let weeks = (start + days as usize).div_ceil(7);
+
+    // .month: 7 columns, 2px gap, 24px cells (26px pitch with the row gap).
+    const PITCH: f32 = 26.0;
+    const GAP: f32 = 2.0;
+    let x0 = c.rect.x + 12.0;
+    let col_w = (c.rect.w - 24.0 - 6.0 * GAP) / 7.0;
+    for (i, d) in WEEKDAYS.iter().enumerate() {
+        let area = rect_at(x0 + i as f32 * (col_w + GAP), y, col_w, 24.0);
+        c.text(d, area, font(10.0, FAINT).center())?;
+    }
+    for day in 1..=days {
+        let idx = start + day as usize - 1;
+        let area = rect_at(
+            x0 + (idx % 7) as f32 * (col_w + GAP),
+            y + (1 + idx / 7) as f32 * PITCH,
+            col_w,
+            24.0,
+        );
+        let is_today = day == today.day();
+        if is_today {
+            c.round(area, 6.0, TODAY)?;
+        }
+        let f = if is_today { font(11.5, TEXT).bold() } else { font(11.5, TEXT) };
+        c.text(&day.to_string(), area, f.center())?;
+    }
+    let y = y + (1 + weeks) as f32 * PITCH - GAP + 8.0;
+    section_end(c, y)
+}
+
+fn draw_media(c: &mut Ctx<'_>, y: f32, m: Option<&Media>) -> Result<f32> {
+    let y = section(c, y, "ĐANG PHÁT")?;
+    let playing = m.is_some_and(|m| m.playing);
+    let (x, w) = (c.inner_x(), c.inner_w());
+
+    // .np: wave box (static here, no animation), title, artist, status, then the controls.
+    for (i, full) in WAVE.iter().enumerate() {
+        let h = if playing { *full } else { 4.0 };
+        let color = if playing { WAVE_COLOR } else { WAVE_COLOR_IDLE };
+        c.round(rect_at(x + i as f32 * 4.0, y + 6.0 + (30.0 - h) / 2.0, 2.0, h), 1.0, color)?;
+    }
+    let title = m
+        .map(|m| m.title.as_str())
+        .filter(|t| !t.is_empty())
+        .unwrap_or("Không có ứng dụng nào đang phát");
+    c.text(title, rect_at(x, y + 40.0, w, 20.0), font(15.0, TEXT).bold())?;
+    c.text(m.map_or("", |m| m.artist.as_str()), rect_at(x, y + 64.0, w, 16.0), font(11.0, MUTED))?;
+    if m.is_some() {
+        let status = if playing { "Đang phát" } else { "Tạm dừng" };
+        c.text(status, rect_at(x, y + 84.0, w, 13.0), font(9.5, MUTED))?;
+    }
+
+    // Buttons use the same rects as `hit_media_button`.
+    let [prev, play, next] = media_buttons(c.rect);
+    let play_glyph = if playing { PAUSE } else { PLAY };
+    for (b, glyph, big) in [(prev, PREV, false), (play, play_glyph, true), (next, NEXT, false)] {
+        c.round(b, b.w / 2.0, if big { BTN_BIG } else { BTN })?;
+        c.text(glyph, b, font(14.0, if big { BTN_BIG_TEXT } else { TEXT }).icon().center())?;
+    }
+    section_end(c, y + 159.0)
+}
+
+/// CPU or RAM: one usage row, then a sparkline of the sample history.
+fn draw_system(c: &mut Ctx<'_>, y: f32, kind: PopupKind, hist: &[f32]) -> Result<f32> {
+    let Some(&cur) = hist.last() else { return empty(c, y, "Đang đo…") };
+    let mut y = section(c, y, "SỬ DỤNG")?;
+    let color = if kind == PopupKind::Cpu { pct_color(cur) } else { BLUE };
+    let value = format!("{cur:.0}%");
+    y = row(c, y, 0, "Sử dụng", None, Some(value.as_str()), Some((cur / 100.0, color)))?;
+    spark(c, rect_at(c.inner_x(), y, c.inner_w(), SPARK_H), hist, color)?;
+    y += SPARK_H + 6.0;
+    section_end(c, y)
+}
+
+/// Sparkline on a 0..=100 scale. The renderer has no polyline, so the line and its faint
+/// area are drawn as 1px columns.
+fn spark(c: &mut Ctx<'_>, area: RectF, data: &[f32], color: u32) -> Result<()> {
+    if data.len() < 2 || area.w <= 0.0 {
+        return Ok(());
+    }
+    let base = area.y + area.h;
+    let y_of = |v: f32| area.y + area.h - 2.0 - (v.clamp(0.0, 100.0) / 100.0) * (area.h - 4.0);
+    let step = area.w / (data.len() - 1) as f32;
+    let fill = (color & 0xFFFF_FF00) | 0x1F; // ~12% alpha
+    for (i, pair) in data.windows(2).enumerate() {
+        let x0 = area.x + i as f32 * step;
+        let x1 = x0 + step;
+        let (y0, y1) = (y_of(pair[0]), y_of(pair[1]));
+        let mut px = x0.floor();
+        while px < x1 {
+            let t0 = ((px - x0) / step).clamp(0.0, 1.0);
+            let t1 = ((px + 1.0 - x0) / step).clamp(0.0, 1.0);
+            let ya = y0 + (y1 - y0) * t0;
+            let yb = y0 + (y1 - y0) * t1;
+            let top = ya.min(yb);
+            c.fill(rect_at(px, top, 1.0, base - top), fill)?;
+            c.fill(rect_at(px, top, 1.0, ya.max(yb) - top + 1.5), color)?;
+            px += 1.0;
+        }
     }
     Ok(())
 }
 
-/// Short label for a WMO weather code (Open-Meteo).
-fn wmo_text(code: u32) -> &'static str {
-    match code {
-        0 => "Clear",
-        1..=3 => "Cloudy",
-        45 | 48 => "Fog",
-        51..=67 | 80..=82 => "Rain",
-        71..=77 | 85 | 86 => "Snow",
-        95..=99 => "Storm",
-        _ => "-",
-    }
-}
-
-fn media_buttons(inner: RectF) -> [RectF; 3] {
-    let y = inner.y + 2.0 * ROW_H + 8.0;
-    let bw = ((inner.w - 2.0 * BTN_GAP) / 3.0).max(0.0);
-    [0.0, 1.0, 2.0].map(|i| RectF { x: inner.x + i * (bw + BTN_GAP), y, w: bw, h: BTN_H })
-}
-
-fn draw_media(r: &mut Renderer, inner: RectF, m: Option<&Media>) -> Result<()> {
-    let Some(m) = m else {
-        return r.draw_text("Nothing playing", row(inner, 0.0), 13.0, DIM, Align::Left);
-    };
-    title(r, row(inner, 0.0), &m.title)?;
-    r.draw_text(&m.artist, row(inner, 1.0), 12.0, DIM, Align::Left)?;
-    let play_label = if m.playing { "Pause" } else { "Play" };
-    let labels = ["Previous", play_label, "Next"];
-    for (b, label) in media_buttons(inner).iter().zip(labels) {
-        r.fill_rounded_rect(*b, 8.0, BTN)?;
-        r.stroke_rounded_rect(*b, 8.0, BTN_STROKE, 1.0)?;
-        r.draw_text(label, *b, 12.0, TEXT, Align::Center)?;
-    }
-    Ok(())
-}
-
-fn draw_settings(r: &mut Renderer, inner: RectF) -> Result<()> {
-    title(r, row(inner, 0.0), "Settings")?;
+fn draw_settings(c: &mut Ctx<'_>, y: f32) -> Result<f32> {
+    let mut y = y;
     for (i, (label, on)) in SETTINGS.iter().enumerate() {
-        kv(r, row(inner, i as f32 + 1.0), label, if *on { "On" } else { "Off" })?;
+        y = row(c, y, i, label, None, Some(if *on { "On" } else { "Off" }), None)?;
     }
-    Ok(())
+    Ok(y)
+}
+
+// ---------------------------------------------------------------- labels
+
+/// Vietnamese short label for a WMO weather code (same buckets as weatherInfo in common.tsx).
+fn wx_text(code: u32) -> &'static str {
+    match code {
+        0 => "Trời quang",
+        1..=2 => "Ít mây",
+        3 => "Nhiều mây",
+        4..=48 => "Sương mù",
+        49..=57 => "Mưa phùn",
+        58..=67 => "Mưa",
+        68..=77 => "Tuyết",
+        78..=82 => "Mưa rào",
+        83..=86 => "Mưa tuyết",
+        _ => "Dông",
+    }
+}
+
+/// "T2".."CN" from a YYYY-MM-DD date; falls back to MM-DD.
+fn weekday_label(date: &str) -> String {
+    match NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(d) => WEEKDAYS[d.weekday().num_days_from_monday() as usize].to_owned(),
+        Err(_) => date.get(5..).unwrap_or(date).to_owned(),
+    }
 }

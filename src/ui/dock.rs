@@ -3,7 +3,9 @@
 //! CPU, RAM, clock). Coordinates are dock-local DIPs (the dock window's client area).
 use windows::core::Result;
 
+use super::liquid::LiquidBitmap;
 use super::renderer::{Align, Renderer, TextStyle};
+use super::svgpath;
 
 pub const DOCK_H: f32 = 56.0;
 const BAR_RADIUS: f32 = 8.0;
@@ -86,6 +88,8 @@ pub struct TileView {
     pub bg: u32,
     /// Git heatmap levels 0..=4, column-major (16 columns of 3 rows). Empty when unused.
     pub cells: Vec<u8>,
+    /// Vector glyph drawn inside `bg`: SVG path data and an optional stroke width (None = fill).
+    pub glyph: Option<(&'static str, Option<f32>)>,
 }
 
 impl TileView {
@@ -101,6 +105,7 @@ impl TileView {
             accent: 0,
             bg: 0,
             cells: Vec::new(),
+            glyph: None,
         }
     }
 
@@ -149,10 +154,20 @@ pub fn hit_test(x: f32, y: f32, rects: &[RectF]) -> Option<usize> {
 /// Draws the dock bar (full renderer size), then each tile at `rects[i]`.
 /// `hover` is the index of the tile under the pointer, if any.
 /// Call between `Renderer::begin` and `Renderer::end`.
-pub fn draw_dock(r: &mut Renderer, tiles: &[TileView], rects: &[RectF], hover: Option<usize>) -> Result<()> {
+pub fn draw_dock(
+    r: &mut Renderer,
+    tiles: &[TileView],
+    rects: &[RectF],
+    hover: Option<usize>,
+    backdrop: Option<&LiquidBitmap>,
+) -> Result<()> {
     let (w, h) = r.size();
     let bar = RectF { x: 0.0, y: 0.0, w, h };
     r.fill_rounded_rect_gradient(bar, BAR_RADIUS, BAR_TOP, BAR_BOTTOM)?;
+    // Liquid Glass canvas sits over the tint, as `.liquid-canvas` does over `.dock`.
+    if let Some(b) = backdrop {
+        r.draw_bitmap(b.w, b.h, &b.rgba, bar)?;
+    }
     r.stroke_rounded_rect(bar, BAR_RADIUS, BAR_BORDER, 1.0)?;
 
     for (i, (t, rc)) in tiles.iter().zip(rects).enumerate() {
@@ -196,6 +211,10 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
         r.fill_rounded_rect(sq, 6.0, t.bg)?;
         if let Some(icon) = &t.icon {
             r.draw_bitmap(icon.w, icon.h, &icon.rgba, RectF { x: sq.x + 4.0, y: sq.y + 4.0, w: 14.0, h: 14.0 })?;
+        }
+        if let Some((d, stroke)) = t.glyph {
+            // Provider logos are 24-unit SVG paths in white.
+            svgpath::draw_path(r, d, RectF { x: sq.x + 4.0, y: sq.y + 4.0, w: 14.0, h: 14.0 }, 24.0, 0xFFFF_FFFF, stroke)?;
         }
         text_x = sq.x + 22.0 + 6.0;
     }

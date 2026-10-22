@@ -7,7 +7,7 @@ use std::sync::Once;
 
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
@@ -117,6 +117,19 @@ pub fn show(anchor: RectF, height: i32) -> Result<()> {
     Ok(())
 }
 
+/// Asks for a repaint of the open popup (e.g. after new sparkline samples). No-op if nothing is open.
+pub fn invalidate() {
+    POPUP.with(|p| {
+        let Ok(g) = p.try_borrow() else { return };
+        if let Some(pw) = g.as_ref() {
+            // SAFETY: hwnd is a live window owned by POPUP; a null rect invalidates the whole client area.
+            unsafe {
+                let _ = InvalidateRect(pw.hwnd, None, false);
+            }
+        }
+    });
+}
+
 /// Destroys the popup and its D2D resources. No-op if nothing is open.
 pub fn hide() {
     // Take it out first so Drop (which sends WM_DESTROY) never runs under a RefCell borrow.
@@ -181,7 +194,9 @@ fn paint() {
             let (w, h) = pw.renderer.size();
             let rect = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
             let _ = pw.renderer.begin().and_then(|_| {
-                pw.renderer.fill_rounded_rect(rect, RADIUS, 0x1E1F_249E)?;
+                // .popup: gradient fill (rgba(30,31,36,.62) to rgba(18,18,22,.74)), inset top highlight, 1px border.
+                pw.renderer.fill_rounded_rect_gradient(rect, RADIUS, 0x1E1F_249E, 0x1212_16BD)?;
+                pw.renderer.fill_rect(RectF { x: rect.x + 4.0, y: rect.y + 0.5, w: rect.w - 8.0, h: 1.0 }, 0xFFFF_FF14)?;
                 pw.renderer.stroke_rounded_rect(rect, RADIUS, 0xFFFF_FF21, 1.0)?;
                 if let Some(f) = PAINTER.with(Cell::get) {
                     f(&mut pw.renderer, rect);

@@ -435,3 +435,37 @@ pub fn apply_acrylic(hwnd: HWND, tint_argb: u32) -> bool {
         set(hwnd, &mut data).as_bool()
     }
 }
+
+/// Path-geometry drawing used by `svgpath`. Kept in its own block so it does not touch the core API.
+impl Renderer {
+    /// Builds a path geometry through `build` (which drives an open sink), then fills it
+    /// (`stroke` is None) or strokes it with the given width in DIPs.
+    pub fn draw_geometry_with(
+        &mut self,
+        build: impl FnOnce(&windows::Win32::Graphics::Direct2D::ID2D1GeometrySink) -> Result<()>,
+        rgba: u32,
+        stroke: Option<f32>,
+    ) -> Result<()> {
+        let factory = d2d_factory()?;
+        let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
+        // SAFETY: the sink is closed before the geometry is used, even when `build` fails.
+        unsafe {
+            let sink = geo.Open()?;
+            let built = build(&sink);
+            let closed = sink.Close();
+            built?;
+            closed?;
+        }
+        let (rt, brush) = self.parts()?;
+        Self::set_color(brush, rgba);
+        let g: &ID2D1Geometry = &geo;
+        // SAFETY: `g` lives for the call; default stroke style; no opacity brush.
+        unsafe {
+            match stroke {
+                Some(width) => rt.DrawGeometry(g, brush, width, None::<&ID2D1StrokeStyle>),
+                None => rt.FillGeometry(g, brush, None::<&windows::Win32::Graphics::Direct2D::ID2D1Brush>),
+            }
+        };
+        Ok(())
+    }
+}

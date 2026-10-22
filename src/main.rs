@@ -15,37 +15,46 @@ use std::time::Duration;
 
 use chrono::{Datelike, Local};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, BOOL, E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, SetLastError, BOOL, E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use data::history::History;
 use model::Stats;
 use ui::apps::{self, AppsState};
 use ui::control_center::{self, ControlState};
 use ui::dock::{self, RectF, Style, Tile, TileView};
 use ui::glass;
+use ui::liquid::{self, LiquidBitmap};
 use ui::popup;
 use ui::popup_content::{self, MediaAction as PopupMedia, PopupKind};
 use ui::renderer::Renderer;
+use ui::svgpath;
 use ui::tiles::{self, DataState};
 use win::appbar::{self, AbEdge};
 use win::system::{self, MediaAction};
 use win::tasks::{self, Attention, ShellEvent};
+use win::wallpaper;
 
 const DOCK_HEIGHT: i32 = 56;
 const POPUP_W: f32 = 320.0;
-const POPUP_H: f32 = 260.0;
+/// Height used when the popup content cannot be measured yet.
+const POPUP_H_DEFAULT: f32 = 260.0;
 const GLASS_OPACITY: u8 = 70;
-const TIMER_REFRESH: usize = 1; // 1 s: apps, tiles, repaint
+const TIMER_REFRESH: usize = 1; // 1 s: apps, stats, popup refresh, repaint
 const TIMER_GUARD: usize = 2; // 500 ms: keep the Windows taskbar hidden
 
 /// Data shared with the background refresh thread. Blocking calls run there, never on the UI thread.
 struct Shared {
     data: Mutex<DataState>,
     control: Mutex<ControlState>,
+    /// Liquid Glass backdrop for the dock bar, rendered off the UI thread when the wallpaper changes.
+    liquid: Mutex<Option<Arc<LiquidBitmap>>>,
 }
 
 struct App {
@@ -61,6 +70,10 @@ struct App {
     tiles: Vec<(&'static str, RectF)>,
     /// Index into `tiles` of the tile under the pointer.
     hover: Option<usize>,
+    /// Latest CPU/RAM sample, read once per second on the timer.
+    stats: Stats,
+    /// Two-minute CPU/RAM history for the sparklines.
+    history: History,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -81,7 +94,11 @@ thread_local! {
     /// Control Center state while that popup is open; `None` means a data popup.
     static CONTROL_VIEW: RefCell<Option<ControlState>> = const { RefCell::new(None) };
     static OPEN: Cell<Option<OpenPopup>> = const { Cell::new(None) };
+    /// Height of the currently shown data popup, from `popup_content::content_height`.
+    static POPUP_H_CUR: Cell<f32> = const { Cell::new(POPUP_H_DEFAULT) };
     static SHELL_MSG: Cell<u32> = const { Cell::new(0) };
+    /// True while CreateWindowExW runs, so every message the window receives is logged.
+    static CREATING: Cell<bool> = const { Cell::new(false) };
 }
 
 fn default_repos() -> Vec<PathBuf> {
@@ -105,8 +122,7 @@ fn main() {
     }
 
     if let Err(e) = run() {
-        let msg = format!("SmartDock không khởi động được:
-{e}");
+        let msg = format!("SmartDock không khởi động được:\n{e}");
         log(&msg);
         show_error(&msg);
     }
@@ -114,7 +130,7 @@ fn main() {
     appbar::ensure_restored_on_exit();
 }
 
-/// Appends a line to %APPDATA%SmartDocksmartdock.log. The GUI build has no console to print to.
+/// Appends a line to `%APPDATA%\SmartDock\smartdock.log`. The GUI build has no console to print to.
 fn log(msg: &str) {
     use std::io::Write;
     let Ok(appdata) = std::env::var("APPDATA") else { return };
@@ -139,7 +155,7 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> BOOL {
     std::process::exit(0);
 }
 
-fn start_background_refresh(shared: Arc<Shared>) {
+fn start_background_refresh(shared: Arc<Shared>, screen: (i32, i32)) {
     thread::spawn(move || {
         let repos = default_repos();
         let mut tick: u64 = 0;
@@ -161,35 +177,84 @@ fn start_background_refresh(shared: Arc<Shared>) {
                 local.refresh_slow(&repos);
                 *shared.data.lock().unwrap() = local;
             }
+            // Liquid Glass backdrop: load and render on the first pass, then only when the wallpaper changes.
+            if tick % 15 == 0 && (tick == 0 || wallpaper::wallpaper_changed()) {
+                match wallpaper::load(screen.0 as u32) {
+                    Ok(wp) => {
+                        let bar = RectF { x: 0.0, y: 0.0, w: screen.0 as f32, h: DOCK_HEIGHT as f32 };
+                        let bitmap = liquid::render_liquid(&wp, bar, screen);
+                        *shared.liquid.lock().unwrap() = Some(Arc::new(bitmap));
+                        log("liquid backdrop rendered");
+                    }
+                    Err(e) => log(&format!("wallpaper load failed: {e}")),
+                }
+            }
             tick += 1;
             thread::sleep(Duration::from_secs(1));
         }
     });
 }
 
+/// Stock window procedure for the probe class.
+unsafe extern "system" fn probe_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+/// Unregistered probe class with the stock window procedure, to tell a class problem from a window problem.
+fn probe_window(hinst: HINSTANCE) {
+    let name = w!("SmartDockProbe");
+    let wc = WNDCLASSEXW {
+        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+        lpfnWndProc: Some(probe_proc),
+        hInstance: hinst,
+        lpszClassName: name,
+        ..Default::default()
+    };
+    unsafe {
+        // SAFETY: wc and the class name are valid for the call.
+        let atom = RegisterClassExW(&wc);
+        log(&format!("probe class atom={atom}"));
+        let res = CreateWindowExW(WINDOW_EX_STYLE(0), name, w!("probe"), WS_POPUP, 0, 0, 10, 10, None, None, hinst, None);
+        match res {
+            Ok(h) if !h.is_invalid() => {
+                log("probe window created");
+                let _ = DestroyWindow(h);
+            }
+            _ => log(&format!("probe window failed, last_error={:?}", GetLastError())),
+        }
+    }
+}
+
 /// Creates the dock window. Tries the full dock style first, then plainer styles, logging each attempt.
 fn create_dock_window(hinst: HINSTANCE, class: PCWSTR, screen_w: i32, screen_h: i32) -> windows::core::Result<HWND> {
+    probe_window(hinst);
     let y = screen_h - DOCK_HEIGHT;
     let attempts = [
         ("dock", WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, WS_POPUP, 0, y, screen_w, DOCK_HEIGHT),
         ("plain popup", WINDOW_EX_STYLE(0), WS_POPUP, 0, y, screen_w, DOCK_HEIGHT),
         ("overlapped", WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW, 100, 100, 400, 200),
     ];
+    CREATING.with(|c| c.set(true));
+    let mut created = None;
     for (name, ex, style, x, y, w, h) in attempts {
         // SAFETY: class is registered by the caller; all string args are static literals.
-        let res = unsafe { CreateWindowExW(ex, class, w!("SmartDock"), style, x, y, w, h, None, None, hinst, None) };
+        let res = unsafe {
+            SetLastError(WIN32_ERROR(0));
+            let res = CreateWindowExW(ex, class, w!("SmartDock"), style, x, y, w, h, None, None, hinst, None);
+            log(&format!("CreateWindowExW '{name}' last_error={:?}", GetLastError()));
+            res
+        };
         match res {
             Ok(hwnd) if !hwnd.is_invalid() => {
                 log(&format!("window '{name}' created"));
-                return Ok(hwnd);
+                created = Some(hwnd);
+                break;
             }
-            _ => {
-                let err = unsafe { GetLastError() };
-                log(&format!("window '{name}' failed, last_error={err:?}"));
-            }
+            _ => log(&format!("window '{name}' failed")),
         }
     }
-    Err(windows::core::Error::new(E_FAIL, "CreateWindowExW failed for every style"))
+    CREATING.with(|c| c.set(false));
+    created.ok_or_else(|| windows::core::Error::new(E_FAIL, "CreateWindowExW failed for every style"))
 }
 
 fn run() -> windows::core::Result<()> {
@@ -213,7 +278,7 @@ fn run() -> windows::core::Result<()> {
     unsafe {
         // SAFETY: wc and the class name are valid for the call.
         let atom = RegisterClassExW(&wc);
-        log(&format!("RegisterClassExW atom={atom} last_error={:?}", GetLastError()));
+        log(&format!("RegisterClassExW atom={atom}"));
     }
 
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
@@ -221,7 +286,6 @@ fn run() -> windows::core::Result<()> {
     let hwnd = create_dock_window(hinst, class, screen_w, screen_h)?;
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
-    log("window created");
     let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, DOCK_HEIGHT)?;
     log(&format!("appbar rect {:?}", (rect.left, rect.top, rect.right, rect.bottom)));
     let width = (rect.right - rect.left) as f32;
@@ -241,8 +305,9 @@ fn run() -> windows::core::Result<()> {
     let shared = Arc::new(Shared {
         data: Mutex::new(DataState::default()),
         control: Mutex::new(ControlState::read()),
+        liquid: Mutex::new(None),
     });
-    start_background_refresh(shared.clone());
+    start_background_refresh(shared.clone(), (screen_w, screen_h));
 
     let mut apps = AppsState::default();
     let attention = Attention::default();
@@ -260,6 +325,8 @@ fn run() -> windows::core::Result<()> {
             attention,
             tiles: Vec::new(),
             hover: None,
+            stats: data::stats::read_stats(),
+            history: History::default(),
         })
     });
 
@@ -323,11 +390,11 @@ fn gauge_color(pct: f32) -> u32 {
     }
 }
 
-/// AI tile: colored square, provider label, session percent, reset time and a usage bar.
+/// AI tile: colored square with the provider logo, label, session percent, reset time and a usage bar.
 fn ai_view(data: &DataState, name: &str) -> TileView {
-    let (label, bg) = match name {
-        "Claude" => ("Claude", 0xD977_57FF),
-        _ => ("ChatGPT", 0x0D0D_0DFF),
+    let (label, bg, glyph) = match name {
+        "Claude" => ("Claude", 0xD977_57FF, (svgpath::CLAUDE_SPARK, None)),
+        _ => ("ChatGPT", 0x0D0D_0DFF, (svgpath::CODEX_ORBITS, Some(1.7))),
     };
     let usage = data.ai.iter().find(|a| a.name == name);
     let (value, sub, progress, accent) = match usage {
@@ -340,7 +407,7 @@ fn ai_view(data: &DataState, name: &str) -> TileView {
         Some(a) => (a.reset_text.clone(), String::new(), None, 0),
         None => ("…".into(), String::new(), None, 0),
     };
-    TileView { progress, accent, bg, sub, ..TileView::card(label, value) }
+    TileView { progress, accent, bg, sub, glyph: Some(glyph), ..TileView::card(label, value) }
 }
 
 /// Weather glyph for a WMO code, from `weatherInfo` in common.tsx.
@@ -408,9 +475,10 @@ fn repaint() {
         let mut slot = a.borrow_mut();
         let Some(app) = slot.as_mut() else { return };
 
-        let stats = data::stats::read_stats();
+        let stats = app.stats.clone();
         let data = app.shared.data.lock().unwrap().clone();
         let control = app.shared.control.lock().unwrap().clone();
+        let backdrop = app.shared.liquid.lock().unwrap().clone();
 
         let zones = layout_tiles(app.apps.windows.len());
         let rects = dock::layout(&zones.left, &zones.center, &zones.right, app.width);
@@ -422,21 +490,21 @@ fn repaint() {
         let res = app
             .renderer
             .begin()
-            .and_then(|_| dock::draw_dock(&mut app.renderer, &views, &rects, app.hover))
+            .and_then(|_| dock::draw_dock(&mut app.renderer, &views, &rects, app.hover, backdrop.as_deref()))
             .and_then(|_| match apps_rect {
                 Some(r) => apps::draw_apps(&mut app.renderer, r, &app.apps),
                 None => Ok(()),
             })
             .and_then(|_| app.renderer.end());
         if let Err(e) = res {
-            eprintln!("[smartdock] paint failed: {e}");
+            log(&format!("paint failed: {e}"));
         }
     });
 }
 
-/// Updates the hovered tile from a pointer position. Repaints only when it changes.
-fn set_hover(hover_at: Option<(f32, f32)>) {
-    let changed = APP.with(|a| {
+/// Updates the hovered tile from a pointer position. Returns true when the hovered tile changed.
+fn set_hover(hover_at: Option<(f32, f32)>) -> bool {
+    APP.with(|a| {
         let Ok(mut slot) = a.try_borrow_mut() else { return false };
         let Some(app) = slot.as_mut() else { return false };
         let rects: Vec<RectF> = app.tiles.iter().map(|(_, r)| *r).collect();
@@ -444,10 +512,7 @@ fn set_hover(hover_at: Option<(f32, f32)>) {
         let changed = next != app.hover;
         app.hover = next;
         changed
-    });
-    if changed {
-        repaint();
-    }
+    })
 }
 
 fn dock_click(x: f32, y: f32) -> Click {
@@ -463,10 +528,38 @@ fn dock_click(x: f32, y: f32) -> Click {
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
             "claude" | "codex" => Click::Open(OpenPopup::Data("ai"), anchor),
             "media" => Click::Open(OpenPopup::Data("media"), anchor),
+            "clock" => Click::Open(OpenPopup::Data("clock"), anchor),
+            "cpu" => Click::Open(OpenPopup::Data("cpu"), anchor),
+            "ram" => Click::Open(OpenPopup::Data("ram"), anchor),
             "cc" => Click::Open(OpenPopup::Control, anchor),
             _ => Click::None,
         }
     })
+}
+
+fn popup_kind(id: &str) -> PopupKind {
+    match id {
+        "git" => PopupKind::Git,
+        "ai" => PopupKind::Ai,
+        "weather" => PopupKind::Weather,
+        "clock" => PopupKind::Clock,
+        "cpu" => PopupKind::Cpu,
+        "ram" => PopupKind::Ram,
+        _ => PopupKind::Media,
+    }
+}
+
+/// Pushes fresh data (and sparkline history for CPU/RAM) into the popup content.
+fn feed_popup(kind: PopupKind, data: &DataState, history: &History) {
+    popup_content::set_content(kind, data.clone());
+    let samples = match kind {
+        PopupKind::Cpu => Some(history.snapshot().0),
+        PopupKind::Ram => Some(history.snapshot().1),
+        _ => None,
+    };
+    if let Some(s) = samples {
+        popup_content::set_history(kind, s);
+    }
 }
 
 fn open_popup(which: OpenPopup, anchor: RectF) {
@@ -475,30 +568,44 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
         OPEN.with(|o| o.set(None));
         return;
     }
-    let height = match which {
+    match which {
         OpenPopup::Data(id) => {
-            let kind = match id {
-                "git" => PopupKind::Git,
-                "ai" => PopupKind::Ai,
-                "weather" => PopupKind::Weather,
-                _ => PopupKind::Media,
-            };
-            let data = APP.with(|a| a.borrow().as_ref().map(|app| app.shared.data.lock().unwrap().clone()));
-            if let Some(data) = data {
-                popup_content::set_content(kind, data);
-            }
+            let kind = popup_kind(id);
+            let height = APP
+                .with(|a| {
+                    let slot = a.borrow();
+                    let app = slot.as_ref()?;
+                    let data = app.shared.data.lock().unwrap().clone();
+                    feed_popup(kind, &data, &app.history);
+                    Some(popup_content::content_height(kind, &data))
+                })
+                .unwrap_or(POPUP_H_DEFAULT);
             CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
-            POPUP_H
+            POPUP_H_CUR.with(|h| h.set(height));
+            if popup::show(anchor, height as i32).is_ok() {
+                OPEN.with(|o| o.set(Some(which)));
+            }
         }
         OpenPopup::Control => {
             let state = APP.with(|a| a.borrow().as_ref().map(|app| app.shared.control.lock().unwrap().clone()));
             CONTROL_VIEW.with(|c| *c.borrow_mut() = state);
-            control_center::HEIGHT
+            if popup::show(anchor, control_center::HEIGHT as i32).is_ok() {
+                OPEN.with(|o| o.set(Some(which)));
+            }
         }
-    };
-    if popup::show(anchor, height as i32).is_ok() {
-        OPEN.with(|o| o.set(Some(which)));
     }
+}
+
+/// Keeps an open data popup live: fresh data and history each second, then a repaint of the popup.
+fn refresh_open_popup() {
+    let Some(OpenPopup::Data(id)) = OPEN.with(Cell::get) else { return };
+    APP.with(|a| {
+        let slot = a.borrow();
+        let Some(app) = slot.as_ref() else { return };
+        let data = app.shared.data.lock().unwrap().clone();
+        feed_popup(popup_kind(id), &data, &app.history);
+    });
+    popup::invalidate();
 }
 
 fn paint_popup(r: &mut Renderer, rect: RectF) {
@@ -512,7 +619,7 @@ fn paint_popup(r: &mut Renderer, rect: RectF) {
 }
 
 fn popup_rect() -> RectF {
-    let h = if CONTROL_VIEW.with(|c| c.borrow().is_some()) { control_center::HEIGHT } else { POPUP_H };
+    let h = if CONTROL_VIEW.with(|c| c.borrow().is_some()) { control_center::HEIGHT } else { POPUP_H_CUR.with(Cell::get) };
     RectF { x: 0.5, y: 0.5, w: POPUP_W - 1.0, h: h - 1.0 }
 }
 
@@ -572,6 +679,9 @@ fn on_shell_event(event: ShellEvent) {
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if CREATING.with(Cell::get) {
+        log(&format!("create message {msg:#x}"));
+    }
     let shell_msg = SHELL_MSG.with(Cell::get);
     if shell_msg != 0 && msg == shell_msg {
         if let Some(event) = tasks::parse_shell_message(wparam.0, lparam.0) {
@@ -587,9 +697,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         if let Ok(mut slot) = a.try_borrow_mut() {
                             if let Some(app) = slot.as_mut() {
                                 app.apps.refresh(&app.attention);
+                                app.stats = data::stats::read_stats();
+                                app.history.push(&app.stats);
                             }
                         }
                     });
+                    refresh_open_popup();
                     repaint();
                 }
                 TIMER_GUARD => appbar::enforce_taskbar_hidden(),
@@ -627,11 +740,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             };
             // SAFETY: tme is a valid local struct for the call.
             let _ = TrackMouseEvent(&mut tme);
+            // The app icons magnify under the pointer, so every move repaints.
+            apps::set_pointer(Some(x));
             set_hover(Some((x, y)));
+            repaint();
             LRESULT(0)
         }
         WM_MOUSELEAVE => {
+            apps::set_pointer(None);
             set_hover(None);
+            repaint();
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
