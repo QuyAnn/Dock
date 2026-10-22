@@ -31,7 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const CACHE_LIMIT: usize = 128;
-const ICON_PX: i32 = 32;
+/// Requested shell image size: 256 px (jumbo), reduced once when composed, so 38-DIP icons
+/// stay crisp at any DPI.
+const ICON_PX: i32 = 256;
 
 /// Inbox Settings AUMID used when SystemSettings.exe is resolved but process AUMID is empty.
 pub const SETTINGS_AUMID: &str =
@@ -150,7 +152,12 @@ fn apps_folder_icon(aumid: &str) -> Option<IconBitmap> {
     if aumid.is_empty() {
         return None;
     }
-    let path = format!("shell:AppsFolder\\{aumid}");
+    shell_image(&format!("shell:AppsFolder\\{aumid}"))
+}
+
+/// IShellItemImageFactory icon for any parsing name (exe path, .lnk, AppsFolder item) at
+/// `ICON_PX` (jumbo image list size); smaller native sizes are accepted.
+fn shell_image(path: &str) -> Option<IconBitmap> {
     let wide: Vec<u16> = path.encode_utf16().chain(once(0)).collect();
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -344,6 +351,9 @@ fn decode_image(path: &Path) -> Result<IconBitmap> {
 }
 
 fn extract(exe_path: &str) -> Option<IconBitmap> {
+    if let Some(big) = shell_image(exe_path).filter(|b| b.w >= 48 && !is_blank_white(b)) {
+        return Some(big);
+    }
     let wide: Vec<u16> = exe_path.encode_utf16().chain(Some(0)).collect();
     unsafe {
         let mut info: SHFILEINFOW = zeroed();

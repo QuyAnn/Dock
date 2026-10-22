@@ -729,10 +729,15 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     right.push(t("clock", 64.0));
     Zones {
         left,
+        // Variant A: 38-DIP Start squircle, thin divider, then the 38-DIP app icons.
         center: if app_count == 0 {
-            vec![t("start", 38.0)]
+            vec![Tile { id: "start", width: apps::ICON, height: 44.0 }]
         } else {
-            vec![t("start", 38.0), Tile { id: "apps", width: apps_w, height: 44.0 }]
+            vec![
+                Tile { id: "start", width: apps::ICON, height: 44.0 },
+                Tile { id: "sep", width: 1.0, height: 24.0 },
+                Tile { id: "apps", width: apps_w, height: 44.0 },
+            ]
         },
         right,
     }
@@ -881,6 +886,7 @@ fn tile_view(
             ..TileView::card("", "")
         },
         "start" => TileView { style: Style::Start, ..TileView::card("", "") },
+        "sep" => TileView { style: Style::Separator, ..TileView::card("", "") },
         "gear" => TileView::bare("\u{E713}"),
         // Ring: short label above the percent (no "CPU 65" single-line overlap).
         "cpu" => TileView {
@@ -941,6 +947,10 @@ fn paint_surface(
         .map(|t| tile_view(t.id, data, control, stats, audio_peak, settings))
         .collect();
     *tiles_out = defs.iter().zip(rects.iter()).map(|(t, r)| (t.id, *r)).collect();
+    // Glass shelf behind the whole centre cluster (Start .. last app), centred with it.
+    let c0 = zones.left.len();
+    let shelf = (!zones.center.is_empty()).then(|| dock::shelf_for(rects[c0], rects[c0 + zones.center.len() - 1]));
+    dock::set_shelf(shelf);
     let apps_rect = tiles_out.iter().find(|(id, _)| *id == "apps").map(|(_, r)| *r);
     let res = renderer
         .begin()

@@ -2,6 +2,7 @@
 //! Three zones: left (git, AI, media), center (running apps), right (Control Center, settings,
 //! CPU, RAM, clock). Coordinates are dock-local DIPs (the dock window's client area).
 use windows::core::Result;
+use std::cell::Cell;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -67,6 +68,8 @@ pub enum Style {
     Button,
     /// Windows logo button that opens Start.
     Start,
+    /// Thin vertical divider in the centre cluster (Start | apps).
+    Separator,
     /// No background (the apps zone, the settings gear). `value` is the glyph or text.
     Bare,
 }
@@ -246,6 +249,9 @@ pub fn draw_dock(
     r.stroke_top_rounded_rect_linear(bar, BAR_RADIUS, (0.0, 0.0), 0xFFFF_FFA0, (w * 0.6, DOCK_H), 0xFFFF_FF2E, 1.0)?;
     let _ = (glass_fill_color(opacity_pct), GLASS_SHEEN_TOP, BAR_BORDER);
 
+    if let Some(shelf) = SHELF.with(Cell::get) {
+        draw_shelf(r, shelf)?;
+    }
     for (i, (t, rc)) in tiles.iter().zip(rects).enumerate() {
         let hovered = hover == Some(i);
         match t.style {
@@ -257,6 +263,7 @@ pub fn draw_dock(
             Style::Media => draw_media(r, t, *rc, hovered)?,
             Style::Button => draw_button(r, t, *rc, hovered)?,
             Style::Start => draw_start(r, *rc, hovered)?,
+            Style::Separator => draw_separator(r, *rc)?,
         }
     }
     Ok(())
@@ -475,25 +482,40 @@ fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resu
 }
 
 fn draw_start(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
-    // Liquid-glass plate — same helper / radius as centre app icon plates.
-    super::glass::draw_liquid_plate(r, rc, super::glass::PLATE_RADIUS, hovered)?;
-    let d = 8.0;
-    let gap = 1.5;
-    let total = d * 2.0 + gap;
-    let x = rc.x + (rc.w - total) / 2.0;
-    let y = rc.y + (rc.h - total) / 2.0;
-    for row in 0..2 {
-        for col in 0..2 {
-            let tile = RectF {
-                x: x + col as f32 * (d + gap),
-                y: y + row as f32 * (d + gap),
-                w: d,
-                h: d,
-            };
-            r.fill_rounded_rect_gradient(tile, 1.3, 0x65C7_FFFF, 0x1688_FFFF)?;
-        }
-    }
-    Ok(())
+    // macOS-style: white Windows logo on a blue squircle, same size and shadow as app icons.
+    super::apps::draw_start_icon(r, rc, hovered)
+}
+
+fn draw_separator(r: &mut Renderer, rc: RectF) -> Result<()> {
+    let line = RectF { x: rc.x + (rc.w - 1.0) / 2.0, y: rc.y, w: 1.0, h: rc.h };
+    r.fill_rect(line, 0xFFFF_FF4D)
+}
+
+thread_local! {
+    /// Glass shelf behind the centre cluster (Start + apps), set by the caller each frame.
+    static SHELF: Cell<Option<RectF>> = const { Cell::new(None) };
+}
+
+/// Sets (or clears) the shelf drawn behind the centre cluster on the next `draw_dock`.
+pub fn set_shelf(rect: Option<RectF>) {
+    SHELF.with(|s| s.set(rect));
+}
+
+/// Shelf geometry for a centre cluster spanning `first..last` (dock-local DIPs): symmetric
+/// padding keeps it centred with the cluster; it spans nearly the full bar height so the
+/// running dots sit inside.
+pub fn shelf_for(first: RectF, last: RectF) -> RectF {
+    let pad = SHELF_PAD;
+    RectF { x: first.x - pad, y: 1.0, w: last.x + last.w - first.x + 2.0 * pad, h: DOCK_H - 2.0 }
+}
+
+const SHELF_PAD: f32 = 5.0;
+const SHELF_RADIUS: f32 = 13.0;
+
+/// One continuous, very light liquid-glass capsule behind the icon group (macOS Tahoe dock).
+fn draw_shelf(r: &mut Renderer, rc: RectF) -> Result<()> {
+    r.fill_rounded_rect(rc, SHELF_RADIUS, 0xFFFF_FF12)?;
+    super::glass::draw_highlights(r, rc, SHELF_RADIUS, 0.75)
 }
 
 #[cfg(test)]
@@ -506,7 +528,11 @@ mod tests {
 
     fn home_zones(apps: usize) -> (Vec<Tile>, Vec<Tile>, Vec<Tile>) {
         let left = vec![t("git", GIT_W), t("claude", USAGE_W), t("codex", USAGE_W), t("cursor", USAGE_W), t("grok", USAGE_W), t("media", MEDIA_W)];
-        let center = vec![t("start", 38.0), Tile { id: "apps", width: super::super::apps::cluster_width(apps), height: 44.0 }];
+        let center = vec![
+            Tile { id: "start", width: 38.0, height: 44.0 },
+            Tile { id: "sep", width: 1.0, height: 24.0 },
+            Tile { id: "apps", width: super::super::apps::cluster_width(apps), height: 44.0 },
+        ];
         let right = vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
         (left, center, right)
     }
