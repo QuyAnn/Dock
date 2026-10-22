@@ -56,6 +56,8 @@ pub struct Settings {
     /// "hidden" or "autohide".
     pub taskbar_mode: String,
     pub launch_at_startup: bool,
+    /// SmartDock's own Shell_TrayWnd listener (tray icons in the ^ popup). Kill switch.
+    pub tray_service: bool,
     pub tiles: TileSettings,
     pub weather_location: String,
     /// "clock" or "tile".
@@ -79,6 +81,7 @@ impl Default for Settings {
             glass_opacity: 55,
             taskbar_mode: "hidden".to_owned(),
             launch_at_startup: false,
+            tray_service: true,
             tiles: TileSettings::default(),
             weather_location: "Hanoi".to_owned(),
             weather_position: "clock".to_owned(),

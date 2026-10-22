@@ -7,4 +7,5 @@ pub mod icons;    // app icons (exe -> RGBA, cached)
 pub mod system;   // media (SMTC), Core Audio volume/mute, radios, brightness, Wi-Fi
 pub mod wallpaper; // desktop wallpaper path + WIC decode, change poll (Liquid Glass source)
 pub mod overflow; // Windows tray overflow ("Show hidden icons") via UIA Invoke
+pub mod traysvc;  // our Shell_TrayWnd listener: learns tray icons, forwards everything to Explorer
 pub mod grokbot;  // Grok Bot desktop app resolve/launch (never reads %USERPROFILE%\.grokbot)
