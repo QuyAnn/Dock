@@ -493,3 +493,21 @@ pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Con
     }
     None
 }
+
+#[cfg(test)]
+mod settings_route_tests {
+    use super::*;
+
+    #[test]
+    fn dock_layout_cc_gear_opens_smartdock_settings_and_dark_label_still_toggles() {
+        let rect = RectF { x: 0.5, y: 0.5, w: 339.0, h: HEIGHT - 1.0 };
+        let l = layout(rect);
+        let g = gear_of(l.dark);
+        assert!(g.x + g.w <= l.dark.x + l.dark.w && g.y >= l.dark.y && g.y + g.h <= l.dark.y + l.dark.h);
+        let state = ControlState::default();
+        let hit = hit_test(g.x + g.w / 2.0, g.y + g.h / 2.0, rect, &state);
+        assert!(matches!(hit, Some(ControlAction::OpenSmartDockSettings)), "{hit:?}");
+        let other = hit_test(l.dark.x + 20.0, l.dark.y + 20.0, rect, &state);
+        assert!(matches!(other, Some(ControlAction::ToggleDark)), "{other:?}");
+    }
+}

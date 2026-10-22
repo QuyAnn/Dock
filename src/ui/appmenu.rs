@@ -268,3 +268,15 @@ pub fn dock_menu_hit(x: f32, y: f32) -> bool {
     let r = dock_menu_row();
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
+
+#[cfg(test)]
+mod dock_menu_tests {
+    use super::*;
+
+    #[test]
+    fn dock_layout_dock_menu_settings_row_hit() {
+        assert!(dock_menu_hit(DOCK_MENU_W / 2.0, DOCK_MENU_H / 2.0));
+        assert!(!dock_menu_hit(DOCK_MENU_W / 2.0, DOCK_MENU_H - 1.0));
+        assert!(!dock_menu_hit(1.0, DOCK_MENU_H / 2.0));
+    }
+}
