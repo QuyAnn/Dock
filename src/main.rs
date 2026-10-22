@@ -611,6 +611,9 @@ fn run() -> windows::core::Result<()> {
     popup::set_painter(paint_popup);
     popup::set_click_handler(on_popup_click);
     popup::set_on_hide(on_popup_hidden);
+    popup::set_drag_handler(on_popup_drag);
+    popup::set_tick_handler(on_popup_tick);
+    win::system::watch_volume();
 
     let shared = Arc::new(Shared {
         data: Mutex::new(DataState::default()),
@@ -1434,6 +1437,142 @@ fn on_popup_hidden() {
     thumbnails::set_suppressed(false);
     CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
     appmenu::clear();
+}
+
+thread_local! {
+    /// Slider being dragged in the Control Center.
+    static DRAG_SLIDER: Cell<Option<control_center::Slider>> = const { Cell::new(None) };
+    /// When the last slider drag ended (the 2 s system poll must not snap the knob back).
+    static LAST_DRAG_END: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// Control Center slider drag: value follows the pointer on every move, the panel repaints
+/// immediately and the system value is applied live (coalesced to ~30 Hz off the UI thread).
+fn on_popup_drag(phase: popup::DragPhase, x: f32, _y: f32) -> bool {
+    let rect = popup_rect();
+    let slider = match phase {
+        popup::DragPhase::Down => {
+            let hit = CONTROL_VIEW.with(|c| c.borrow().as_ref().and_then(|st| control_center::slider_at(x, _y, rect, st)));
+            DRAG_SLIDER.with(|d| d.set(hit));
+            match hit {
+                Some(s) => s,
+                None => return false,
+            }
+        }
+        _ => match DRAG_SLIDER.with(Cell::get) {
+            Some(s) => s,
+            None => return false,
+        },
+    };
+    let v = control_center::slider_value(slider, x, rect);
+    let action = match slider {
+        control_center::Slider::Volume => control_center::ControlAction::SetVolume(v),
+        control_center::Slider::Brightness => control_center::ControlAction::SetBrightness((v * 100.0).round() as u32),
+    };
+    CONTROL_VIEW.with(|c| {
+        if let Some(st) = c.borrow_mut().as_mut() {
+            match action {
+                control_center::ControlAction::SetVolume(v) => st.volume = v,
+                control_center::ControlAction::SetBrightness(p) => st.brightness = Some(p),
+                _ => {}
+            }
+            let st = st.clone();
+            APP.with(|a| {
+                if let Ok(slot) = a.try_borrow() {
+                    if let Some(app) = slot.as_ref() {
+                        *app.shared.control.lock().unwrap() = st;
+                    }
+                }
+            });
+        }
+    });
+    live_apply(action);
+    popup::repaint_now();
+    if phase == popup::DragPhase::Up {
+        DRAG_SLIDER.with(|d| d.set(None));
+        LAST_DRAG_END.with(|t| t.set(Some(std::time::Instant::now())));
+        log(&format!("control: {:?} set by drag", action));
+    }
+    true
+}
+
+/// Queues a slider value for the live-apply worker, which applies only the newest value of each
+/// kind at most ~30 times a second (DDC/CI brightness can take tens of ms per call).
+fn live_apply(action: control_center::ControlAction) {
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::OnceLock;
+    static TX: OnceLock<std::sync::Mutex<Sender<control_center::ControlAction>>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = channel::<control_center::ControlAction>();
+        thread::spawn(move || {
+            while let Ok(first) = rx.recv() {
+                let mut vol = None;
+                let mut br = None;
+                let mut take = |a| match a {
+                    control_center::ControlAction::SetVolume(_) => vol = Some(a),
+                    control_center::ControlAction::SetBrightness(_) => br = Some(a),
+                    _ => {}
+                };
+                take(first);
+                while let Ok(a) = rx.try_recv() {
+                    take(a);
+                }
+                for a in [vol, br].into_iter().flatten() {
+                    let _ = control_center::apply(a);
+                }
+                thread::sleep(Duration::from_millis(33));
+            }
+        });
+        std::sync::Mutex::new(tx)
+    });
+    if let Ok(tx) = tx.lock() {
+        let _ = tx.send(action);
+    }
+}
+
+/// Popup tick (~100 ms): reflect external volume/mute changes (IAudioEndpointVolumeCallback)
+/// and fresh radio/brightness state while the Control Center stays open.
+fn on_popup_tick() {
+    if CONTROL_VIEW.with(|c| c.borrow().is_none()) {
+        let _ = win::system::take_volume_change();
+        return;
+    }
+    if popup::is_dragging() {
+        let _ = win::system::take_volume_change();
+        return;
+    }
+    let mut changed = false;
+    if let Some((v, m)) = win::system::take_volume_change() {
+        CONTROL_VIEW.with(|c| {
+            if let Some(st) = c.borrow_mut().as_mut() {
+                if (st.volume - v).abs() > 0.004 || st.muted != m {
+                    st.volume = v;
+                    st.muted = m;
+                    changed = true;
+                }
+            }
+        });
+    }
+    let settled = LAST_DRAG_END.with(Cell::get).map_or(true, |t| t.elapsed() > Duration::from_millis(2500));
+    if settled {
+        let shared = APP.with(|a| a.try_borrow().ok().and_then(|s| s.as_ref().map(|app| app.shared.control.lock().unwrap().clone())));
+        if let Some(sh) = shared {
+            CONTROL_VIEW.with(|c| {
+                if let Some(st) = c.borrow_mut().as_mut() {
+                    if st.wifi != sh.wifi || st.bluetooth != sh.bluetooth || st.dark != sh.dark || st.brightness != sh.brightness {
+                        st.wifi = sh.wifi;
+                        st.bluetooth = sh.bluetooth;
+                        st.dark = sh.dark;
+                        st.brightness = sh.brightness;
+                        changed = true;
+                    }
+                }
+            });
+        }
+    }
+    if changed {
+        popup::repaint_now();
+    }
 }
 
 fn shutdown() {

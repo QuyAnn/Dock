@@ -16,7 +16,10 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL, E_NOTIMPL, FALSE, HANDLE, POINT, TRUE};
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
-use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioMeterInformation};
+use windows::Win32::Media::Audio::Endpoints::{
+    IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl, IAudioMeterInformation,
+};
+use windows::Win32::Media::Audio::AUDIO_VOLUME_NOTIFICATION_DATA;
 use windows::Win32::Media::Audio::{
     eConsole, eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
@@ -173,6 +176,61 @@ pub fn get_volume() -> (f32, bool) {
         unsafe { Ok((vol.GetMasterVolumeLevelScalar()?, vol.GetMute()?.0 != 0)) }
     };
     read().unwrap_or((0.0, false))
+}
+
+// ---------- live volume notifications ----------
+
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// Latest master volume (f32 bits) and mute from IAudioEndpointVolumeCallback.
+static NOTIFIED_VOLUME: AtomicU32 = AtomicU32::new(0);
+static NOTIFIED_MUTED: AtomicBool = AtomicBool::new(false);
+/// Set by the callback, cleared by `take_volume_change`.
+static VOLUME_DIRTY: AtomicBool = AtomicBool::new(false);
+
+#[windows::core::implement(IAudioEndpointVolumeCallback)]
+struct VolumeWatcher;
+
+impl IAudioEndpointVolumeCallback_Impl for VolumeWatcher_Impl {
+    fn OnNotify(&self, data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> Result<()> {
+        if data.is_null() {
+            return Ok(());
+        }
+        // SAFETY: the audio service passes a valid struct for the duration of the call.
+        let d = unsafe { &*data };
+        NOTIFIED_VOLUME.store(d.fMasterVolume.to_bits(), Ordering::SeqCst);
+        NOTIFIED_MUTED.store(d.bMuted.as_bool(), Ordering::SeqCst);
+        VOLUME_DIRTY.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Registers an IAudioEndpointVolumeCallback on the default output once (dedicated thread that
+/// keeps the endpoint + callback alive). Volume/mute changes from anywhere (keyboard keys,
+/// other apps, our own slider) are then available through `take_volume_change`.
+pub fn watch_volume() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let Ok(vol) = endpoint_volume() else { return };
+        let cb: IAudioEndpointVolumeCallback = VolumeWatcher.into();
+        // SAFETY: vol is live; cb stays alive with this thread (parked forever).
+        if unsafe { vol.RegisterControlChangeNotify(&cb) }.is_err() {
+            return;
+        }
+        loop {
+            std::thread::park();
+        }
+    });
+}
+
+/// (volume, muted) if it changed since the last call.
+pub fn take_volume_change() -> Option<(f32, bool)> {
+    VOLUME_DIRTY.swap(false, Ordering::SeqCst).then(|| {
+        (f32::from_bits(NOTIFIED_VOLUME.load(Ordering::SeqCst)), NOTIFIED_MUTED.load(Ordering::SeqCst))
+    })
 }
 
 /// Sets master volume, scalar 0.0..=1.0 (clamped).

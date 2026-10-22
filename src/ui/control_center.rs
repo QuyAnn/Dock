@@ -45,6 +45,10 @@ pub enum ControlAction {
     ToggleDark,
     OpenNetworkSettings,
     OpenSoundSettings,
+    /// Wi-Fi label: the network list (like macOS Wi-Fi module).
+    OpenWifiList,
+    /// Bluetooth label: Bluetooth devices page.
+    OpenBluetoothSettings,
     MediaPrevious,
     MediaPlayPause,
     MediaNext,
@@ -71,6 +75,8 @@ pub fn apply(action: ControlAction) -> Result<()> {
         ControlAction::ToggleDark => system::set_dark_mode(!system::dark_mode()),
         ControlAction::OpenNetworkSettings => system::open_settings("ms-settings:network-wifi"),
         ControlAction::OpenSoundSettings => system::open_settings("ms-settings:sound"),
+        ControlAction::OpenWifiList => system::open_settings("ms-availablenetworks:"),
+        ControlAction::OpenBluetoothSettings => system::open_settings("ms-settings:bluetooth"),
         ControlAction::MediaPrevious => system::media_control(MediaAction::Previous),
         ControlAction::MediaPlayPause => system::media_control(MediaAction::PlayPause),
         ControlAction::MediaNext => system::media_control(MediaAction::Next),
@@ -95,10 +101,9 @@ const THUMB: f32 = 22.0;
 
 // Colors 0xRRGGBBAA, from the CSS alphas.
 const CARD: u32 = 0xFFFF_FF17; // rgba(255,255,255,.09)
-const CARD_BORDER: u32 = 0xFFFF_FF1A; // rgba(255,255,255,.10)
 const ROUND_BG: u32 = 0xFFFF_FF24; // rgba(255,255,255,.14)
 const WHITE: u32 = 0xFFFF_FFFF;
-const ACCENT: u32 = 0x1D6F_FFFF; // #1d6fff
+const ACCENT: u32 = 0x0A84_FFFF; // macOS system blue #0A84FF
 const TEXT: u32 = 0xFFFF_FFFF;
 const SUB: u32 = 0xFFFF_FF99; // opacity .6
 const NA: u32 = 0xFFFF_FF8C; // opacity .55
@@ -190,11 +195,26 @@ fn fade(rgba: u32, k: f32) -> u32 {
     (rgba & !0xFF) | a
 }
 
-/// Circle button (`.cc-round`). `on` = white with blue glyph. `k` fades the circle, `icon_k` the glyph.
+/// Circle button, macOS Control Center style. ON = filled system blue with a white glyph;
+/// OFF = translucent liquid-glass circle (light fill + specular rim) with a white glyph.
+/// `k` fades the circle, `icon_k` the glyph.
 fn draw_round(r: &mut Renderer, rect: RectF, glyph: &str, size: f32, on: bool, k: f32, icon_k: f32) -> Result<()> {
-    let (bg, fg) = if on { (WHITE, ACCENT) } else { (ROUND_BG, TEXT) };
-    r.fill_rounded_rect(rect, rect.h / 2.0, fade(bg, k))?;
-    r.draw_text_styled(glyph, rect, size, fade(fg, icon_k), Align::Center, TextStyle::Icon)
+    let radius = rect.h / 2.0;
+    if on {
+        r.fill_rounded_rect(rect, radius, fade(ACCENT, k))?;
+        super::glass::draw_highlights(r, rect, radius, 0.8 * k)?;
+    } else {
+        r.fill_rounded_rect(rect, radius, fade(ROUND_BG, k))?;
+        super::glass::draw_highlights(r, rect, radius, k)?;
+    }
+    r.draw_text_styled(glyph, rect, size, fade(TEXT, icon_k), Align::Center, TextStyle::Icon)
+}
+
+/// Liquid-glass module (same material language as the dock tiles): light translucent fill,
+/// inner top highlight and specular rims.
+fn draw_module(r: &mut Renderer, rect: RectF) -> Result<()> {
+    r.fill_rounded_rect(rect, CARD_R, CARD)?;
+    super::glass::draw_highlights(r, rect, CARD_R, 0.9)
 }
 
 /// One `.cc-toggle` row: round button, bold label, sub text.
@@ -223,8 +243,7 @@ fn draw_toggle(r: &mut Renderer, row: RectF, t: Toggle) -> Result<()> {
 
 /// Square shortcut (`.cc-sq`): round glyph centered above a 10 px label.
 fn draw_square(r: &mut Renderer, rect: RectF, glyph: &str, label: &str) -> Result<()> {
-    r.fill_rounded_rect(rect, CARD_R, CARD)?;
-    r.stroke_rounded_rect(rect, CARD_R, CARD_BORDER, 1.0)?;
+    draw_module(r, rect)?;
     let top = rect.y + (rect.h - 45.0) / 2.0; // 28 circle + 4 gap + 13 text
     let round = RectF { x: rect.x + (rect.w - ROUND) / 2.0, y: top, w: ROUND, h: ROUND };
     draw_round(r, round, glyph, 15.0, false, 1.0, 1.0)?;
@@ -233,8 +252,7 @@ fn draw_square(r: &mut Renderer, rect: RectF, glyph: &str, label: &str) -> Resul
 
 /// `.cc-cap` card background with its title and right-aligned value.
 fn draw_cap(r: &mut Renderer, card: RectF, title: &str, value: &str) -> Result<()> {
-    r.fill_rounded_rect(card, CARD_R, CARD)?;
-    r.stroke_rounded_rect(card, CARD_R, CARD_BORDER, 1.0)?;
+    draw_module(r, card)?;
     let head = head_of(card);
     r.draw_text_styled(title, head, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
     r.draw_text(value, head, 10.5, NA, Align::Right)
@@ -247,7 +265,9 @@ fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, glyph: &st
     let x0 = track.x + THUMB / 2.0;
     let span = track.w - THUMB;
     let end = x0 + span * frac.clamp(0.0, 1.0);
+    // Glass capsule track: translucent fill, faint inner shade and a specular rim.
     r.fill_rounded_rect(track, track.h / 2.0, fade(TRACK, k))?;
+    super::glass::draw_highlights(r, track, track.h / 2.0, 0.7 * k)?;
     if end > x0 {
         r.fill_rounded_rect(
             RectF { x: track.x, y: track.y, w: end - track.x, h: track.h },
@@ -272,9 +292,8 @@ fn radio_sub(v: Option<bool>) -> &'static str {
 pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&Media>) -> Result<()> {
     let l = layout(rect);
 
-    // Connectivity card.
-    r.fill_rounded_rect(l.conn, CARD_R, CARD)?;
-    r.stroke_rounded_rect(l.conn, CARD_R, CARD_BORDER, 1.0)?;
+    // Connectivity module.
+    draw_module(r, l.conn)?;
     draw_toggle(
         r,
         l.wifi,
@@ -302,8 +321,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
 
     draw_square(r, l.net, GLYPH_NETWORK, "Mạng")?;
     draw_square(r, l.sound, GLYPH_VOLUME, "Âm thanh")?;
-    r.fill_rounded_rect(l.dark, CARD_R, CARD)?;
-    r.stroke_rounded_rect(l.dark, CARD_R, CARD_BORDER, 1.0)?;
+    draw_module(r, l.dark)?;
     let moon = RectF { x: l.dark.x + 7.0, y: l.dark.y + 6.0, w: 28.0, h: 28.0 };
     draw_round(r, moon, GLYPH_MOON, 14.0, state.dark, 1.0, 1.0)?;
     r.draw_text("Chế độ tối", RectF { x: moon.x + 36.0, y: l.dark.y, w: l.dark.w - 45.0, h: l.dark.h }, 10.5, TEXT, Align::Left)?;
@@ -332,8 +350,7 @@ fn media_buttons(card: RectF) -> [RectF; 3] {
 }
 
 fn draw_now_playing(r: &mut Renderer, card: RectF, media: Option<&Media>) -> Result<()> {
-    r.fill_rounded_rect(card, CARD_R, CARD)?;
-    r.stroke_rounded_rect(card, CARD_R, CARD_BORDER, 1.0)?;
+    draw_module(r, card)?;
     let art = RectF { x: card.x + 8.0, y: card.y + 8.0, w: 40.0, h: 40.0 };
     r.fill_rounded_rect_gradient(art, 8.0, 0xFF5F_6DFF, 0xFFC3_71FF)?;
     r.draw_text("♪", art, 18.0, WHITE, Align::Center)?;
@@ -352,14 +369,57 @@ fn draw_now_playing(r: &mut Renderer, card: RectF, media: Option<&Media>) -> Res
 
 // ---------- hit testing ----------
 
+/// Round button of a toggle row.
+fn round_of(row: RectF) -> RectF {
+    RectF { x: row.x, y: row.y, w: ROUND, h: ROUND }
+}
+
+/// Which slider a drag controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slider {
+    Volume,
+    Brightness,
+}
+
+/// Slider under (x, y) for a drag start (the volume glyph is the mute button, not the track).
+pub fn slider_at(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Slider> {
+    let l = layout(rect);
+    let vol = slider_of(l.volume);
+    if contains(vol, x, y) && !contains(icon_of(vol), x, y) {
+        return Some(Slider::Volume);
+    }
+    let br = slider_of(l.brightness);
+    if state.brightness.is_some() && contains(br, x, y) && !contains(icon_of(br), x, y) {
+        return Some(Slider::Brightness);
+    }
+    None
+}
+
+/// Fraction 0..1 for pointer x on `slider` (clamped, so dragging past the ends pins to 0/100%).
+pub fn slider_value(slider: Slider, x: f32, rect: RectF) -> f32 {
+    let l = layout(rect);
+    let card = match slider {
+        Slider::Volume => l.volume,
+        Slider::Brightness => l.brightness,
+    };
+    value_at(slider_of(card), x)
+}
+
 /// Maps a click at (x, y) to an action. None when the click hits nothing actionable.
 pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<ControlAction> {
     let l = layout(rect);
-    if contains(l.wifi, x, y) {
+    // Only the round icon toggles a radio; the label opens its list / settings page.
+    if contains(round_of(l.wifi), x, y) {
         return state.wifi.map(|_| ControlAction::ToggleWifi);
     }
-    if contains(l.bluetooth, x, y) {
+    if contains(l.wifi, x, y) {
+        return Some(ControlAction::OpenWifiList);
+    }
+    if contains(round_of(l.bluetooth), x, y) {
         return state.bluetooth.map(|_| ControlAction::ToggleBluetooth);
+    }
+    if contains(l.bluetooth, x, y) {
+        return Some(ControlAction::OpenBluetoothSettings);
     }
     if contains(l.dark, x, y) {
         return Some(ControlAction::ToggleDark);

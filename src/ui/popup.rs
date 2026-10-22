@@ -12,13 +12,14 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect,
     KillTimer, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_LBUTTONUP, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -57,6 +58,54 @@ thread_local! {
     static PAINTER: Cell<Option<fn(&mut Renderer, RectF)>> = const { Cell::new(None) };
     static CLICK: Cell<Option<fn(f32, f32)>> = const { Cell::new(None) };
     static ON_HIDE: Cell<Option<fn()>> = const { Cell::new(None) };
+    static DRAG: Cell<Option<fn(DragPhase, f32, f32) -> bool>> = const { Cell::new(None) };
+    static TICK: Cell<Option<fn()>> = const { Cell::new(None) };
+    /// True between a captured mouse-down and its mouse-up.
+    static DRAGGING: Cell<bool> = const { Cell::new(false) };
+    static LAST_POS: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
+/// Phase of a captured drag inside the popup (sliders).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragPhase {
+    Down,
+    Move,
+    Up,
+}
+
+/// Drag handler: called on mouse-down with `Down`; returning true captures the mouse, and then
+/// every WM_MOUSEMOVE (`Move`) and the release (`Up`) go to it instead of the click handler.
+pub fn set_drag_handler(f: fn(DragPhase, f32, f32) -> bool) {
+    DRAG.with(|c| c.set(Some(f)));
+}
+
+/// Called every poll tick (~100 ms) while the popup is visible.
+pub fn set_tick_handler(f: fn()) {
+    TICK.with(|c| c.set(Some(f)));
+}
+
+/// True while a slider drag holds the mouse capture.
+pub fn is_dragging() -> bool {
+    DRAGGING.with(Cell::get)
+}
+
+/// Invalidates and paints the popup synchronously (live slider feedback).
+pub fn repaint_now() {
+    let hwnd = POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|pw| pw.hwnd)));
+    if let Some(hwnd) = hwnd {
+        // SAFETY: hwnd is our live popup.
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+            let _ = UpdateWindow(hwnd);
+        }
+    }
+}
+
+fn client_dip(lp: LPARAM) -> (f32, f32) {
+    let dpi = POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|p| p.renderer.dpi())).unwrap_or(96));
+    let x = dpi::px_to_dip((lp.0 & 0xffff) as i16 as i32, dpi);
+    let y = dpi::px_to_dip(((lp.0 >> 16) & 0xffff) as i16 as i32, dpi);
+    (x, y)
 }
 
 /// Sets the body painter, called inside each frame after the background (see `paint`).
@@ -208,6 +257,12 @@ pub fn invalidate() {
 /// Hides the persistent popup window. Keeping its HWND and D2D resources alive makes the next open
 /// a synchronous move/resize/show operation, matching the Electron fast path.
 pub fn hide() {
+    if DRAGGING.with(Cell::get) {
+        // SAFETY: drops our own capture; WM_CAPTURECHANGED finishes the drag.
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
     POPUP.with(|p| {
         if let Some(pw) = p.borrow().as_ref() {
             unsafe {
@@ -258,12 +313,54 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             poll();
             LRESULT(0)
         }
+        WM_LBUTTONDOWN => {
+            let (x, y) = client_dip(lp);
+            LAST_POS.with(|p| p.set((x, y)));
+            if let Some(f) = DRAG.with(Cell::get) {
+                if f(DragPhase::Down, x, y) {
+                    DRAGGING.with(|d| d.set(true));
+                    // SAFETY: our own window takes the capture until mouse-up.
+                    unsafe {
+                        SetCapture(hwnd);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if DRAGGING.with(Cell::get) {
+                let (x, y) = client_dip(lp);
+                LAST_POS.with(|p| p.set((x, y)));
+                if let Some(f) = DRAG.with(Cell::get) {
+                    f(DragPhase::Move, x, y);
+                }
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
-            let dpi = POPUP.with(|p| p.borrow().as_ref().map(|p| p.renderer.dpi()).unwrap_or(96));
-            let x = dpi::px_to_dip((lp.0 & 0xffff) as i16 as i32, dpi);
-            let y = dpi::px_to_dip(((lp.0 >> 16) & 0xffff) as i16 as i32, dpi);
+            let (x, y) = client_dip(lp);
+            if DRAGGING.with(|d| d.replace(false)) {
+                // SAFETY: releases the capture taken on mouse-down.
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                if let Some(f) = DRAG.with(Cell::get) {
+                    f(DragPhase::Up, x, y);
+                }
+                return LRESULT(0);
+            }
             if let Some(f) = CLICK.with(Cell::get) {
                 f(x, y);
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            // Capture lost without a mouse-up (e.g. popup hidden): finish the drag where it was.
+            if DRAGGING.with(|d| d.replace(false)) {
+                let (x, y) = LAST_POS.with(Cell::get);
+                if let Some(f) = DRAG.with(Cell::get) {
+                    f(DragPhase::Up, x, y);
+                }
             }
             LRESULT(0)
         }
@@ -299,6 +396,9 @@ fn key_down(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> boo
 /// Closes on Esc (rising edge) or on a click outside both the popup and its anchor.
 /// Clicks on the anchor are left to the dock, which toggles or switches the popup.
 fn poll() {
+    if let Some(f) = TICK.with(Cell::get) {
+        f();
+    }
     let close = POPUP.with(|p| {
         let Ok(mut g) = p.try_borrow_mut() else { return false };
         let Some(pw) = g.as_mut() else { return false };
