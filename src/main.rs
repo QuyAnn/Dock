@@ -253,6 +253,10 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
                     bottom: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) },
                 };
                 let virtual_size = (virtual_screen.right - virtual_screen.left, virtual_screen.bottom - virtual_screen.top);
+                match wallpaper::source_path() {
+                    Some(path) => log(&format!("wallpaper candidate={}", path.display())),
+                    None => log("wallpaper candidate not found"),
+                }
                 match wallpaper::load(virtual_size.0.max(monitor.right - monitor.left) as u32) {
                     Ok(wp) => {
                         let (bar, screen) = if wp.mode == wallpaper::FitMode::Span {

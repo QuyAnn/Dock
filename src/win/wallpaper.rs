@@ -72,6 +72,11 @@ pub fn wallpaper_changed() -> bool {
     current != seen
 }
 
+/// Path selected by the same discovery order as `load`, for diagnostics even if WIC decode fails.
+pub fn source_path() -> Option<PathBuf> {
+    current_source().map(|source| source.path)
+}
+
 /// Reads and decodes the current wallpaper. Width is capped to `max_w` (use the primary display
 /// width, at least 1920). Records the signature so `wallpaper_changed` reports false afterwards.
 /// Errors: no wallpaper file, or WIC cannot decode it.
@@ -98,25 +103,23 @@ pub fn load(max_w: u32) -> Result<WallpaperPixels> {
 fn current_source() -> Option<Source> {
     let themes = std::env::var_os("APPDATA")
         .map(|a| PathBuf::from(a).join("Microsoft").join("Windows").join("Themes"));
-    let registry = [
-        reg_string(w!("WallPaper")),
-        reg_string_at(
-            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Wallpapers"),
-            w!("BackgroundHistoryPath0"),
-        ),
-    ]
-    .into_iter()
-    .flatten()
+    let desktop = reg_string(w!("WallPaper")).filter(|p| !p.is_empty()).map(PathBuf::from).filter(|p| p.is_file());
+    let history = reg_string_at(
+        w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Wallpapers"),
+        w!("BackgroundHistoryPath0"),
+    )
     .filter(|p| !p.is_empty())
     .map(PathBuf::from)
-    .find(|p| p.is_file());
+    .filter(|p| p.is_file());
     let transcoded = themes.as_ref().map(|d| d.join("TranscodedWallpaper")).filter(|p| p.is_file());
     let generated = themes.as_ref().and_then(|d| newest_file(d, Some("Transcoded_")));
     let cached = themes
         .as_ref()
         .map(|d| d.join("CachedFiles"))
         .and_then(|d| newest_file(&d, Some("CachedImage_")));
-    let path = registry.or(transcoded).or(generated).or(cached)?;
+    // BackgroundHistoryPath0 is not guaranteed to be the image currently on screen. Prefer the
+    // transcoded/cached output that Windows updates for slideshow and Spotlight sessions.
+    let path = desktop.or(transcoded).or(generated).or(cached).or(history)?;
     let meta = std::fs::metadata(&path).ok()?;
     let style = reg_string(w!("WallpaperStyle")).unwrap_or_else(|| "10".into());
     let tile = reg_string(w!("TileWallpaper")).unwrap_or_else(|| "0".into());
