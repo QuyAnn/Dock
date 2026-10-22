@@ -55,14 +55,18 @@ fn find_repos(folders: &[PathBuf]) -> Vec<PathBuf> {
 }
 
 /// Counts the configured user's commits per day over the last 17 weeks.
-pub fn refresh_git(repos: &[PathBuf]) -> GitSummary {
+pub fn refresh_git(repos: &[PathBuf], configured_author: &str) -> GitSummary {
     let mut counts: HashMap<String, u32> = HashMap::new();
     let mut error = None;
 
     let git_available = git(&["--version"], None).is_some();
-    let author = git(&["config", "--global", "user.email"], None)
-        .map(|o| o.trim().to_owned())
-        .unwrap_or_default();
+    let author = if configured_author.trim().is_empty() {
+        git(&["config", "--global", "user.email"], None)
+            .map(|o| o.trim().to_owned())
+            .unwrap_or_default()
+    } else {
+        configured_author.trim().to_owned()
+    };
     let repo_dirs = find_repos(repos);
     if !git_available {
         error = Some("git.exe not found in PATH".to_owned());

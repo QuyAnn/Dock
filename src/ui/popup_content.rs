@@ -71,12 +71,16 @@ const AI_NOTE: &str = "Đọc từ đăng nhập cục bộ của bạn trên m�
 const OPEN_METEO: &str = "Thời tiết: Open-Meteo (không cần key).";
 const LOCAL_NOTE: &str = "Đo cục bộ mỗi 2 giây.";
 
-/// Settings placeholder rows: (label, on).
-const SETTINGS: [(&str, bool); 4] = [
-    ("Start with Windows", true),
-    ("Full-width dock", false),
-    ("Dark mode", true),
-    ("Show attention dots", true),
+const SETTING_TILES: [(&str, &str); 9] = [
+    ("git", "Git"),
+    ("claude", "Claude"),
+    ("codex", "ChatGPT"),
+    ("cursor", "Cursor"),
+    ("grok", "Grok"),
+    ("music", "Media"),
+    ("cpu", "CPU"),
+    ("ram", "RAM"),
+    ("weather", "Thời tiết"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,12 +102,23 @@ pub enum MediaAction {
     Next,
 }
 
+#[derive(Clone, Debug)]
+pub enum SettingsAction {
+    GlassOpacity(u8),
+    HiddenTaskbar(bool),
+    ToggleWidget(&'static str),
+    ToggleWeatherPosition,
+    ToggleStartup,
+    OpenConfig,
+}
+
 
 thread_local! {
     static CONTENT: RefCell<Option<(PopupKind, DataState)>> = const { RefCell::new(None) };
     static AI_PROVIDER: RefCell<Option<&'static str>> = const { RefCell::new(None) };
     /// Sample history per kind (Cpu, Ram), percent 0..=100, oldest first.
     static HISTORY: RefCell<Vec<(PopupKind, Vec<f32>)>> = const { RefCell::new(Vec::new()) };
+    static SETTINGS_STATE: RefCell<crate::settings::Settings> = RefCell::new(crate::settings::Settings::default());
 }
 
 pub fn set_ai_provider(provider: Option<&'static str>) {
@@ -126,6 +141,10 @@ pub fn set_content(kind: PopupKind, data: DataState) {
     CONTENT.with(|c| *c.borrow_mut() = Some((kind, data)));
 }
 
+pub fn set_settings(settings: crate::settings::Settings) {
+    SETTINGS_STATE.with(|state| *state.borrow_mut() = settings);
+}
+
 /// Painter with the signature `popup::set_painter` expects. Draws the content stored by `set_content`.
 pub fn paint_content(r: &mut Renderer, rect: RectF) {
     CONTENT.with(|c| {
@@ -144,8 +163,54 @@ pub fn draw_popup(r: &mut Renderer, kind: PopupKind, rect: RectF, data: &DataSta
 
 /// Total popup height for this content, in DIPs. Use it as the window height (and in the click hit test).
 pub fn content_height(kind: PopupKind, data: &DataState) -> f32 {
-    let mut c = Ctx { r: None, rect: RectF { x: 0.0, y: 0.0, w: WIDTH, h: 0.0 } };
+    let width = if kind == PopupKind::Settings { 459.0 } else { WIDTH };
+    let mut c = Ctx { r: None, rect: RectF { x: 0.0, y: 0.0, w: width, h: 0.0 } };
     draw_all(&mut c, kind, data).unwrap_or(0.0)
+}
+
+pub fn hit_settings(x: f32, y: f32, rect: RectF) -> Option<SettingsAction> {
+    let top = rect.y + HEAD_H;
+    let inner_x = rect.x + PAD_X;
+    let inner_w = rect.w - PAD_X * 2.0;
+    let slider = rect_at(inner_x, top + 33.0, inner_w, 18.0);
+    if contains(slider, x, y) {
+        let pct = ((x - slider.x) / slider.w * 95.0).round().clamp(0.0, 95.0) as u8;
+        return Some(SettingsAction::GlassOpacity(pct));
+    }
+    let taskbar = rect_at(inner_x, top + 76.0, inner_w, 30.0);
+    if contains(taskbar, x, y) {
+        return Some(SettingsAction::HiddenTaskbar(x >= taskbar.x + taskbar.w / 2.0));
+    }
+    let grid_y = top + 137.0;
+    let cell_w = (inner_w - 8.0) / 3.0;
+    for (index, (id, _)) in SETTING_TILES.iter().enumerate() {
+        let cell = rect_at(
+            inner_x + (index % 3) as f32 * (cell_w + 4.0),
+            grid_y + (index / 3) as f32 * 31.0,
+            cell_w,
+            27.0,
+        );
+        if contains(cell, x, y) {
+            return Some(SettingsAction::ToggleWidget(id));
+        }
+    }
+    if contains(rect_at(inner_x, top + 257.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::ToggleWeatherPosition);
+    }
+    if contains(rect_at(inner_x, top + 295.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::OpenConfig);
+    }
+    if contains(rect_at(inner_x, top + 333.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::OpenConfig);
+    }
+    if contains(rect_at(inner_x, top + 371.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::ToggleStartup);
+    }
+    None
+}
+
+fn contains(rect: RectF, x: f32, y: f32) -> bool {
+    x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h
 }
 
 /// Hit test for the media buttons. `rect` must match the one passed to `draw_popup`.
@@ -273,7 +338,7 @@ fn meta(kind: PopupKind) -> Meta {
         }
         PopupKind::Cpu => Meta { glyph: "◔", color: 0x30A4_6CFF, title: "CPU", badge: None, note: LOCAL_NOTE },
         PopupKind::Ram => Meta { glyph: "◔", color: 0x3E63_DDFF, title: "RAM", badge: None, note: LOCAL_NOTE },
-        PopupKind::Settings => Meta { glyph: "⚙", color: 0x6B6B_75FF, title: "Settings", badge: None, note: "" },
+        PopupKind::Settings => Meta { glyph: "⚙", color: 0x6B6B_75FF, title: "Cài đặt SmartDock", badge: None, note: "" },
     }
 }
 
@@ -669,11 +734,91 @@ fn spark(c: &mut Ctx<'_>, area: RectF, data: &[f32], color: u32) -> Result<()> {
 }
 
 fn draw_settings(c: &mut Ctx<'_>, y: f32) -> Result<f32> {
-    let mut y = y;
-    for (i, (label, on)) in SETTINGS.iter().enumerate() {
-        y = row(c, y, i, label, None, Some(if *on { "On" } else { "Off" }), None)?;
+    let settings = SETTINGS_STATE.with(|state| state.borrow().clone());
+    let x = c.inner_x();
+    let w = c.inner_w();
+
+    c.text(
+        &format!("ĐỘ ĐỤC KÍNH  ·  {}%", settings.glass_opacity),
+        rect_at(x, y + 10.0, w, 15.0),
+        font(9.5, MUTED).bold(),
+    )?;
+    let track = rect_at(x, y + 38.0, w, 5.0);
+    c.round(track, 2.5, 0xFFFF_FF1F)?;
+    c.round(RectF { w: track.w * settings.glass_opacity as f32 / 95.0, ..track }, 2.5, BLUE)?;
+    let knob_x = track.x + track.w * settings.glass_opacity as f32 / 95.0;
+    c.round(rect_at(knob_x - 7.0, track.y - 5.0, 14.0, 14.0), 7.0, WHITE)?;
+
+    c.text("TASKBAR WINDOWS", rect_at(x, y + 57.0, w, 15.0), font(9.5, MUTED).bold())?;
+    let taskbar = rect_at(x, y + 76.0, w, 30.0);
+    c.round(taskbar, 8.0, 0xFFFF_FF0F)?;
+    let half = taskbar.w / 2.0;
+    let hidden = settings.taskbar_mode == "hidden";
+    c.round(
+        rect_at(taskbar.x + if hidden { half } else { 0.0 }, taskbar.y, half, taskbar.h),
+        8.0,
+        0x4AA8_FF45,
+    )?;
+    c.text("Tự ẩn", rect_at(taskbar.x, taskbar.y, half, taskbar.h), font(10.5, if hidden { MUTED } else { WHITE }).center())?;
+    c.text("Ẩn hoàn toàn", rect_at(taskbar.x + half, taskbar.y, half, taskbar.h), font(10.5, if hidden { WHITE } else { MUTED }).center())?;
+
+    c.text("WIDGET HIỂN THỊ", rect_at(x, y + 118.0, w, 15.0), font(9.5, MUTED).bold())?;
+    let cell_w = (w - 8.0) / 3.0;
+    for (index, (id, label)) in SETTING_TILES.iter().enumerate() {
+        let on = match *id {
+            "git" => settings.tiles.git,
+            "claude" => settings.tiles.claude,
+            "codex" => settings.tiles.codex,
+            "cursor" => settings.tiles.cursor,
+            "grok" => settings.tiles.grok,
+            "music" => settings.tiles.music,
+            "cpu" => settings.tiles.cpu,
+            "ram" => settings.tiles.ram,
+            _ => settings.tiles.weather,
+        };
+        let cell = rect_at(
+            x + (index % 3) as f32 * (cell_w + 4.0),
+            y + 137.0 + (index / 3) as f32 * 31.0,
+            cell_w,
+            27.0,
+        );
+        c.round(cell, 7.0, if on { 0x4AA8_FF35 } else { 0xFFFF_FF0B })?;
+        c.text(if on { "✓" } else { "○" }, rect_at(cell.x + 8.0, cell.y, 16.0, cell.h), font(10.5, if on { BLUE } else { MUTED }).center())?;
+        c.text(label, rect_at(cell.x + 27.0, cell.y, cell.w - 32.0, cell.h), font(10.0, if on { TEXT } else { MUTED }))?;
     }
-    Ok(y)
+
+    setting_value(
+        c,
+        rect_at(x, y + 257.0, w, 30.0),
+        "Vị trí thời tiết",
+        if settings.weather_position == "tile" { "Widget riêng" } else { "Trong đồng hồ" },
+    )?;
+    setting_value(c, rect_at(x, y + 295.0, w, 30.0), "Địa điểm", &settings.weather_location)?;
+    let repo = if settings.git_folders.is_empty() {
+        "Tự tìm repo".to_owned()
+    } else {
+        format!("{} thư mục · {}", settings.git_folders.len(), if settings.git_author.is_empty() { "email Git" } else { &settings.git_author })
+    };
+    setting_value(c, rect_at(x, y + 333.0, w, 30.0), "Git / email", &repo)?;
+    setting_value(
+        c,
+        rect_at(x, y + 371.0, w, 30.0),
+        "Khởi động cùng Windows",
+        if settings.launch_at_startup { "Bật" } else { "Tắt" },
+    )?;
+    setting_value(c, rect_at(x, y + 409.0, w, 30.0), "Phím tắt ẩn / hiện", &settings.shortcut)?;
+    c.text(
+        "Bấm Địa điểm hoặc Git / email để sửa settings.json.",
+        rect_at(x, y + 447.0, w, 14.0),
+        font(9.0, MUTED),
+    )?;
+    Ok(y + 470.0)
+}
+
+fn setting_value(c: &mut Ctx<'_>, area: RectF, label: &str, value: &str) -> Result<()> {
+    c.round(area, 8.0, 0xFFFF_FF0B)?;
+    c.text(label, rect_at(area.x + 10.0, area.y, area.w * 0.48, area.h), font(10.0, TEXT))?;
+    c.text(value, rect_at(area.x + area.w * 0.46, area.y, area.w * 0.50 - 10.0, area.h), font(9.5, MUTED).right())
 }
 
 // ---------------------------------------------------------------- labels

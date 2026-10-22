@@ -34,6 +34,8 @@ pub enum AbEdge {
 
 /// True while the taskbar is hidden by us.
 static APPLIED: AtomicBool = AtomicBool::new(false);
+/// Hidden mode removes the primary tray HWND; autohide mode leaves it available at the edge.
+static HIDE_WINDOW: AtomicBool = AtomicBool::new(true);
 /// Taskbar AppBar state (ABS_*) from before we changed it.
 static ORIGINAL_STATE: AtomicU32 = AtomicU32::new(ABS_ALWAYSONTOP);
 
@@ -212,7 +214,7 @@ fn remove_state_file() {
 /// Auto-hides the primary taskbar and hides only its window.
 /// The original state is saved to disk first; if that fails, nothing is changed.
 /// No-op if already hidden.
-pub fn hide_taskbar() {
+pub fn hide_taskbar(hide_window: bool) {
     if APPLIED.load(Ordering::SeqCst) {
         return;
     }
@@ -224,8 +226,16 @@ pub fn hide_taskbar() {
     }
     ORIGINAL_STATE.store(original, Ordering::SeqCst);
     APPLIED.store(true, Ordering::SeqCst);
+    HIDE_WINDOW.store(hide_window, Ordering::SeqCst);
     set_taskbar_state(tray, ABS_AUTOHIDE);
-    show_primary_tray(false);
+    show_primary_tray(!hide_window);
+}
+
+pub fn set_hidden_mode(hidden: bool) {
+    HIDE_WINDOW.store(hidden, Ordering::SeqCst);
+    if APPLIED.load(Ordering::SeqCst) {
+        show_primary_tray(!hidden);
+    }
 }
 
 /// Restores the taskbar saved by `hide_taskbar`. Idempotent and synchronous: safe to call
@@ -251,7 +261,9 @@ pub fn ensure_restored_on_exit() {
 /// No-op unless the taskbar is hidden by us.
 pub fn enforce_taskbar_hidden() {
     if APPLIED.load(Ordering::SeqCst) {
-        show_primary_tray(false);
+        if HIDE_WINDOW.load(Ordering::SeqCst) {
+            show_primary_tray(false);
+        }
     }
 }
 

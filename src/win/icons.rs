@@ -1,13 +1,23 @@
 //! App icons: exe -> 32x32 RGBA via the shell icon, cached per path.
 use std::collections::HashMap;
+use std::iter::once;
 use std::mem::{size_of, zeroed};
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::HWND;
+use windows::core::{PCWSTR, Result};
+use windows::Win32::Foundation::{GENERIC_READ, HWND};
 use windows::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetDIBits, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
     HBITMAP, HDC, HGDIOBJ,
+};
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICImagingFactory,
+    WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
+};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
 use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -32,13 +42,103 @@ pub fn icon_for_exe(exe_path: &str) -> Option<IconBitmap> {
     if let Some(hit) = cache.lock().ok()?.get(exe_path).cloned() {
         return Some(hit);
     }
-    let icon = extract(exe_path)?;
+    // Packaged/UWP executables often expose only a generic shell icon. Prefer the manifest's
+    // Square44x44Logo, but keep a valid shell icon whenever package discovery/decoding fails.
+    let icon = appx_icon(exe_path).or_else(|| extract(exe_path))?;
     let mut map = cache.lock().ok()?;
     if map.len() >= CACHE_LIMIT {
         map.clear();
     }
     map.insert(exe_path.to_owned(), icon.clone());
     Some(icon)
+}
+
+fn appx_icon(exe_path: &str) -> Option<IconBitmap> {
+    let exe = Path::new(exe_path);
+    let packaged = exe_path.to_ascii_lowercase().contains("\\windowsapps\\")
+        || exe.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("SystemSettings.exe"));
+    if !packaged {
+        return None;
+    }
+    let mut dir = exe.parent()?;
+    let manifest = loop {
+        let candidate = dir.join("AppxManifest.xml");
+        if candidate.is_file() {
+            break candidate;
+        }
+        dir = dir.parent()?;
+    };
+    let xml = std::fs::read_to_string(&manifest).ok()?;
+    let logo = xml_value(&xml, "Square44x44Logo")?;
+    let root = manifest.parent()?;
+    let configured = root.join(logo.replace('/', "\\"));
+    let selected = best_logo(&configured).or_else(|| configured.is_file().then_some(configured))?;
+    decode_image(&selected).ok()
+}
+
+fn xml_value(xml: &str, name: &str) -> Option<String> {
+    let marker = format!("{name}=\"");
+    let rest = xml.split_once(&marker)?.1;
+    Some(rest.split('"').next()?.to_owned())
+}
+
+fn best_logo(configured: &Path) -> Option<PathBuf> {
+    let dir = configured.parent()?;
+    let stem = configured.file_stem()?.to_string_lossy();
+    let mut candidates: Vec<(i32, PathBuf)> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+            if !name.starts_with(&stem.to_ascii_lowercase()) || path.extension()?.to_string_lossy().to_ascii_lowercase() != "png" {
+                return None;
+            }
+            // Prefer unplated target-size assets, then high-DPI scale assets, then the base logo.
+            let score = if name.contains("targetsize-48") && name.contains("unplated") {
+                300
+            } else if name.contains("targetsize-48") {
+                250
+            } else if name.contains("scale-200") {
+                200
+            } else {
+                100
+            };
+            Some((score, path))
+        })
+        .collect();
+    candidates.sort_by_key(|(score, _)| *score);
+    candidates.pop().map(|(_, path)| path)
+}
+
+fn decode_image(path: &Path) -> Result<IconBitmap> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let decoder = factory.CreateDecoderFromFilename(
+            PCWSTR(wide.as_ptr()),
+            None,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand,
+        )?;
+        let frame = decoder.GetFrame(0)?;
+        let (mut w, mut h) = (0, 0);
+        frame.GetSize(&mut w, &mut h)?;
+        let converter = factory.CreateFormatConverter()?;
+        converter.Initialize(
+            &frame,
+            &GUID_WICPixelFormat32bppRGBA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )?;
+        let mut rgba = vec![0; (w * h * 4) as usize];
+        converter.CopyPixels(std::ptr::null(), w * 4, &mut rgba)?;
+        Ok(IconBitmap { w, h, rgba })
+    }
 }
 
 fn extract(exe_path: &str) -> Option<IconBitmap> {

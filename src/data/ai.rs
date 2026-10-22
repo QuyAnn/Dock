@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 use crate::model::{AiUsage, AiWindow};
@@ -42,6 +45,17 @@ fn home() -> Option<PathBuf> {
 
 fn read_json(path: &Path) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Provider diagnostics only. Never pass credentials or request headers to this function.
+fn log_provider(provider: &str, message: &str) {
+    use std::io::Write;
+    let Some(appdata) = std::env::var_os("APPDATA") else { return };
+    let dir = PathBuf::from(appdata).join("SmartDock");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.txt")) {
+        let _ = writeln!(file, "AI {provider}: {message}");
+    }
 }
 
 fn now_ms() -> i64 {
@@ -84,7 +98,17 @@ fn send(req: ureq::Request) -> Result<Value, String> {
         Err(ureq::Error::Status(401 | 403, _)) => Err("sign-in expired, sign in again".to_owned()),
         Err(ureq::Error::Status(429, _)) => Err("rate limited, retrying later".to_owned()),
         Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
-        Err(_) => Err("network error".to_owned()),
+        Err(ureq::Error::Transport(e)) => Err(format!("network error: {e}")),
+    }
+}
+
+fn send_body(req: ureq::Request, body: &str) -> Result<Value, String> {
+    match req.send_string(body) {
+        Ok(resp) => resp.into_json::<Value>().map_err(|_| "unreadable response".to_owned()),
+        Err(ureq::Error::Status(401 | 403, _)) => Err("sign-in expired, sign in again".to_owned()),
+        Err(ureq::Error::Status(429, _)) => Err("rate limited, retrying later".to_owned()),
+        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+        Err(ureq::Error::Transport(e)) => Err(format!("network error: {e}")),
     }
 }
 
@@ -183,7 +207,10 @@ fn codex() -> AiUsage {
                 }
                 api_err = Some("no usage data".to_owned());
             }
-            Err(e) => api_err = Some(e),
+            Err(e) => {
+                log_provider(NAME, &format!("usage endpoint failed: {e}"));
+                api_err = Some(e);
+            }
         }
     }
 
@@ -256,9 +283,94 @@ fn collect_jsonl(dir: &Path, depth: u32, out: &mut Vec<(PathBuf, i64)>) {
 // ---------------------------------------------------------------- Cursor / Grok
 
 fn cursor() -> AiUsage {
-    // Cursor keeps its session in a SQLite state database. The native port deliberately exposes the
-    // provider tile even when that optional source cannot be read, rather than inventing usage.
-    no_data("Cursor", "sign in to Cursor")
+    const NAME: &str = "Cursor";
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return no_data(NAME, "sign in to Cursor");
+    };
+    let db_path = PathBuf::from(appdata).join("Cursor").join("User").join("globalStorage").join("state.vscdb");
+    if !db_path.is_file() {
+        return no_data(NAME, "sign in to Cursor");
+    }
+    let read_auth = || -> Result<(String, Option<String>), String> {
+        let db = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("cannot open state.vscdb: {e}"))?;
+        let mut stmt = db
+            .prepare("SELECT key, value FROM ItemTable WHERE key LIKE 'cursorAuth/%'")
+            .map_err(|e| format!("cannot query state.vscdb: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
+            .map_err(|e| format!("cannot read state.vscdb: {e}"))?;
+        let mut token = None;
+        let mut plan = None;
+        for row in rows.flatten() {
+            match row.0.as_str() {
+                "cursorAuth/accessToken" => token = Some(row.1),
+                "cursorAuth/stripeMembershipType" => plan = Some(row.1),
+                _ => {}
+            }
+        }
+        token.filter(|value| !value.is_empty()).map(|value| (value, plan)).ok_or_else(|| "access token missing".to_owned())
+    };
+    let (token, plan) = match read_auth() {
+        Ok(auth) => auth,
+        Err(e) => {
+            log_provider(NAME, &e);
+            return no_data(NAME, if e == "access token missing" { "sign in to Cursor" } else { "Cursor auth error" });
+        }
+    };
+    let user_id = token
+        .split('.')
+        .nth(1)
+        .and_then(|part| URL_SAFE_NO_PAD.decode(part).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|payload| payload.get("sub").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|sub| sub.rsplit('|').next().map(str::to_owned))
+        .filter(|id| !id.is_empty());
+    let Some(user_id) = user_id else {
+        log_provider(NAME, "access token payload has no user id");
+        return no_data(NAME, "Cursor auth error");
+    };
+
+    let request = agent()
+        .post("https://cursor.com/api/dashboard/get-current-period-usage")
+        .set("Content-Type", "application/json")
+        .set("Origin", "https://cursor.com")
+        .set("Referer", "https://cursor.com/dashboard")
+        .set("Cookie", &format!("WorkosCursorSessionToken={}%3A%3A{}", user_id, token));
+    let json = match send_body(request, "{}") {
+        Ok(json) => json,
+        Err(e) => {
+            log_provider(NAME, &format!("usage endpoint failed: {e}"));
+            return no_data(NAME, &e);
+        }
+    };
+    let usage = json.get("planUsage").unwrap_or(&Value::Null);
+    let spend = usage.get("totalSpend").and_then(Value::as_f64);
+    let limit = usage.get("limit").and_then(Value::as_f64);
+    let total_pct = usage
+        .get("totalPercentUsed")
+        .and_then(Value::as_f64)
+        .or_else(|| Some(spend? / limit? * 100.0));
+    let end_ms = json.get("billingCycleEnd").and_then(to_ms);
+    let money = match (spend, limit) {
+        (Some(spend), Some(limit)) => format!("${:.2}/${:.2}", spend / 100.0, limit / 100.0),
+        _ => plan.unwrap_or_else(|| "Cursor".to_owned()),
+    };
+    let reset = end_ms
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map(|date| date.format("%d/%m").to_string());
+    let reset_text = reset.map_or(money.clone(), |date| format!("{money} · {date}"));
+    let Some(total_pct) = total_pct else {
+        return no_data(NAME, &reset_text);
+    };
+    usage(
+        NAME,
+        vec![AiWindow {
+            label: "Plan (chu kỳ)".to_owned(),
+            used_pct: total_pct as f32,
+            reset_text,
+        }],
+    )
 }
 
 /// xAI exposes no local sign-in or usage API that a desktop app can read.

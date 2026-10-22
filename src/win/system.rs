@@ -16,7 +16,7 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL, E_NOTIMPL, FALSE, HANDLE, POINT, TRUE};
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioMeterInformation};
 use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -84,6 +84,12 @@ pub fn open_settings(page: &str) -> Result<()> {
     }
 }
 
+pub fn open_path(path: &std::path::Path) -> Result<()> {
+    let value = windows::core::HSTRING::from(path.as_os_str());
+    let result = unsafe { ShellExecuteW(None, w!("open"), &value, None, None, SW_SHOWNORMAL) };
+    if result.0 as isize > 32 { Ok(()) } else { Err(E_FAIL.into()) }
+}
+
 thread_local! {
     // Initialize COM/WinRT once per thread. Ignoring the result is fine:
     // RPC_E_CHANGED_MODE means the thread was already initialized.
@@ -137,6 +143,21 @@ fn endpoint_volume() -> Result<IAudioEndpointVolume> {
         let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
         device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
     }
+}
+
+/// Current peak level of the default output endpoint (WASAPI endpoint meter), 0.0..=1.0.
+/// This is the same signal a loopback visualizer would observe, without copying audio samples.
+pub fn audio_peak() -> f32 {
+    let read = || -> Result<f32> {
+        init_com();
+        let meter: IAudioMeterInformation = unsafe {
+            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+            device.Activate(CLSCTX_ALL, None)?
+        };
+        unsafe { meter.GetPeakValue() }
+    };
+    read().unwrap_or(0.0).clamp(0.0, 1.0)
 }
 
 /// Master volume as a scalar 0.0..=1.0 and mute state. Returns (0.0, false) when no device.

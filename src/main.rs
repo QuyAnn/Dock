@@ -4,12 +4,13 @@
 //! Every exit path (WM_CLOSE, panic, Ctrl+C) restores the taskbar.
 mod data;
 mod model;
+mod settings;
 mod ui;
 mod win;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -47,20 +48,25 @@ use win::wallpaper;
 const DOCK_HEIGHT: f32 = 46.0;
 const POPUP_W: f32 = 320.0;
 const CONTROL_POPUP_W: f32 = 340.0;
+const SETTINGS_POPUP_W: f32 = 460.0;
 /// Height used when the popup content cannot be measured yet.
 const POPUP_H_DEFAULT: f32 = 260.0;
-const GLASS_OPACITY: u8 = glass::DEFAULT_OPACITY_PCT;
 const TIMER_REFRESH: usize = 1; // 1 s: apps, stats, popup refresh, repaint
 const TIMER_GUARD: usize = 2; // 500 ms: keep the Windows taskbar hidden
+const TIMER_VISUALIZER: usize = 3; // ~30 fps, enabled only while media is playing
+const HOTKEY_TOGGLE: i32 = 1;
 
 /// Data shared with the background refresh thread. Blocking calls run there, never on the UI thread.
 struct Shared {
     data: Mutex<DataState>,
     control: Mutex<ControlState>,
+    settings: Mutex<settings::Settings>,
     /// Liquid Glass backdrop for the dock bar, rendered off the UI thread when the wallpaper changes.
     liquid: Mutex<Option<Arc<LiquidBitmap>>>,
     /// Set by WM_DISPLAYCHANGE so monitor/virtual-screen geometry is sampled again.
     refresh_liquid: AtomicBool,
+    /// Peak of the default render endpoint as f32 bits.
+    audio_peak: AtomicU32,
 }
 
 struct App {
@@ -81,6 +87,8 @@ struct App {
     stats: Stats,
     /// Two-minute CPU/RAM history for the sparklines.
     history: History,
+    visualizer_running: bool,
+    dock_visible: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -93,6 +101,7 @@ enum OpenPopup {
 enum Click {
     None,
     Activate(isize),
+    Start,
     Open(OpenPopup, RectF),
 }
 
@@ -214,7 +223,6 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> BOOL {
 
 fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
     thread::spawn(move || {
-        let repos = default_repos();
         let mut tick: u64 = 0;
         loop {
             // Control state every 2 s (volume, mute, radios, brightness).
@@ -230,8 +238,10 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
             }
             // Git, AI usage and weather every 10 min (first pass runs immediately).
             if tick % 600 == 0 {
+                let current = shared.settings.lock().unwrap().clone();
+                let repos = if current.git_folders.is_empty() { default_repos() } else { current.git_folders };
                 let mut local = shared.data.lock().unwrap().clone();
-                local.refresh_slow(&repos);
+                local.refresh_slow(&repos, &current.git_author, &current.weather_location);
                 *shared.data.lock().unwrap() = local;
             }
             // Liquid Glass backdrop: load and render on the first pass, then only when the wallpaper changes.
@@ -300,6 +310,24 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
     });
 }
 
+fn start_audio_meter(shared: Arc<Shared>) {
+    thread::spawn(move || loop {
+        let playing = shared
+            .data
+            .lock()
+            .ok()
+            .and_then(|data| data.media.as_ref().map(|media| media.playing))
+            .unwrap_or(false);
+        if playing {
+            shared.audio_peak.store(system::audio_peak().to_bits(), Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(33));
+        } else {
+            shared.audio_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(250));
+        }
+    });
+}
+
 /// Creates the dock window. Tries the full dock style first, then plainer styles, logging each attempt.
 fn create_dock_window(
     hinst: HINSTANCE,
@@ -337,6 +365,7 @@ fn create_dock_window(
 
 fn run() -> windows::core::Result<()> {
     log("start");
+    let initial_settings = settings::load();
     let hinst: HINSTANCE = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => h.into(),
         Err(e) => {
@@ -372,7 +401,7 @@ fn run() -> windows::core::Result<()> {
 
     // Remove the taskbar's edge claim before asking the shell to place our AppBar. Otherwise
     // ABM_QUERYPOS can return a rect one taskbar-height above rcMonitor.bottom.
-    appbar::hide_taskbar();
+    appbar::hide_taskbar(initial_settings.taskbar_mode == "hidden");
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
     let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, dock_height_px)?;
@@ -392,7 +421,7 @@ fn run() -> windows::core::Result<()> {
         );
     }
     apply_dwm_rounding(hwnd);
-    glass::apply_dock_glass(hwnd, GLASS_OPACITY);
+    glass::apply_dock_glass(hwnd, initial_settings.glass_opacity);
 
     let shell_msg = tasks::register_shell_hook(hwnd);
     SHELL_MSG.with(|m| m.set(shell_msg));
@@ -404,10 +433,13 @@ fn run() -> windows::core::Result<()> {
     let shared = Arc::new(Shared {
         data: Mutex::new(DataState::default()),
         control: Mutex::new(ControlState::read()),
+        settings: Mutex::new(initial_settings),
         liquid: Mutex::new(None),
         refresh_liquid: AtomicBool::new(false),
+        audio_peak: AtomicU32::new(0.0f32.to_bits()),
     });
     start_background_refresh(shared.clone(), dock_height_px);
+    start_audio_meter(shared.clone());
 
     let mut apps = AppsState::default();
     let attention = Attention::default();
@@ -428,6 +460,8 @@ fn run() -> windows::core::Result<()> {
             hover: None,
             stats: data::stats::read_stats(),
             history: History::default(),
+            visualizer_running: false,
+            dock_visible: true,
         })
     });
 
@@ -436,6 +470,7 @@ fn run() -> windows::core::Result<()> {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetTimer(hwnd, TIMER_REFRESH, 1000, None);
         SetTimer(hwnd, TIMER_GUARD, 500, None);
+        let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT, b'D' as u32);
     }
     repaint();
 
@@ -459,20 +494,26 @@ struct Zones {
     right: Vec<Tile>,
 }
 
-fn layout_tiles(app_count: usize) -> Zones {
+fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     let apps_w = (16.0 + app_count as f32 * 38.0).max(72.0);
     let t = |id, width| Tile { id, width, height: 0.0 };
+    let mut left = Vec::new();
+    let enabled = &settings.tiles;
+    if enabled.git { left.push(t("git", 118.0)); }
+    if enabled.claude { left.push(t("claude", 100.0)); }
+    if enabled.codex { left.push(t("codex", 100.0)); }
+    if enabled.cursor { left.push(t("cursor", 115.0)); }
+    if enabled.grok { left.push(t("grok", 100.0)); }
+    if enabled.music { left.push(t("media", 165.0)); }
+    if enabled.weather && settings.weather_position == "tile" { left.push(t("weather", 100.0)); }
+    let mut right = vec![t("cc", 56.0), t("gear", 22.0)];
+    if enabled.cpu { right.push(t("cpu", 42.0)); }
+    if enabled.ram { right.push(t("ram", 42.0)); }
+    right.push(t("clock", 64.0));
     Zones {
-        left: vec![
-            t("git", 118.0),
-            t("claude", 100.0),
-            t("codex", 100.0),
-            t("cursor", 100.0),
-            t("grok", 100.0),
-            t("media", 165.0),
-        ],
-        center: vec![Tile { id: "apps", width: apps_w, height: 44.0 }],
-        right: vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)],
+        left,
+        center: vec![t("start", 38.0), Tile { id: "apps", width: apps_w, height: 44.0 }],
+        right,
     }
 }
 
@@ -554,7 +595,14 @@ fn weather_icon(code: u32) -> &'static str {
     }
 }
 
-fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) -> TileView {
+fn tile_view(
+    id: &str,
+    data: &DataState,
+    control: &ControlState,
+    stats: &Stats,
+    audio_peak: f32,
+    settings: &settings::Settings,
+) -> TileView {
     let now = Local::now();
     match id {
         "git" => tiles::git_tile(data),
@@ -562,7 +610,12 @@ fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) 
         "codex" => ai_view(data, "Codex"),
         "cursor" => ai_view(data, "Cursor"),
         "grok" => ai_view(data, "Grok"),
-        "media" => tiles::media_tile(data),
+        "media" => {
+            let mut view = tiles::media_tile(data);
+            view.audio_peak = audio_peak;
+            view
+        }
+        "weather" => tiles::weather_tile(data),
         // .cc-btn: Wi-Fi and volume glyphs (Segoe MDL2 Assets).
         "cc" => TileView {
             style: Style::Button,
@@ -570,6 +623,7 @@ fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) 
             progress: control.wifi.map(|on| if on { 1.0 } else { 0.0 }),
             ..TileView::card("", "")
         },
+        "start" => TileView { style: Style::Start, ..TileView::card("", "") },
         "gear" => TileView::bare("\u{E713}"),
         "cpu" => TileView {
             style: Style::Ring,
@@ -589,11 +643,14 @@ fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) 
         }
         "clock" => {
             let day = ["CN", "T2", "T3", "T4", "T5", "T6", "T7"][now.weekday().num_days_from_sunday() as usize];
-            let sub = data
-                .weather
-                .as_ref()
-                .map(|w| format!("{} {:.0}°", weather_icon(w.current.code), w.current.temp))
-                .unwrap_or_default();
+            let sub = if settings.tiles.weather && settings.weather_position == "clock" {
+                data.weather
+                    .as_ref()
+                    .map(|w| format!("{} {:.0}°", weather_icon(w.current.code), w.current.temp))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             TileView {
                 style: Style::Clock,
                 sub,
@@ -613,12 +670,17 @@ fn repaint() {
         let stats = app.stats.clone();
         let data = app.shared.data.lock().unwrap().clone();
         let control = app.shared.control.lock().unwrap().clone();
+        let audio_peak = f32::from_bits(app.shared.audio_peak.load(Ordering::Relaxed));
         let backdrop = app.shared.liquid.lock().unwrap().clone();
 
-        let zones = layout_tiles(app.apps.windows.len());
+        let settings = app.shared.settings.lock().unwrap().clone();
+        let zones = layout_tiles(app.apps.windows.len(), &settings);
         let rects = dock::layout(&zones.left, &zones.center, &zones.right, app.width);
         let defs: Vec<&Tile> = zones.left.iter().chain(&zones.center).chain(&zones.right).collect();
-        let views: Vec<TileView> = defs.iter().map(|t| tile_view(t.id, &data, &control, &stats)).collect();
+        let views: Vec<TileView> = defs
+            .iter()
+            .map(|t| tile_view(t.id, &data, &control, &stats, audio_peak, &settings))
+            .collect();
         app.tiles = defs.iter().zip(rects.iter()).map(|(t, r)| (t.id, *r)).collect();
 
         let apps_rect = app.tiles.iter().find(|(id, _)| *id == "apps").map(|(_, r)| *r);
@@ -631,7 +693,7 @@ fn repaint() {
                 &rects,
                 app.hover,
                 backdrop.as_deref(),
-                GLASS_OPACITY,
+                settings.glass_opacity,
             ))
             .and_then(|_| match apps_rect {
                 Some(r) => apps::draw_apps(&mut app.renderer, r, &app.apps),
@@ -673,6 +735,7 @@ fn dock_click(x: f32, y: f32) -> Click {
         };
         match id {
             "apps" => apps::hit_app(x, y, rect, &app.apps).map_or(Click::None, Click::Activate),
+            "start" => Click::Start,
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
             "claude" | "codex" | "cursor" | "grok" => Click::Open(OpenPopup::Data(id), anchor),
             "media" => Click::Open(OpenPopup::Data("media"), anchor),
@@ -734,13 +797,15 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
                     let app = slot.as_ref()?;
                     let data = app.shared.data.lock().unwrap().clone();
                     feed_popup(kind, &data, &app.history);
+                    popup_content::set_settings(app.shared.settings.lock().unwrap().clone());
                     Some(popup_content::content_height(kind, &data))
                 })
                 .unwrap_or(POPUP_H_DEFAULT);
             CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
             POPUP_H_CUR.with(|h| h.set(height));
-            POPUP_W_CUR.with(|w| w.set(POPUP_W));
-            if popup::show(anchor, POPUP_W, height as i32).is_ok() {
+            let width = if kind == PopupKind::Settings { SETTINGS_POPUP_W } else { POPUP_W };
+            POPUP_W_CUR.with(|w| w.set(width));
+            if popup::show(anchor, width, height as i32).is_ok() {
                 OPEN.with(|o| o.set(Some(which)));
             }
         }
@@ -762,7 +827,11 @@ fn refresh_open_popup() {
         let slot = a.borrow();
         let Some(app) = slot.as_ref() else { return };
         let data = app.shared.data.lock().unwrap().clone();
-        feed_popup(popup_kind(id), &data, &app.history);
+        let kind = popup_kind(id);
+        feed_popup(kind, &data, &app.history);
+        if kind == PopupKind::Settings {
+            popup_content::set_settings(app.shared.settings.lock().unwrap().clone());
+        }
     });
     popup::invalidate();
 }
@@ -799,6 +868,56 @@ fn on_popup_click(x: f32, y: f32) {
         }
         return;
     }
+    if OPEN.with(Cell::get) == Some(OpenPopup::Data("settings")) {
+        if let Some(action) = popup_content::hit_settings(x, y, rect) {
+            APP.with(|a| {
+                let slot = a.borrow();
+                let Some(app) = slot.as_ref() else { return };
+                let mut settings = app.shared.settings.lock().unwrap();
+                match action {
+                    popup_content::SettingsAction::GlassOpacity(value) => {
+                        settings.glass_opacity = value;
+                        glass::apply_dock_glass(app.hwnd, value);
+                    }
+                    popup_content::SettingsAction::HiddenTaskbar(hidden) => {
+                        settings.taskbar_mode = if hidden { "hidden" } else { "autohide" }.to_owned();
+                        appbar::set_hidden_mode(hidden);
+                    }
+                    popup_content::SettingsAction::ToggleWidget(id) => match id {
+                        "git" => settings.tiles.git = !settings.tiles.git,
+                        "claude" => settings.tiles.claude = !settings.tiles.claude,
+                        "codex" => settings.tiles.codex = !settings.tiles.codex,
+                        "cursor" => settings.tiles.cursor = !settings.tiles.cursor,
+                        "grok" => settings.tiles.grok = !settings.tiles.grok,
+                        "music" => settings.tiles.music = !settings.tiles.music,
+                        "cpu" => settings.tiles.cpu = !settings.tiles.cpu,
+                        "ram" => settings.tiles.ram = !settings.tiles.ram,
+                        "weather" => settings.tiles.weather = !settings.tiles.weather,
+                        _ => {}
+                    },
+                    popup_content::SettingsAction::ToggleWeatherPosition => {
+                        settings.weather_position =
+                            if settings.weather_position == "clock" { "tile" } else { "clock" }.to_owned();
+                    }
+                    popup_content::SettingsAction::ToggleStartup => {
+                        settings.launch_at_startup = !settings.launch_at_startup;
+                        settings::sync_startup(settings.launch_at_startup);
+                    }
+                    popup_content::SettingsAction::OpenConfig => {
+                        let _ = settings::save(&settings);
+                        if let Some(path) = settings::path() {
+                            let _ = system::open_path(&path);
+                        }
+                    }
+                }
+                let _ = settings::save(&settings);
+                popup_content::set_settings(settings.clone());
+            });
+            popup::invalidate();
+            repaint();
+        }
+        return;
+    }
     if let Some(action) = popup_content::hit_media_button(x, y, rect) {
         let action = match action {
             PopupMedia::Previous => MediaAction::Previous,
@@ -825,6 +944,8 @@ fn shutdown() {
                 // SAFETY: hwnd is still valid until DestroyWindow in the caller.
                 let _ = KillTimer(app.hwnd, TIMER_REFRESH);
                 let _ = KillTimer(app.hwnd, TIMER_GUARD);
+                let _ = KillTimer(app.hwnd, TIMER_VISUALIZER);
+                let _ = UnregisterHotKey(app.hwnd, HOTKEY_TOGGLE);
             }
             tasks::unregister_shell_hook(app.hwnd);
             appbar::unregister_appbar(app.hwnd);
@@ -877,6 +998,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                                 app.apps.refresh(&app.attention);
                                 app.stats = data::stats::read_stats();
                                 app.history.push(&app.stats);
+                                let playing = app
+                                    .shared
+                                    .data
+                                    .lock()
+                                    .ok()
+                                    .and_then(|data| data.media.as_ref().map(|media| media.playing))
+                                    .unwrap_or(false);
+                                if playing != app.visualizer_running {
+                                    app.visualizer_running = playing;
+                                    if playing {
+                                        SetTimer(hwnd, TIMER_VISUALIZER, 33, None);
+                                    } else {
+                                        let _ = KillTimer(hwnd, TIMER_VISUALIZER);
+                                    }
+                                }
                             }
                         }
                     });
@@ -884,8 +1020,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     repaint();
                 }
                 TIMER_GUARD => appbar::enforce_taskbar_hidden(),
+                TIMER_VISUALIZER => repaint(),
                 _ => {}
             }
+            LRESULT(0)
+        }
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_TOGGLE => {
+            APP.with(|a| {
+                if let Some(app) = a.borrow_mut().as_mut() {
+                    app.dock_visible = !app.dock_visible;
+                    if app.dock_visible {
+                        let hidden = app.shared.settings.lock().unwrap().taskbar_mode == "hidden";
+                        appbar::hide_taskbar(hidden);
+                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    } else {
+                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        appbar::restore_taskbar();
+                    }
+                }
+            });
             LRESULT(0)
         }
         WM_PAINT => {
@@ -902,11 +1055,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             log(&format!("click at ({x},{y}) -> {}", match &click {
                 Click::None => "none",
                 Click::Activate(_) => "activate",
+                Click::Start => "open Start",
                 Click::Open(..) => "open popup",
             }));
             match click {
                 Click::None => {}
                 Click::Activate(h) => tasks::activate_window(h),
+                Click::Start => tasks::open_start_menu(),
                 Click::Open(which, anchor) => open_popup(which, anchor),
             }
             LRESULT(0)

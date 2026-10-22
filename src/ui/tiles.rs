@@ -9,7 +9,7 @@ use super::dock::{RectF, Style, TileView};
 use super::renderer::Renderer;
 use crate::data::ai::refresh_ai;
 use crate::data::git::{refresh_git, GitSummary};
-use crate::data::weather::{refresh_weather_at, Weather, DEFAULT_LOCATION};
+use crate::data::weather::{refresh_weather_at, Weather};
 use crate::model::{AiUsage, Media};
 use crate::win::system::current_media;
 
@@ -34,10 +34,10 @@ pub enum DataUpdate {
 
 impl DataState {
     /// Blocking network and disk reads (git, AI usage, weather). Run on a worker thread.
-    pub fn refresh_slow(&mut self, repos: &[PathBuf]) {
-        self.apply(DataUpdate::Git(refresh_git(repos)));
+    pub fn refresh_slow(&mut self, repos: &[PathBuf], git_author: &str, weather_location: &str) {
+        self.apply(DataUpdate::Git(refresh_git(repos, git_author)));
         self.apply(DataUpdate::Ai(refresh_ai()));
-        self.apply(DataUpdate::Weather(refresh_weather_at(DEFAULT_LOCATION)));
+        self.apply(DataUpdate::Weather(refresh_weather_at(weather_location)));
     }
 
     /// Reads the current media session. Blocks on WinRT; keep it off the UI thread.

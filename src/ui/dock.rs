@@ -2,6 +2,8 @@
 //! Three zones: left (git, AI, media), center (running apps), right (Control Center, settings,
 //! CPU, RAM, clock). Coordinates are dock-local DIPs (the dock window's client area).
 use windows::core::Result;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use super::liquid::{glass_fill_color, LiquidBitmap, GLASS_SHEEN_TOP};
 use super::renderer::{Align, Renderer, TextStyle};
@@ -68,6 +70,8 @@ pub enum Style {
     Media,
     /// Control Center button: value holds Segoe MDL2 glyphs drawn side by side.
     Button,
+    /// Windows logo button that opens Start.
+    Start,
     /// No background (the apps zone, the settings gear). `value` is the glyph or text.
     Bare,
 }
@@ -84,6 +88,8 @@ pub struct TileView {
     pub progress: Option<f32>,
     /// Gauge/bar color, 0xRRGGBBAA. 0 means the default.
     pub accent: u32,
+    /// Live endpoint peak for the media visualizer, 0..1.
+    pub audio_peak: f32,
     /// Icon square background for AI tiles, 0xRRGGBBAA. 0 means no square.
     pub bg: u32,
     /// Git heatmap levels 0..=4, column-major (16 columns of 3 rows). Empty when unused.
@@ -103,6 +109,7 @@ impl TileView {
             icon: None,
             progress: None,
             accent: 0,
+            audio_peak: 0.0,
             bg: 0,
             cells: Vec::new(),
             glyph: None,
@@ -194,6 +201,7 @@ pub fn draw_dock(
             Style::Git => draw_git(r, t, *rc, hovered)?,
             Style::Media => draw_media(r, t, *rc, hovered)?,
             Style::Button => draw_button(r, t, *rc, hovered)?,
+            Style::Start => draw_start(r, *rc, hovered)?,
         }
     }
     Ok(())
@@ -329,9 +337,16 @@ fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<
 
 fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
-    const WAVE: [f32; 14] = [5.0, 9.0, 15.0, 7.0, 18.0, 11.0, 4.0, 13.0, 17.0, 8.0, 14.0, 5.0, 10.0, 16.0];
-    for (i, full) in WAVE.iter().enumerate() {
-        let h = if t.progress.is_some() { *full } else { 4.0 };
+    let elapsed = {
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f32()
+    };
+    let peak = t.audio_peak.sqrt();
+    for i in 0..14 {
+        // Endpoint peak drives the envelope; staggered sine phases avoid a rigid equal-height block.
+        let pulse = ((elapsed * 10.0 + i as f32 * 1.73).sin() * 0.5 + 0.5).powf(0.7);
+        let shape = 0.45 + 0.55 * ((i as f32 - 6.5).abs() / 6.5 * std::f32::consts::PI).cos().abs();
+        let h = if t.progress.is_some() { 3.0 + peak * (5.0 + 18.0 * pulse * shape) } else { 4.0 };
         r.fill_rounded_rect(
             RectF { x: rc.x + 7.0 + i as f32 * 4.0, y: rc.y + (rc.h - h) / 2.0, w: 2.0, h },
             1.0,
@@ -364,6 +379,30 @@ fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resu
         };
         r.draw_text_styled(&glyph.to_string(), g, 13.0, color, Align::Center, TextStyle::Icon)?;
         x += 14.0 + 7.0;
+    }
+    Ok(())
+}
+
+fn draw_start(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
+    if hovered {
+        r.fill_rounded_rect(rc, 10.0, 0xFFFF_FF20)?;
+        r.stroke_rounded_rect(rc, 10.0, 0xFFFF_FF2E, 1.0)?;
+    }
+    let d = 8.0;
+    let gap = 1.5;
+    let total = d * 2.0 + gap;
+    let x = rc.x + (rc.w - total) / 2.0;
+    let y = rc.y + (rc.h - total) / 2.0;
+    for row in 0..2 {
+        for col in 0..2 {
+            let tile = RectF {
+                x: x + col as f32 * (d + gap),
+                y: y + row as f32 * (d + gap),
+                w: d,
+                h: d,
+            };
+            r.fill_rounded_rect_gradient(tile, 1.3, 0x65C7_FFFF, 0x1688_FFFF)?;
+        }
     }
     Ok(())
 }
