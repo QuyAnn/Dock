@@ -866,6 +866,6 @@ mod tests {
         assert!(!is_promoted(&other, &s));
         assert_eq!(parse_guid("{7820ae78-23e3-4229-82c1-e41cb67d5b9c}").unwrap()[0], 0x78);
         assert_eq!(parse_guid("{7820ae78-23e3-4229-82c1-e41cb67d5b9c}").unwrap()[3], 0x78);
-        assert_eq!(parse_guid("{7820ae78-23e3-4229-82c1-e41cb67d5b9c}").unwrap()[2], 0xae);
+        assert_eq!(parse_guid("{7820ae78-23e3-4229-82c1-e41cb67d5b9c}").unwrap()[1], 0xae);
     }
 }
