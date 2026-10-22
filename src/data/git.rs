@@ -203,6 +203,10 @@ pub fn refresh_git(repos: &[PathBuf], configured_author: &str) -> GitSummary {
         error = Some("Chưa có git user.email — đặt trong Cài đặt hoặc: git config --global user.email".to_owned());
     } else if repo_dirs.is_empty() {
         error = Some("Không tìm thấy repo git — thêm thư mục trong Cài đặt (Git / email)".to_owned());
+        git_log(&format!(
+            "git scan: author={author} repos=0 commits_119d=0 (configured_folders={})",
+            repos.len()
+        ));
     } else {
         let author_arg = format!("--author={author}");
         let since = format!("--since={DAYS} days ago");
@@ -214,6 +218,23 @@ pub fn refresh_git(repos: &[PathBuf], configured_author: &str) -> GitSummary {
                     *counts.entry(day.to_owned()).or_insert(0) += 1;
                 }
             }
+        }
+        let total: u32 = counts.values().sum();
+        git_log(&format!(
+            "git scan: author={author} repos={} commits_119d={total} sample={}",
+            repo_dirs.len(),
+            repo_dirs
+                .iter()
+                .take(5)
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
+        if total == 0 {
+            error = Some(format!(
+                "0 commit của {author} trong {} repo — kiểm tra email / thư mục trong Cài đặt",
+                repo_dirs.len()
+            ));
         }
     }
 
@@ -232,7 +253,21 @@ pub fn refresh_git(repos: &[PathBuf], configured_author: &str) -> GitSummary {
     let skip = if today_count > 0 { 0 } else { 1 };
     let streak = heatmap.iter().rev().skip(skip).take_while(|d| d.commits > 0).count() as u32;
 
+    if let Some(err) = &error {
+        git_log(&format!("git status: {err}"));
+    }
+
     GitSummary { today: today_count, week, streak, heatmap, error }
+}
+
+fn git_log(msg: &str) {
+    use std::io::Write;
+    let Ok(appdata) = std::env::var("APPDATA") else { return };
+    let dir = std::path::Path::new(&appdata).join("SmartDock");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log.txt")) {
+        let _ = writeln!(f, "{msg}");
+    }
 }
 
 fn ymd(d: NaiveDate) -> String {

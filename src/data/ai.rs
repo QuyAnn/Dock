@@ -399,10 +399,14 @@ fn cursor() -> AiUsage {
     let plan_usage = json.get("planUsage").unwrap_or(&Value::Null);
     let spend = plan_usage.get("totalSpend").and_then(Value::as_f64);
     let limit = plan_usage.get("limit").and_then(Value::as_f64);
-    let total_pct = plan_usage
-        .get("totalPercentUsed")
-        .and_then(Value::as_f64)
-        .or_else(|| Some(spend? / limit? * 100.0));
+    // Prefer $ spend / limit — `totalPercentUsed` from the API can disagree with the dollar
+    // amounts (e.g. $37.43/$20 shown as ~45%). Over-limit plans correctly exceed 100%.
+    let from_money = match (spend, limit) {
+        (Some(s), Some(l)) if l > 0.0 => Some(s / l * 100.0),
+        _ => None,
+    };
+    let from_api = plan_usage.get("totalPercentUsed").and_then(Value::as_f64);
+    let total_pct = from_money.or(from_api);
     let end_ms = json.get("billingCycleEnd").and_then(to_ms);
     let money = match (spend, limit) {
         (Some(spend), Some(limit)) => format!("${:.2}/${:.2}", spend / 100.0, limit / 100.0),

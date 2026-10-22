@@ -122,15 +122,36 @@ impl TileView {
     }
 }
 
-/// Places tiles in three zones. Center group is centered on the bar; left and right hug the edges.
+/// Places tiles in three zones. Center stays screen-centered; left/right expand toward it
+/// (extra space goes to flexible tiles like `media`) so the bar does not look sparse.
 /// Returns one rect per tile, in the order: left, center, right.
 pub fn layout(left: &[Tile], center: &[Tile], right: &[Tile], screen_w: f32) -> Vec<RectF> {
     let mut out = Vec::with_capacity(left.len() + center.len() + right.len());
     let zone_w = |tiles: &[Tile]| -> f32 {
         tiles.iter().map(|t| t.width).sum::<f32>() + ZONE_GAP * tiles.len().saturating_sub(1) as f32
     };
-    let place = |tiles: &[Tile], x: f32, max_w: f32, out: &mut Vec<RectF>| -> f32 {
+    // Extra width for tiles that should soak leftover side space toward the center cluster.
+    let flex_extra = |tiles: &[Tile], extra: f32, prefer: &str| -> Vec<f32> {
+        if extra <= 0.0 || tiles.is_empty() {
+            return tiles.iter().map(|t| t.width).collect();
+        }
+        let mut widths: Vec<f32> = tiles.iter().map(|t| t.width).collect();
+        if let Some(i) = tiles.iter().position(|t| t.id == prefer) {
+            widths[i] += extra;
+        } else if let Some(last) = widths.last_mut() {
+            *last += extra;
+        }
+        widths
+    };
+    let place = |tiles: &[Tile], widths: &[f32], x: f32, out: &mut Vec<RectF>| {
         let mut x = x;
+        for (t, &w) in tiles.iter().zip(widths) {
+            let h = if t.height > 0.0 { t.height } else { TILE_H };
+            out.push(RectF { x, y: (DOCK_H - h) / 2.0, w, h });
+            x += w + ZONE_GAP;
+        }
+    };
+    let fit_scale = |tiles: &[Tile], max_w: f32| -> Vec<f32> {
         let gaps = ZONE_GAP * tiles.len().saturating_sub(1) as f32;
         let widths = tiles.iter().map(|t| t.width).sum::<f32>();
         let scale = if widths + gaps > max_w {
@@ -138,25 +159,34 @@ pub fn layout(left: &[Tile], center: &[Tile], right: &[Tile], screen_w: f32) -> 
         } else {
             1.0
         };
-        for t in tiles {
-            let h = if t.height > 0.0 { t.height } else { TILE_H };
-            let w = t.width * scale;
-            out.push(RectF { x, y: (DOCK_H - h) / 2.0, w, h });
-            x += w + ZONE_GAP;
-        }
-        x
+        tiles.iter().map(|t| t.width * scale).collect()
     };
 
     let center_w = zone_w(center);
     let center_x = (screen_w - center_w) / 2.0;
     let side_w = (center_x - ROW_PAD - ROW_GAP).max(0.0);
-    place(left, ROW_PAD, side_w, &mut out);
-    place(center, center_x, center_w, &mut out);
 
-    let right_w = zone_w(right);
-    let fitted_right_w = right_w.min(side_w);
+    let left_natural = zone_w(left);
+    let left_widths = if left_natural > side_w {
+        fit_scale(left, side_w)
+    } else {
+        flex_extra(left, side_w - left_natural, "media")
+    };
+    place(left, &left_widths, ROW_PAD, &mut out);
+    place(center, &center.iter().map(|t| t.width).collect::<Vec<_>>(), center_x, &mut out);
+
+    let right_natural = zone_w(right);
+    let right_widths = if right_natural > side_w {
+        fit_scale(right, side_w)
+    } else {
+        // Right packs to the trailing edge (clock / rings stay put). Leftover side glass is
+        // intentional; growing CC would make a huge Wi-Fi tile. Media on the left soaks its side.
+        right.iter().map(|t| t.width).collect()
+    };
+    let fitted_right_w: f32 =
+        right_widths.iter().sum::<f32>() + ZONE_GAP * right.len().saturating_sub(1) as f32;
     let right_x = screen_w - ROW_PAD - fitted_right_w;
-    place(right, right_x, side_w, &mut out);
+    place(right, &right_widths, right_x, &mut out);
     out
 }
 
@@ -283,11 +313,10 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
 
 fn draw_ring(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
-    // Dock-Rc Ring: 28 px box, r=11.5, stroke 2.4, track rgba(255,255,255,.12), value centered.
+    // Dock-Rc Ring: 28 px box, r=11.5, stroke 2.4, track + accent; tiny label above the percent.
     let (cx, cy) = (rc.x + rc.w / 2.0, rc.y + rc.h / 2.0);
     let radius = 11.5;
     let width = 2.4;
-    // Full grey track first (split into semicircles inside stroke_arc), then the accent arc.
     r.stroke_arc(cx, cy, radius, 0.0, 360.0, RING_TRACK, width)?;
     if let Some(p) = t.progress {
         let accent = if t.accent != 0 { t.accent } else { 0x4AA8_FFFF };
@@ -296,10 +325,29 @@ fn draw_ring(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
             r.stroke_arc(cx, cy, radius, -90.0, sweep, accent, width)?;
         }
     }
-    // Number only (Dock-Rc ring-val), inset so glyphs never sit on the stroke.
     let inset = radius - width;
-    let text = RectF { x: cx - inset, y: cy - inset, w: inset * 2.0, h: inset * 2.0 };
-    r.draw_text_styled(&t.value, text, 9.0, TEXT, Align::Center, TextStyle::Bold)
+    let inner = RectF { x: cx - inset, y: cy - inset, w: inset * 2.0, h: inset * 2.0 };
+    if !t.title.is_empty() {
+        // Label above the number so "CPU"/"RAM" never collides with the percent.
+        r.draw_text(
+            &t.title,
+            RectF { x: inner.x, y: inner.y + 0.5, w: inner.w, h: 7.5 },
+            6.0,
+            MUTED,
+            Align::Center,
+        )?;
+        r.draw_text_styled(
+            &t.value,
+            RectF { x: inner.x, y: cy - 3.0, w: inner.w, h: inset },
+            8.5,
+            TEXT,
+            Align::Center,
+            TextStyle::Bold,
+        )?;
+    } else {
+        r.draw_text_styled(&t.value, inner, 9.0, TEXT, Align::Center, TextStyle::Bold)?;
+    }
+    Ok(())
 }
 
 fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
@@ -351,21 +399,50 @@ fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
         START.get_or_init(Instant::now).elapsed().as_secs_f32()
     };
     let peak = t.audio_peak.sqrt();
+    let has_peak = peak > 0.04;
+    let playing = t.progress.is_some();
     for i in 0..14 {
-        // Endpoint peak drives the envelope; staggered sine phases avoid a rigid equal-height block.
         let pulse = ((elapsed * 10.0 + i as f32 * 1.73).sin() * 0.5 + 0.5).powf(0.7);
         let shape = 0.45 + 0.55 * ((i as f32 - 6.5).abs() / 6.5 * std::f32::consts::PI).cos().abs();
-        let h = if t.progress.is_some() { 3.0 + peak * (5.0 + 18.0 * pulse * shape) } else { 4.0 };
+        // Peak drives the bars when audio is audible; otherwise a soft idle pulse while "playing".
+        let h = if playing && has_peak {
+            3.0 + peak * (5.0 + 18.0 * pulse * shape)
+        } else if playing {
+            3.0 + (0.2 + 0.35 * pulse * shape) * 10.0
+        } else {
+            4.0
+        };
         r.fill_rounded_rect(
             RectF { x: rc.x + 7.0 + i as f32 * 4.0, y: rc.y + (rc.h - h) / 2.0, w: 2.0, h },
             1.0,
-            if t.progress.is_some() { 0xC7A6_FFFF } else { 0xC7A6_FF8C },
+            if playing { 0xC7A6_FFFF } else { 0xC7A6_FF8C },
         )?;
     }
     let x = rc.x + 65.0;
     let w = (rc.x + rc.w - 7.0 - x).max(0.0);
-    r.draw_text_styled(&t.title, RectF { x, y: rc.y + 4.0, w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(&t.sub, RectF { x, y: rc.y + 18.0, w, h: 11.0 }, 8.5, MUTED, Align::Left)
+    // Marquee long titles/artists (Vietnamese diacritics preserved — we scroll the full string).
+    let title = marquee(&t.title, elapsed, w, 11.5);
+    let artist = marquee(&t.sub, elapsed * 0.85 + 1.7, w, 8.5);
+    r.draw_text_styled(&title, RectF { x, y: rc.y + 4.0, w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(&artist, RectF { x, y: rc.y + 18.0, w, h: 11.0 }, 8.5, MUTED, Align::Left)
+}
+
+/// Scrolls `text` when it is wider than `max_w` DIPs (approx. by glyph count × font size × 0.55).
+fn marquee(text: &str, elapsed: f32, max_w: f32, font_px: f32) -> String {
+    if text.is_empty() || max_w <= 0.0 {
+        return String::new();
+    }
+    let approx = text.chars().count() as f32 * font_px * 0.55;
+    if approx <= max_w + 4.0 {
+        return text.to_owned();
+    }
+    // Pad so the scroll loops cleanly.
+    let padded = format!("{text}   ·   ");
+    let chars: Vec<char> = padded.chars().collect();
+    let n = chars.len().max(1);
+    let start = ((elapsed * 4.0) as usize) % n;
+    let visible = ((max_w / (font_px * 0.55)).ceil() as usize + 2).min(n);
+    chars.iter().cycle().skip(start).take(visible).collect()
 }
 
 fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {

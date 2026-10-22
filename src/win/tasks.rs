@@ -1,5 +1,7 @@
 //! Window list, activation, shell hook messages and attention flags.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Mutex;
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM};
@@ -15,7 +17,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_LWIN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow,
+    BringWindowToTop, EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow,
     GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
     IsWindowVisible, RegisterShellHookWindow, RegisterWindowMessageW, SetForegroundWindow,
     ShowWindow, DeregisterShellHookWindow, GWL_EXSTYLE, GW_OWNER, SW_RESTORE, WS_EX_APPWINDOW,
@@ -32,30 +34,90 @@ const SKIP_CLASSES: [&str; 4] = [
     "Shell_SecondaryTrayWnd",
 ];
 
+/// ApplicationFrameHost hwnd → last resolved package exe (survives CoreWindow detach on minimize).
+static FRAME_MEMO: Mutex<HashMap<isize, String>> = Mutex::new(HashMap::new());
+
+struct EnumState {
+    out: Vec<WindowEntry>,
+    /// Title → pid of top-level `Windows.UI.Core.CoreWindow` (minimized UWP often lives here).
+    core_by_title: HashMap<String, u32>,
+}
+
 /// Top-level windows that the taskbar would show, excluding SmartDock's own windows.
 pub fn list_windows() -> Vec<WindowEntry> {
-    let mut out: Vec<WindowEntry> = Vec::new();
-    // SAFETY: the callback runs only during EnumWindows and receives a pointer to `out`, which outlives the call.
+    let mut state = EnumState {
+        out: Vec::new(),
+        core_by_title: HashMap::new(),
+    };
+    // SAFETY: the callback runs only during EnumWindows and receives a pointer to `state`.
     unsafe {
         let _ = EnumWindows(
             Some(enum_proc),
-            LPARAM(&mut out as *mut Vec<WindowEntry> as isize),
+            LPARAM(&mut state as *mut EnumState as isize),
         );
     }
-    out
+    // CoreWindows may be enumerated after their frame: resolve remaining frames by title.
+    for entry in &mut state.out {
+        if !is_frame_host(&entry.exe) {
+            continue;
+        }
+        if let Some(&pid) = state.core_by_title.get(&entry.title) {
+            let identity = process_identity(pid);
+            if !identity.0.is_empty() && !is_frame_host(&identity.0) {
+                entry.exe = identity.0.clone();
+                if !identity.1.is_empty() {
+                    entry.aumid = identity.1;
+                }
+                if !identity.2.is_empty() {
+                    entry.package_path = identity.2;
+                }
+                if let Ok(mut memo) = FRAME_MEMO.lock() {
+                    memo.insert(entry.hwnd, identity.0);
+                }
+            }
+        }
+    }
+    if let Ok(mut memo) = FRAME_MEMO.lock() {
+        memo.retain(|hwnd, _| state.out.iter().any(|w| w.hwnd == *hwnd));
+    }
+    state.out
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    // SAFETY: lparam is the `&mut Vec<WindowEntry>` passed by list_windows.
-    let out = &mut *(lparam.0 as *mut Vec<WindowEntry>);
-    if let Some(entry) = task_entry(hwnd) {
-        out.push(entry);
+    // SAFETY: lparam is the `&mut EnumState` passed by list_windows.
+    let state = &mut *(lparam.0 as *mut EnumState);
+    let mut cls = [0u16; 64];
+    let n = GetClassNameW(hwnd, &mut cls);
+    let cls = String::from_utf16_lossy(&cls[..n.max(0) as usize]);
+    if cls == "Windows.UI.Core.CoreWindow" {
+        let title = window_title(hwnd);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if !title.is_empty() && pid != 0 {
+            state.core_by_title.insert(title, pid);
+        }
+        return BOOL(1);
+    }
+    if let Some(entry) = task_entry(hwnd, &state.core_by_title) {
+        state.out.push(entry);
     }
     BOOL(1)
 }
 
+fn window_title(hwnd: HWND) -> String {
+    unsafe {
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+}
+
 /// Taskbar rules: visible, not owned (unless WS_EX_APPWINDOW), not a tool window, titled, not cloaked.
-unsafe fn task_entry(hwnd: HWND) -> Option<WindowEntry> {
+unsafe fn task_entry(hwnd: HWND, core_by_title: &HashMap<String, u32>) -> Option<WindowEntry> {
     if !IsWindowVisible(hwnd).as_bool() {
         return None;
     }
@@ -66,13 +128,10 @@ unsafe fn task_entry(hwnd: HWND) -> Option<WindowEntry> {
         return None;
     }
 
-    let len = GetWindowTextLengthW(hwnd);
-    if len <= 0 {
+    let title = window_title(hwnd);
+    if title.is_empty() {
         return None;
     }
-    let mut buf = vec![0u16; len as usize + 1];
-    let n = GetWindowTextW(hwnd, &mut buf);
-    let title = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
 
     let mut cloaked: u32 = 0;
     if DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), 4).is_ok()
@@ -93,7 +152,49 @@ unsafe fn task_entry(hwnd: HWND) -> Option<WindowEntry> {
     if pid == 0 || pid == GetCurrentProcessId() {
         return None;
     }
-    let (exe, aumid, package_path) = process_identity(pid);
+    let (mut exe, mut aumid, mut package_path) = process_identity(pid);
+    // UWP apps are often hosted by ApplicationFrameHost; resolve the real package exe via a
+    // child CoreWindow, same-titled top-level CoreWindow, or last successful memo.
+    if is_frame_host(&exe) {
+        let host = exe.clone();
+        if let Some((real_exe, real_aumid, real_pkg)) = resolve_frame_host(hwnd, pid) {
+            if !real_exe.is_empty() {
+                exe = real_exe;
+            }
+            if !real_aumid.is_empty() {
+                aumid = real_aumid;
+            }
+            if !real_pkg.is_empty() {
+                package_path = real_pkg;
+            }
+        }
+        if exe == host {
+            if let Some(&cpid) = core_by_title.get(&title) {
+                let identity = process_identity(cpid);
+                if !identity.0.is_empty() && !is_frame_host(&identity.0) {
+                    exe = identity.0;
+                    if !identity.1.is_empty() {
+                        aumid = identity.1;
+                    }
+                    if !identity.2.is_empty() {
+                        package_path = identity.2;
+                    }
+                }
+            }
+        }
+        if exe == host {
+            if let Ok(memo) = FRAME_MEMO.lock() {
+                if let Some(prev) = memo.get(&(hwnd.0 as isize)) {
+                    exe = prev.clone();
+                }
+            }
+        }
+        if exe != host {
+            if let Ok(mut memo) = FRAME_MEMO.lock() {
+                memo.insert(hwnd.0 as isize, exe.clone());
+            }
+        }
+    }
     Some(WindowEntry {
         hwnd: hwnd.0 as isize,
         title,
@@ -102,6 +203,46 @@ unsafe fn task_entry(hwnd: HWND) -> Option<WindowEntry> {
         package_path,
         attention: false,
     })
+}
+
+fn is_frame_host(exe: &str) -> bool {
+    Path::new(exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
+}
+
+/// Walk children of an ApplicationFrameHost frame for a different PID's image / package.
+unsafe fn resolve_frame_host(frame: HWND, host_pid: u32) -> Option<(String, String, String)> {
+    struct State {
+        host_pid: u32,
+        found: Option<(String, String, String)>,
+    }
+    unsafe extern "system" fn child_proc(child: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut State);
+        if state.found.is_some() {
+            return BOOL(0);
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(child, Some(&mut pid));
+        if pid == 0 || pid == state.host_pid {
+            return BOOL(1);
+        }
+        let identity = process_identity(pid);
+        if !identity.0.is_empty() && !is_frame_host(&identity.0) {
+            state.found = Some(identity);
+            return BOOL(0);
+        }
+        // Still useful when only AUMID/package is available on the child process.
+        if !identity.1.is_empty() || !identity.2.is_empty() {
+            state.found = Some(identity);
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    let mut state = State { host_pid, found: None };
+    let _ = EnumChildWindows(frame, Some(child_proc), LPARAM(&mut state as *mut _ as isize));
+    state.found
 }
 
 /// Full image path plus packaged app identity while the process handle is open.

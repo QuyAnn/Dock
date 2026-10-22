@@ -39,29 +39,117 @@ static CACHE: OnceLock<Mutex<HashMap<String, IconBitmap>>> = OnceLock::new();
 /// Shell icon of an exe as RGBA pixels. Successful results are cached (bounded to CACHE_LIMIT).
 pub fn icon_for_exe(exe_path: &str, aumid: &str, package_path: &str) -> Option<IconBitmap> {
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = if aumid.is_empty() { exe_path } else { aumid };
-    if let Some(hit) = cache.lock().ok()?.get(key).cloned() {
+    let frame_host = Path::new(exe_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("ApplicationFrameHost.exe"));
+    // Prefer AUMID as cache key. Never key ApplicationFrameHost by its shared host path.
+    let key = if !aumid.is_empty() {
+        aumid.to_owned()
+    } else if frame_host {
+        format!("hwnd-frame:{exe_path}:{package_path}")
+    } else {
+        exe_path.to_owned()
+    };
+    if let Some(hit) = cache.lock().ok()?.get(&key).cloned() {
         return Some(hit);
     }
-    // Packaged/UWP executables often expose only a generic shell icon. Prefer the manifest's
-    // Square44x44Logo, but keep a valid shell icon whenever package discovery/decoding fails.
-    let icon = appx_icon(exe_path, package_path).or_else(|| extract(exe_path))?;
+    // Packaged/UWP: prefer AppxManifest Square44x44Logo. Skip the host exe's generic icon.
+    let icon = appx_icon(exe_path, package_path, aumid)
+        .or_else(|| if frame_host { None } else { extract(exe_path) })
+        .or_else(|| {
+            // Settings hosted by ApplicationFrameHost often lacks a resolvable package path.
+            if looks_like_settings(aumid, exe_path) {
+                generic_settings_icon()
+            } else if frame_host || !aumid.is_empty() {
+                // Never hide a UWP window — letter-tile fallback is drawn by apps.rs when
+                // icon_for_exe returns None, but a simple package glyph keeps the slot filled.
+                generic_uwp_icon()
+            } else {
+                None
+            }
+        })?;
     let mut map = cache.lock().ok()?;
     if map.len() >= CACHE_LIMIT {
         map.clear();
     }
-    map.insert(key.to_owned(), icon.clone());
+    map.insert(key, icon.clone());
     Some(icon)
 }
 
-fn appx_icon(exe_path: &str, package_path: &str) -> Option<IconBitmap> {
+fn looks_like_settings(aumid: &str, exe_path: &str) -> bool {
+    let a = aumid.to_ascii_lowercase();
+    a.contains("windows.immersivecontrolpanel")
+        || a.contains("systemsettings")
+        || Path::new(exe_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case("SystemSettings.exe"))
+}
+
+/// Simple gear glyph as RGBA when package logo discovery fails for Settings.
+fn generic_settings_icon() -> Option<IconBitmap> {
+    let (w, h) = (32u32, 32u32);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    let cx = 15.5f32;
+    let cy = 15.5f32;
+    for y in 0..h {
+        for x in 0..w {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let r = (dx * dx + dy * dy).sqrt();
+            // Outer ring + hub — readable on dark dock glass.
+            let on = (r > 8.0 && r < 12.5) || r < 4.0 || (dx.abs() < 2.2 && r < 13.0) || (dy.abs() < 2.2 && r < 13.0);
+            let i = ((y * w + x) * 4) as usize;
+            if on {
+                rgba[i] = 0xE8;
+                rgba[i + 1] = 0xE8;
+                rgba[i + 2] = 0xEC;
+                rgba[i + 3] = 0xFF;
+            }
+        }
+    }
+    Some(IconBitmap { w, h, rgba })
+}
+
+/// Rounded square with a window glyph when a packaged app's logo cannot be resolved.
+fn generic_uwp_icon() -> Option<IconBitmap> {
+    let (w, h) = (32u32, 32u32);
+    let mut rgba = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let in_round = x >= 3 && x < 29 && y >= 3 && y < 29;
+            let edge = x == 3 || x == 28 || y == 3 || y == 28;
+            let bar = y >= 5 && y <= 9 && x >= 5 && x <= 26;
+            let pane = y >= 11 && y <= 26 && x >= 5 && x <= 26;
+            if in_round && (edge || bar || pane) {
+                let (r, g, b, a) = if edge || bar {
+                    (0xC8u8, 0xCAu8, 0xD0u8, 0xFFu8)
+                } else {
+                    (0x5A, 0x5E, 0x6A, 0xE0)
+                };
+                rgba[i] = r;
+                rgba[i + 1] = g;
+                rgba[i + 2] = b;
+                rgba[i + 3] = a;
+            }
+        }
+    }
+    Some(IconBitmap { w, h, rgba })
+}
+
+fn appx_icon(exe_path: &str, package_path: &str, aumid: &str) -> Option<IconBitmap> {
     let exe = Path::new(exe_path);
-    let packaged = exe_path.to_ascii_lowercase().contains("\\windowsapps\\")
+    let has_pkg = !package_path.is_empty() && Path::new(package_path).join("AppxManifest.xml").is_file();
+    let packaged = has_pkg
+        || !aumid.is_empty()
+        || exe_path.to_ascii_lowercase().contains("\\windowsapps\\")
         || exe.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("SystemSettings.exe"));
     if !packaged {
         return None;
     }
-    let manifest = if !package_path.is_empty() && Path::new(package_path).join("AppxManifest.xml").is_file() {
+    let manifest = if has_pkg {
         Path::new(package_path).join("AppxManifest.xml")
     } else {
         let mut dir = exe.parent()?;
@@ -74,7 +162,9 @@ fn appx_icon(exe_path: &str, package_path: &str) -> Option<IconBitmap> {
         }
     };
     let xml = std::fs::read_to_string(&manifest).ok()?;
-    let logo = xml_value(&xml, "Square44x44Logo")?;
+    let logo = xml_value(&xml, "Square44x44Logo")
+        .or_else(|| xml_value(&xml, "Square150x150Logo"))
+        .or_else(|| xml_value(&xml, "Logo"))?;
     let root = manifest.parent()?;
     let configured = root.join(logo.replace('/', "\\"));
     let selected = best_logo(&configured).or_else(|| configured.is_file().then_some(configured))?;

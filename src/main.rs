@@ -9,6 +9,7 @@ mod ui;
 mod win;
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -64,8 +65,8 @@ struct Shared {
     data: Mutex<DataState>,
     control: Mutex<ControlState>,
     settings: Mutex<settings::Settings>,
-    /// Liquid Glass backdrop for the dock bar, rendered off the UI thread when the wallpaper changes.
-    liquid: Mutex<Option<Arc<LiquidBitmap>>>,
+    /// Liquid Glass backdrop per monitor (`rcMonitor` key), rendered off the UI thread.
+    liquid: Mutex<HashMap<(i32, i32, i32, i32), Arc<LiquidBitmap>>>,
     /// Set by WM_DISPLAYCHANGE so monitor/virtual-screen geometry is sampled again.
     refresh_liquid: AtomicBool,
     refresh_slow: AtomicBool,
@@ -225,18 +226,12 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
                 local.refresh_slow(&repos, &current.git_author, &current.weather_location);
                 *shared.data.lock().unwrap() = local;
             }
-            // Liquid Glass backdrop: load and render on the first pass, then only when the wallpaper changes.
+            // Liquid Glass backdrop: one crop per monitor, refreshed when wallpaper/topology changes.
             if tick % 15 == 0
                 && (tick == 0
                     || shared.refresh_liquid.swap(false, Ordering::SeqCst)
                     || wallpaper::wallpaper_changed())
             {
-                let monitor = appbar::primary_monitor_rect().unwrap_or(RECT {
-                    left: 0,
-                    top: 0,
-                    right: unsafe { GetSystemMetrics(SM_CXSCREEN) },
-                    bottom: unsafe { GetSystemMetrics(SM_CYSCREEN) },
-                });
                 let virtual_screen = RECT {
                     left: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
                     top: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) },
@@ -244,43 +239,64 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
                     bottom: unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN) },
                 };
                 let virtual_size = (virtual_screen.right - virtual_screen.left, virtual_screen.bottom - virtual_screen.top);
+                let monitors = appbar::enum_monitor_rects();
                 match wallpaper::source_path() {
                     Some(path) => log(&format!("wallpaper candidate={}", path.display())),
                     None => log("wallpaper candidate not found"),
                 }
-                match wallpaper::load(virtual_size.0.max(monitor.right - monitor.left) as u32) {
+                let max_w = monitors
+                    .iter()
+                    .map(|m| m.right - m.left)
+                    .max()
+                    .unwrap_or(virtual_size.0)
+                    .max(virtual_size.0) as u32;
+                match wallpaper::load(max_w) {
                     Ok(wp) => {
-                        let (bar, screen) = if wp.mode == wallpaper::FitMode::Span {
-                            (
-                                RectF {
-                                    x: (monitor.left - virtual_screen.left) as f32,
-                                    y: (monitor.bottom - virtual_screen.top - dock_height_px) as f32,
-                                    w: (monitor.right - monitor.left) as f32,
-                                    h: dock_height_px as f32,
-                                },
-                                virtual_size,
-                            )
-                        } else {
-                            (
-                                RectF {
-                                    x: 0.0,
-                                    y: (monitor.bottom - monitor.top - dock_height_px) as f32,
-                                    w: (monitor.right - monitor.left) as f32,
-                                    h: dock_height_px as f32,
-                                },
-                                (monitor.right - monitor.left, monitor.bottom - monitor.top),
-                            )
-                        };
-                        log(&format!(
-                            "wallpaper source={} mode={:?} decoded={}x{} original={}x{} monitor=({},{}..{},{}) virtual=({},{}..{},{}) bar=({:.0},{:.0},{:.0},{:.0})",
-                            wp.source.display(), wp.mode, wp.w, wp.h, wp.orig_w, wp.orig_h,
-                            monitor.left, monitor.top, monitor.right, monitor.bottom,
-                            virtual_screen.left, virtual_screen.top, virtual_screen.right, virtual_screen.bottom,
-                            bar.x, bar.y, bar.w, bar.h,
-                        ));
-                        let bitmap = liquid::render_liquid(&wp, bar, screen);
-                        *shared.liquid.lock().unwrap() = Some(Arc::new(bitmap));
-                        log("liquid backdrop rendered");
+                        let mut map = HashMap::new();
+                        for monitor in &monitors {
+                            let (bar, screen) = if wp.mode == wallpaper::FitMode::Span {
+                                (
+                                    RectF {
+                                        x: (monitor.left - virtual_screen.left) as f32,
+                                        y: (monitor.bottom - virtual_screen.top - dock_height_px) as f32,
+                                        w: (monitor.right - monitor.left) as f32,
+                                        h: dock_height_px as f32,
+                                    },
+                                    virtual_size,
+                                )
+                            } else {
+                                (
+                                    RectF {
+                                        x: 0.0,
+                                        y: (monitor.bottom - monitor.top - dock_height_px) as f32,
+                                        w: (monitor.right - monitor.left) as f32,
+                                        h: dock_height_px as f32,
+                                    },
+                                    (monitor.right - monitor.left, monitor.bottom - monitor.top),
+                                )
+                            };
+                            log(&format!(
+                                "wallpaper source={} mode={:?} monitor=({},{}..{},{}) bar=({:.0},{:.0},{:.0},{:.0})",
+                                wp.source.display(),
+                                wp.mode,
+                                monitor.left,
+                                monitor.top,
+                                monitor.right,
+                                monitor.bottom,
+                                bar.x,
+                                bar.y,
+                                bar.w,
+                                bar.h,
+                            ));
+                            let bitmap = liquid::render_liquid(&wp, bar, screen);
+                            map.insert(
+                                (monitor.left, monitor.top, monitor.right, monitor.bottom),
+                                Arc::new(bitmap),
+                            );
+                        }
+                        let n = map.len();
+                        *shared.liquid.lock().unwrap() = map;
+                        log(&format!("liquid backdrop rendered for {n} monitor(s)"));
                     }
                     Err(e) => log(&format!("wallpaper load failed: {e}")),
                 }
@@ -292,19 +308,29 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
 }
 
 fn start_audio_meter(shared: Arc<Shared>) {
-    thread::spawn(move || loop {
-        let playing = shared
-            .data
-            .lock()
-            .ok()
-            .and_then(|data| data.media.as_ref().map(|media| media.playing))
-            .unwrap_or(false);
-        if playing {
-            shared.audio_peak.store(system::audio_peak().to_bits(), Ordering::Relaxed);
-            thread::sleep(Duration::from_millis(33));
-        } else {
-            shared.audio_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
-            thread::sleep(Duration::from_millis(250));
+    thread::spawn(move || {
+        let mut ticks: u64 = 0;
+        loop {
+            let playing = shared
+                .data
+                .lock()
+                .ok()
+                .and_then(|data| data.media.as_ref().map(|media| media.playing))
+                .unwrap_or(false);
+            if playing {
+                let peak = system::audio_peak();
+                shared.audio_peak.store(peak.to_bits(), Ordering::Relaxed);
+                // Debug: one peak sample per second so field logs prove the meter moves with music.
+                if ticks % 30 == 0 {
+                    log(&format!("audio_peak={peak:.3} (eMultimedia/eConsole meter)"));
+                }
+                ticks = ticks.wrapping_add(1);
+                thread::sleep(Duration::from_millis(33));
+            } else {
+                shared.audio_peak.store(0.0f32.to_bits(), Ordering::Relaxed);
+                ticks = 0;
+                thread::sleep(Duration::from_millis(250));
+            }
         }
     });
 }
@@ -569,7 +595,7 @@ fn run() -> windows::core::Result<()> {
         data: Mutex::new(DataState::default()),
         control: Mutex::new(ControlState::read()),
         settings: Mutex::new(initial_settings.clone()),
-        liquid: Mutex::new(None),
+        liquid: Mutex::new(HashMap::new()),
         refresh_liquid: AtomicBool::new(false),
         refresh_slow: AtomicBool::new(false),
         audio_peak: AtomicU32::new(0.0f32.to_bits()),
@@ -667,12 +693,13 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     if enabled.codex { left.push(t("codex", 100.0)); }
     if enabled.cursor { left.push(t("cursor", 155.0)); }
     if enabled.grok { left.push(t("grok", 100.0)); }
-    if enabled.music { left.push(t("media", 165.0)); }
+    // Base width; layout() expands `media` into leftover side space toward the center cluster.
+    if enabled.music { left.push(t("media", 200.0)); }
     if enabled.weather && settings.weather_position == "tile" { left.push(t("weather", 100.0)); }
     let mut right = vec![t("cc", 56.0), t("gear", 22.0)];
-    // Dock-Rc .ring-tile width 34 around a 28px SVG ring.
-    if enabled.cpu { right.push(t("cpu", 34.0)); }
-    if enabled.ram { right.push(t("ram", 34.0)); }
+    // Wide enough for a tiny CPU/RAM label above the percent inside the ring.
+    if enabled.cpu { right.push(t("cpu", 42.0)); }
+    if enabled.ram { right.push(t("ram", 42.0)); }
     right.push(t("clock", 64.0));
     Zones {
         left,
@@ -683,10 +710,13 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
 
 /// Bar color for AI usage, from `barColor` in AiTiles.tsx.
 fn usage_color(pct: f32) -> u32 {
-    if pct >= 90.0 {
+    // Over limit → red; ≥90% → orange; high → amber; otherwise green.
+    if pct > 100.0 {
         0xFF5D_5DFF
-    } else if pct >= 70.0 {
+    } else if pct >= 90.0 {
         0xFFB3_40FF
+    } else if pct >= 70.0 {
+        0xE8A0_20FF
     } else {
         0x3FD2_7FFF
     }
@@ -716,6 +746,7 @@ fn ai_view(data: &DataState, name: &str) -> TileView {
         Some(a) if name == "Cursor" && !a.session_pct.is_nan() => (
             a.reset_text.clone(),
             String::new(),
+            // Bar fill is capped at 100%; colour still reflects over-limit spend.
             Some((a.session_pct / 100.0).clamp(0.0, 1.0)),
             usage_color(a.session_pct),
         ),
@@ -795,12 +826,12 @@ fn tile_view(
         },
         "start" => TileView { style: Style::Start, ..TileView::card("", "") },
         "gear" => TileView::bare("\u{E713}"),
-        // Dock-Rc Ring shows the bare percent inside the circle (not "CPU 6" / "RAM 65").
+        // Ring: short label above the percent (no "CPU 65" single-line overlap).
         "cpu" => TileView {
             style: Style::Ring,
             progress: Some(stats.cpu_pct / 100.0),
             accent: gauge_color(stats.cpu_pct),
-            ..TileView::card(format!("CPU {:.0}%", stats.cpu_pct), format!("{:.0}", stats.cpu_pct))
+            ..TileView::card("CPU", format!("{:.0}", stats.cpu_pct))
         },
         "ram" => {
             let pct = if stats.ram_total_mb > 0 { stats.ram_used_mb as f32 * 100.0 / stats.ram_total_mb as f32 } else { 0.0 };
@@ -809,7 +840,7 @@ fn tile_view(
                 progress: Some(pct / 100.0),
                 // RAM is blue until it is nearly full (AppSystem tiles use #4aa8ff).
                 accent: if pct > 85.0 { 0xFF5D_5DFF } else { 0x4AA8_FFFF },
-                ..TileView::card(format!("RAM {pct:.0}%"), format!("{pct:.0}"))
+                ..TileView::card("RAM", format!("{pct:.0}"))
             }
         }
         "clock" => {
@@ -868,6 +899,30 @@ fn paint_surface(
     }
 }
 
+fn liquid_for(map: &HashMap<(i32, i32, i32, i32), Arc<LiquidBitmap>>, mon: RECT) -> Option<Arc<LiquidBitmap>> {
+    let key = (mon.left, mon.top, mon.right, mon.bottom);
+    if let Some(hit) = map.get(&key) {
+        return Some(hit.clone());
+    }
+    // Topology can race with WM_DISPLAYCHANGE — pick the crop whose rect overlaps this monitor most.
+    map.iter()
+        .max_by_key(|((l, t, r, b), _)| {
+            let x0 = (*l).max(mon.left);
+            let y0 = (*t).max(mon.top);
+            let x1 = (*r).min(mon.right);
+            let y1 = (*b).min(mon.bottom);
+            ((x1 - x0).max(0) as i64) * ((y1 - y0).max(0) as i64)
+        })
+        .filter(|((l, t, r, b), _)| {
+            let x0 = (*l).max(mon.left);
+            let y0 = (*t).max(mon.top);
+            let x1 = (*r).min(mon.right);
+            let y1 = (*b).min(mon.bottom);
+            x1 > x0 && y1 > y0
+        })
+        .map(|(_, bmp)| bmp.clone())
+}
+
 fn repaint() {
     APP.with(|a| {
         let mut slot = a.borrow_mut();
@@ -877,8 +932,15 @@ fn repaint() {
         let data = app.shared.data.lock().unwrap().clone();
         let control = app.shared.control.lock().unwrap().clone();
         let audio_peak = f32::from_bits(app.shared.audio_peak.load(Ordering::Relaxed));
-        let backdrop = app.shared.liquid.lock().unwrap().clone();
+        let liquids = app.shared.liquid.lock().unwrap().clone();
         let settings = app.shared.settings.lock().unwrap().clone();
+        let primary_mon = appbar::primary_monitor_rect().unwrap_or(RECT {
+            left: app.origin.0 as i32,
+            top: app.origin.1 as i32,
+            right: app.origin.0 as i32 + dpi::dip_to_px(app.width, app.dpi),
+            bottom: app.origin.1 as i32 + dpi::dip_to_px(DOCK_HEIGHT, app.dpi),
+        });
+        let primary_bg = liquid_for(&liquids, primary_mon);
 
         paint_surface(
             &mut app.renderer,
@@ -891,11 +953,10 @@ fn repaint() {
             &control,
             audio_peak,
             &settings,
-            backdrop.as_deref(),
+            primary_bg.as_deref(),
         );
-        // Secondary monitors do not share the primary liquid bitmap crop; tint + DWM acrylic
-        // still give a frosted look until per-monitor liquid is rendered.
         for sec in &mut app.secondaries {
+            let bg = liquid_for(&liquids, sec.monitor);
             paint_surface(
                 &mut sec.renderer,
                 sec.width,
@@ -907,7 +968,7 @@ fn repaint() {
                 &control,
                 audio_peak,
                 &settings,
-                None,
+                bg.as_deref(),
             );
         }
     });
