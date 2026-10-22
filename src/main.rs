@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use chrono::{Datelike, Local};
 use windows::core::w;
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -169,7 +169,14 @@ fn start_background_refresh(shared: Arc<Shared>) {
 
 fn run() -> windows::core::Result<()> {
     log("start");
-    let hinst: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
+    let hinst: HINSTANCE = match unsafe { GetModuleHandleW(None) } {
+        Ok(h) => h.into(),
+        Err(e) => {
+            log(&format!("GetModuleHandleW failed: {e}"));
+            return Err(e);
+        }
+    };
+    log("module handle ok");
     let class = w!("SmartDockDock");
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -180,7 +187,8 @@ fn run() -> windows::core::Result<()> {
     };
     unsafe {
         // SAFETY: wc and the class name are valid for the call.
-        RegisterClassExW(&wc);
+        let atom = RegisterClassExW(&wc);
+        log(&format!("RegisterClassExW atom={atom} last_error={:?}", GetLastError()));
     }
 
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
@@ -200,7 +208,14 @@ fn run() -> windows::core::Result<()> {
             None,
             hinst,
             None,
-        )?
+        )
+    };
+    let hwnd = match hwnd {
+        Ok(h) => h,
+        Err(e) => {
+            log(&format!("CreateWindowExW failed: {e} last_error={:?}", unsafe { GetLastError() }));
+            return Err(e);
+        }
     };
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
