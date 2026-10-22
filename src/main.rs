@@ -46,7 +46,7 @@ use win::appbar::{self, AbEdge};
 use win::dpi;
 use win::system::{self, MediaAction};
 use win::tasks::{self, Attention, ShellEvent};
-use win::wallpaper;
+use win::{monitors, wallpaper};
 
 const DOCK_HEIGHT: f32 = 46.0;
 const POPUP_W: f32 = 320.0;
@@ -369,23 +369,39 @@ fn create_dock_window_at(
 }
 
 /// Builds a dock HWND + AppBar + renderer for every non-primary monitor.
+///
+/// `primary_hwnd` is used with `MonitorFromWindow` so we skip the primary by full
+/// `rcMonitor` / HMONITOR — never by the dock AppBar strip (that was the 66ecd48 bug).
+/// Windows are created hidden; the caller must paint then `ShowWindow`.
 fn build_secondary_docks(
     hinst: HINSTANCE,
     class: PCWSTR,
-    primary: RECT,
+    primary_hwnd: HWND,
     dock_height_dip: f32,
 ) -> Vec<SecondaryDock> {
+    let primary = monitors::bounds_for_window(primary_hwnd)
+        .or_else(|_| monitors::primary_bounds())
+        .unwrap_or(monitors::MonitorBounds { left: 0, top: 0, right: 0, bottom: 0 });
+    if primary.width() <= 0 || primary.height() <= 0 {
+        log("secondary docks: primary monitor bounds unavailable, skipping");
+        appbar::set_secondary_docks_active(false);
+        return Vec::new();
+    }
+    let targets = monitors::secondary_monitor_bounds(&monitors::enum_bounds(), primary);
+    log(&format!(
+        "monitors: primary=({},{}..{},{}) secondary_targets={}",
+        primary.left, primary.top, primary.right, primary.bottom, targets.len()
+    ));
+
     let mut out = Vec::new();
-    for mon in appbar::enum_monitor_rects() {
-        if mon.left == primary.left && mon.top == primary.top && mon.right == primary.right && mon.bottom == primary.bottom {
-            continue;
-        }
-        let mon_w = mon.right - mon.left;
-        let mon_h = mon.bottom - mon.top;
+    for mon_bounds in targets {
+        let mon = mon_bounds.to_rect();
+        let mon_w = mon_bounds.width();
+        let mon_h = mon_bounds.height();
         if mon_w <= 0 || mon_h <= 0 {
             continue;
         }
-        // Approximate DPI from width vs primary; refined after CreateWindow via window_dpi.
+        // Approximate DPI; refined after CreateWindow via window_dpi.
         let approx_dpi = 96u32;
         let dock_h = dpi::dip_to_px(dock_height_dip, approx_dpi);
         let corner = dpi::dip_to_px(16.0, approx_dpi);
@@ -398,7 +414,10 @@ fn build_secondary_docks(
             dock_h + corner,
             "SmartDockSecondary",
         ) else {
-            log(&format!("secondary dock create failed for monitor {:?}", (mon.left, mon.top, mon.right, mon.bottom)));
+            log(&format!(
+                "secondary dock create failed for monitor ({},{}..{},{})",
+                mon.left, mon.top, mon.right, mon.bottom
+            ));
             continue;
         };
         let dpi_value = dpi::window_dpi(hwnd);
@@ -413,6 +432,8 @@ fn build_secondary_docks(
         };
         let pixel_w = rect.right - rect.left;
         let window_h = dock_h + corner;
+        // Position but keep hidden — showing before APP owns the dock lets WM_PAINT
+        // validate an empty frame (EndPaint) that never gets tiles.
         unsafe {
             let _ = SetWindowPos(
                 hwnd,
@@ -421,14 +442,13 @@ fn build_secondary_docks(
                 rect.top,
                 pixel_w,
                 window_h,
-                SWP_NOACTIVATE,
+                SWP_NOACTIVATE | SWP_HIDEWINDOW,
             );
-            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         apply_dwm_rounding(hwnd);
         let renderer = Renderer::new(hwnd, pixel_w, window_h, dpi_value);
         log(&format!(
-            "secondary dock on monitor ({},{}..{},{}) hwnd={:?}",
+            "secondary dock on monitor ({},{}..{},{}) hwnd={:?} (hidden until painted)",
             mon.left, mon.top, mon.right, mon.bottom, hwnd
         ));
         out.push(SecondaryDock {
@@ -442,8 +462,18 @@ fn build_secondary_docks(
             hover: None,
         });
     }
-    appbar::set_secondary_docks_active(!out.is_empty());
+    // Secondary trays stay visible; docks are additive.
+    appbar::set_secondary_docks_active(false);
     out
+}
+
+fn show_secondary_docks(docks: &[SecondaryDock]) {
+    for dock in docks {
+        unsafe {
+            let _ = ShowWindow(dock.hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+    appbar::ensure_secondary_trays_visible();
 }
 
 /// Unregisters AppBars and returns HWNDs to destroy. DestroyWindow must run **outside**
@@ -552,7 +582,9 @@ fn run() -> windows::core::Result<()> {
     apps.refresh(&attention);
 
     let renderer = Renderer::new(hwnd, pixel_width, dock_window_height_px, dpi_value);
-    let secondaries = build_secondary_docks(hinst, class, rect, DOCK_HEIGHT);
+    // Pass the primary HWND so selection uses MonitorFromWindow → full rcMonitor
+    // (never the AppBar strip rect, which caused a blank dock on the primary in 66ecd48).
+    let secondaries = build_secondary_docks(hinst, class, hwnd, DOCK_HEIGHT);
     for sec in &secondaries {
         glass::apply_dock_glass(sec.hwnd, initial_settings.glass_opacity);
     }
@@ -576,6 +608,25 @@ fn run() -> windows::core::Result<()> {
             secondaries,
         })
     });
+    // Paint tiles into secondary render targets while still hidden, then show.
+    repaint();
+    APP.with(|a| {
+        if let Some(app) = a.borrow().as_ref() {
+            for sec in &app.secondaries {
+                log(&format!(
+                    "secondary dock tiles={} width={:.0} monitor=({},{}..{},{})",
+                    sec.tiles.len(),
+                    sec.width,
+                    sec.monitor.left,
+                    sec.monitor.top,
+                    sec.monitor.right,
+                    sec.monitor.bottom
+                ));
+            }
+            show_secondary_docks(&app.secondaries);
+        }
+    });
+    appbar::ensure_secondary_trays_visible();
 
     unsafe {
         // SAFETY: hwnd is live; timers drive refresh and the taskbar guard.
@@ -1326,15 +1377,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         };
                         let class = w!("SmartDockDock");
                         let opacity = app.shared.settings.lock().unwrap().glass_opacity;
-                        let primary = RECT {
-                            left: app.origin.0 as i32,
-                            top: app.origin.1 as i32,
-                            right: app.origin.0 as i32 + dpi::dip_to_px(app.width, app.dpi),
-                            bottom: app.origin.1 as i32 + dpi::dip_to_px(DOCK_HEIGHT, app.dpi),
-                        };
-                        // Prefer live monitor rect for matching; fall back to dock strip.
-                        let primary_mon = appbar::primary_monitor_rect().unwrap_or(primary);
-                        app.secondaries = build_secondary_docks(hinst, class, primary_mon, DOCK_HEIGHT);
+                        app.secondaries = build_secondary_docks(hinst, class, app.hwnd, DOCK_HEIGHT);
                         for sec in &app.secondaries {
                             glass::apply_dock_glass(sec.hwnd, opacity);
                         }
@@ -1342,6 +1385,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 });
                 appbar::enforce_taskbar_hidden();
                 repaint();
+                APP.with(|a| {
+                    if let Some(app) = a.borrow().as_ref() {
+                        show_secondary_docks(&app.secondaries);
+                    }
+                });
+                appbar::ensure_secondary_trays_visible();
             }
             LRESULT(0)
         }

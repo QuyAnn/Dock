@@ -5,11 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::{w, Error, Result};
-use windows::Win32::Foundation::{CloseHandle, BOOL, E_FAIL, HWND, LPARAM, POINT, RECT};
-use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
-    MONITOR_DEFAULTTOPRIMARY,
-};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, HWND, LPARAM, RECT};
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
@@ -39,8 +35,6 @@ static APPLIED: AtomicBool = AtomicBool::new(false);
 static HIDE_WINDOW: AtomicBool = AtomicBool::new(true);
 /// Taskbar AppBar state (ABS_*) from before we changed it.
 static ORIGINAL_STATE: AtomicU32 = AtomicU32::new(ABS_ALWAYSONTOP);
-/// True when this process owns a dock AppBar on every monitor (secondary trays may then be hidden).
-static SECONDARY_DOCKS: AtomicBool = AtomicBool::new(false);
 
 fn abd(hwnd: HWND, edge: u32, rc: RECT) -> APPBARDATA {
     APPBARDATA {
@@ -54,63 +48,12 @@ fn abd(hwnd: HWND, edge: u32, rc: RECT) -> APPBARDATA {
 }
 
 pub fn primary_monitor_rect() -> Result<RECT> {
-    let mut mi = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: mi is correctly sized and lives across the call; (0,0) is on the primary monitor.
-    unsafe {
-        let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
-        // Some machines report failure with no error code; fall back to the screen size instead of aborting.
-        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
-            let (w, h) = (
-                windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN),
-                windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN),
-            );
-            return Ok(RECT { left: 0, top: 0, right: w, bottom: h });
-        }
-    }
-    Ok(mi.rcMonitor)
+    Ok(crate::win::monitors::primary_bounds()?.to_rect())
 }
 
 /// Every attached monitor's `rcMonitor`, primary first.
 pub fn enum_monitor_rects() -> Vec<RECT> {
-    unsafe extern "system" fn callback(
-        mon: HMONITOR,
-        _hdc: HDC,
-        _rc: *mut RECT,
-        data: LPARAM,
-    ) -> BOOL {
-        let out = &mut *(data.0 as *mut Vec<RECT>);
-        let mut mi = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if GetMonitorInfoW(mon, &mut mi).as_bool() {
-            out.push(mi.rcMonitor);
-        }
-        BOOL(1)
-    }
-    let mut out: Vec<RECT> = Vec::new();
-    // SAFETY: callback only writes through the Vec pointer while EnumDisplayMonitors runs.
-    unsafe {
-        let _ = EnumDisplayMonitors(HDC::default(), None, Some(callback), LPARAM(&mut out as *mut _ as isize));
-    }
-    if out.is_empty() {
-        if let Ok(primary) = primary_monitor_rect() {
-            out.push(primary);
-        }
-    } else {
-        // Primary (contains 0,0 or matches primary_monitor_rect) first for stable ordering.
-        let primary = primary_monitor_rect().ok();
-        out.sort_by_key(|rc| {
-            let is_primary = primary
-                .map(|p| p.left == rc.left && p.top == rc.top && p.right == rc.right && p.bottom == rc.bottom)
-                .unwrap_or(rc.left == 0 && rc.top == 0);
-            !is_primary
-        });
-    }
-    out
+    crate::win::monitors::enum_bounds().into_iter().map(|b| b.to_rect()).collect()
 }
 
 fn edge_rect(mon: RECT, edge: AbEdge, height_px: i32) -> (u32, RECT) {
@@ -205,11 +148,9 @@ fn secondary_trays() -> Vec<HWND> {
 }
 
 /// Explorer often re-hides secondary trays when the primary Shell_TrayWnd is hidden.
-/// Keep them visible unless we are covering those monitors with our own docks.
+/// Always force them visible — secondary SmartDock windows are additive and must never
+/// leave a monitor without a usable taskbar (66ecd48 regression).
 pub fn ensure_secondary_trays_visible() {
-    if SECONDARY_DOCKS.load(Ordering::SeqCst) {
-        return;
-    }
     for h in secondary_trays() {
         unsafe {
             let _ = ShowWindow(h, SW_SHOW);
@@ -217,15 +158,9 @@ pub fn ensure_secondary_trays_visible() {
     }
 }
 
-/// When true, secondary taskbars are hidden because each monitor has a SmartDock AppBar.
-pub fn set_secondary_docks_active(active: bool) {
-    SECONDARY_DOCKS.store(active, Ordering::SeqCst);
-    let cmd = if active { SW_HIDE } else { SW_SHOW };
-    for h in secondary_trays() {
-        unsafe {
-            let _ = ShowWindow(h, cmd);
-        }
-    }
+/// Kept for call-site compatibility. Secondary trays are **never** hidden by this process.
+pub fn set_secondary_docks_active(_active: bool) {
+    ensure_secondary_trays_visible();
 }
 
 /// Win11 ignores ABM_GETSTATE/ABM_SETSTATE unless hWnd is the taskbar itself.
@@ -324,23 +259,13 @@ pub fn ensure_restored_on_exit() {
     restore_taskbar();
 }
 
-/// Re-hides the primary tray if Explorer re-showed it, keeps secondary trays in sync with
-/// whether we own per-monitor docks, and recovers from Explorer re-showing trays.
+/// Re-hides the primary tray if Explorer re-showed it, and always keeps secondary trays visible.
 /// Call about every 500 ms.
 pub fn enforce_taskbar_hidden() {
     if APPLIED.load(Ordering::SeqCst) && HIDE_WINDOW.load(Ordering::SeqCst) {
         show_primary_tray(false);
     } else {
         ensure_secondary_trays_visible();
-    }
-    // Re-assert secondary dock policy even when the primary hide path already ran
-    // (show_primary_tray re-shows secondaries; dock mode must hide them again).
-    if SECONDARY_DOCKS.load(Ordering::SeqCst) {
-        for h in secondary_trays() {
-            unsafe {
-                let _ = ShowWindow(h, SW_HIDE);
-            }
-        }
     }
 }
 

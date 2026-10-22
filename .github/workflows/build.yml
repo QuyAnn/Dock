@@ -34,8 +34,8 @@ jobs:
           }
           Write-Host "TLS wiring OK: native-tls feature + tls_connector in http.rs"
 
-      - name: TLS smoke test
-        run: cargo test --locked native_tls_backend_is_configured -- --nocapture
+      - name: Unit tests (TLS + monitor selection)
+        run: cargo test --locked native_tls_backend_is_configured secondary_selection dock_appbar_strip -- --nocapture
 
       - name: Verify static CRT dependencies
         shell: pwsh
