@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::dock::RectF;
-use super::renderer::{apply_acrylic, apply_dwm_rounding, Align, Renderer};
+use super::renderer::{apply_acrylic, apply_popup_corners, Align, Renderer, POPUP_CORNER_RADIUS};
 use crate::win::dpi;
 use crate::win::tasks::focus_window;
 
@@ -211,7 +211,7 @@ fn host_hwnd() -> Option<HWND> {
         )
     }
     .ok()?;
-    apply_dwm_rounding(hwnd);
+    apply_popup_corners(hwnd);
     apply_acrylic(hwnd, super::glass::PANEL_ACRYLIC_TINT);
     HOST.with(|h| {
         *h.borrow_mut() = Some(Host {
@@ -452,7 +452,7 @@ fn paint(hwnd: HWND, _hdc: HDC) {
         let r = &mut host.renderer;
         let panel = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: hgt - 1.0 };
         let _ = r.begin().and_then(|_| {
-            super::glass::draw_panel(r, panel, 12.0)?;
+            super::glass::draw_panel(r, panel, POPUP_CORNER_RADIUS)?;
             for (title, rc) in &titles {
                 // DirectWrite: full Unicode (Vietnamese) titles, ellipsized to the thumbnail width.
                 r.draw_text(title, *rc, 11.0, 0xF4F4_F7FF, Align::Left)?;

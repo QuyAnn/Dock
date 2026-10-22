@@ -36,7 +36,8 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute, DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_ROUND,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
@@ -624,6 +625,27 @@ pub fn apply_dwm_rounding(hwnd: HWND) -> bool {
         )
         .is_ok()
     }
+}
+
+/// Corner radius (DIPs) of a DWMWCP_ROUND window on Windows 11. Popup panels draw their D2D
+/// shape with exactly this radius so the DWM clip and the drawn rims coincide.
+pub const POPUP_CORNER_RADIUS: f32 = 8.0;
+
+/// Rounded DWM corners for floating panels, with the 1 px DWM border turned off
+/// (DWMWA_COLOR_NONE) so no dark/square outline shows outside the curve.
+pub fn apply_popup_corners(hwnd: HWND) -> bool {
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    let rounded = apply_dwm_rounding(hwnd);
+    // SAFETY: documented attribute with a u32 COLORREF payload.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&DWMWA_COLOR_NONE as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+    rounded
 }
 
 /// Applies the undocumented acrylic accent (same as the old Electron build).

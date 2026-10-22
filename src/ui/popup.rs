@@ -23,12 +23,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::dock::RectF;
-use super::renderer::{apply_acrylic, apply_dwm_rounding, Renderer};
+use super::renderer::{apply_acrylic, apply_popup_corners, Renderer, POPUP_CORNER_RADIUS};
 use crate::win::dpi;
 
 const GAP: f32 = 8.0;
 const MARGIN: f32 = 6.0;
-const RADIUS: f32 = 14.0;
+/// Must equal the DWM corner so the drawn panel and the window clip match exactly.
+const RADIUS: f32 = POPUP_CORNER_RADIUS;
 const TIMER_ID: usize = 1;
 const POLL_MS: u32 = 100;
 
@@ -100,7 +101,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
                 SWP_NOACTIVATE,
             );
         }
-        apply_dwm_rounding(pw.hwnd);
+        apply_popup_corners(pw.hwnd);
         apply_acrylic(pw.hwnd, super::glass::PANEL_ACRYLIC_TINT);
         unsafe {
             let _ = ShowWindow(pw.hwnd, SW_SHOWNOACTIVATE);
@@ -137,7 +138,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         mouse_down: true,
         esc_down: true,
     };
-    apply_dwm_rounding(hwnd);
+    apply_popup_corners(hwnd);
     apply_acrylic(hwnd, super::glass::PANEL_ACRYLIC_TINT);
     POPUP.with(|p| *p.borrow_mut() = Some(pw));
 
