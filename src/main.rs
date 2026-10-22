@@ -34,7 +34,7 @@ use ui::glass;
 use ui::liquid::{self, LiquidBitmap};
 use ui::popup;
 use ui::popup_content::{self, MediaAction as PopupMedia, PopupKind};
-use ui::renderer::{apply_rounded_region, Renderer};
+use ui::renderer::{apply_dwm_rounding, Renderer};
 use ui::svgpath;
 use ui::tiles::{self, DataState};
 use win::appbar::{self, AbEdge};
@@ -105,7 +105,57 @@ thread_local! {
 }
 
 fn default_repos() -> Vec<PathBuf> {
-    vec![PathBuf::from(r"D:\PAYMENT6"), PathBuf::from(r"D:\SmartDock")]
+    if let Ok(value) = std::env::var("SMARTDOCK_REPOS") {
+        let configured: Vec<PathBuf> = value
+            .split(';')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect();
+        if !configured.is_empty() {
+            return configured;
+        }
+    }
+    if let Some(path) = std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|p| p.join("SmartDock").join("settings.json"))
+    {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(items) = json.get("gitFolders").and_then(|v| v.as_array()) {
+                    let configured: Vec<PathBuf> = items
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(PathBuf::from)
+                        .filter(|p| p.exists())
+                        .collect();
+                    if !configured.is_empty() {
+                        return configured;
+                    }
+                }
+            }
+        }
+    }
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        for relative in [
+            "source\\repos",
+            "Documents\\GitHub",
+            "Documents\\Projects",
+            "Projects",
+            "dev",
+            "src",
+        ] {
+            let path = home.join(relative);
+            if path.exists() {
+                candidates.push(path);
+            }
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd);
+    }
+    candidates
 }
 
 fn main() {
@@ -269,6 +319,14 @@ fn run() -> windows::core::Result<()> {
     let hwnd = create_dock_window(hinst, class, screen_w, screen_h, initial_height)?;
     let dpi_value = dpi::window_dpi(hwnd);
     let dock_height_px = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
+    let corner_px = dpi::dip_to_px(16.0, dpi_value);
+    // Extend the HWND below rcMonitor so DWM's lower rounded corners are off-screen. Only the
+    // 46-DIP dock surface is visible; its upper corners retain compositor antialiasing.
+    let dock_window_height_px = dock_height_px + corner_px;
+
+    // Remove the taskbar's edge claim before asking the shell to place our AppBar. Otherwise
+    // ABM_QUERYPOS can return a rect one taskbar-height above rcMonitor.bottom.
+    appbar::hide_taskbar();
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
     let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, dock_height_px)?;
@@ -277,10 +335,17 @@ fn run() -> windows::core::Result<()> {
     let width = dpi::px_to_dip(pixel_width, dpi_value);
     unsafe {
         // SAFETY: hwnd is our live window.
-        let _ = SetWindowPos(hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_width, dock_height_px, SWP_NOACTIVATE);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            rect.left,
+            rect.top,
+            pixel_width,
+            dock_window_height_px,
+            SWP_NOACTIVATE,
+        );
     }
-    apply_rounded_region(hwnd, pixel_width, dock_height_px, dpi::dip_to_px(16.0, dpi_value));
-    appbar::hide_taskbar();
+    apply_dwm_rounding(hwnd);
     glass::apply_dock_glass(hwnd, GLASS_OPACITY);
 
     let shell_msg = tasks::register_shell_hook(hwnd);
@@ -301,7 +366,7 @@ fn run() -> windows::core::Result<()> {
     let attention = Attention::default();
     apps.refresh(&attention);
 
-    let renderer = Renderer::new(hwnd, pixel_width, dock_height_px, dpi_value);
+    let renderer = Renderer::new(hwnd, pixel_width, dock_window_height_px, dpi_value);
     APP.with(|a| {
         *a.borrow_mut() = Some(App {
             hwnd,
@@ -360,7 +425,7 @@ fn layout_tiles(app_count: usize) -> Zones {
             t("media", 142.0),
         ],
         center: vec![Tile { id: "apps", width: apps_w, height: 44.0 }],
-        right: vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 34.0), t("ram", 34.0), t("clock", 50.0)],
+        right: vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)],
     }
 }
 
@@ -402,10 +467,27 @@ fn ai_view(data: &DataState, name: &str) -> TileView {
             Some((a.session_pct / 100.0).clamp(0.0, 1.0)),
             usage_color(a.session_pct),
         ),
-        Some(a) => (a.reset_text.clone(), String::new(), None, 0),
+        Some(a) => (short_ai_status(&a.reset_text).into(), String::new(), None, 0),
         None => ("…".into(), String::new(), None, 0),
     };
     TileView { progress, accent, bg, sub, glyph: Some(glyph), ..TileView::card(label, value) }
+}
+
+fn short_ai_status(status: &str) -> &'static str {
+    let s = status.to_ascii_lowercase();
+    if s.contains("sign in") || s.contains("đăng nhập") {
+        "Chưa đăng nhập"
+    } else if s.contains("network") {
+        "Mất mạng"
+    } else if s.contains("expired") {
+        "Hết phiên"
+    } else if s.contains("rate limit") {
+        "Chờ thử lại"
+    } else if s.contains("no usage") || s.contains("unavailable") {
+        "N/A"
+    } else {
+        "N/A"
+    }
 }
 
 /// Weather glyph for a WMO code, from `weatherInfo` in common.tsx.
@@ -440,7 +522,7 @@ fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) 
             style: Style::Ring,
             progress: Some(stats.cpu_pct / 100.0),
             accent: gauge_color(stats.cpu_pct),
-            ..TileView::card("", format!("{:.0}", stats.cpu_pct))
+            ..TileView::card("", format!("CPU {:.0}", stats.cpu_pct))
         },
         "ram" => {
             let pct = if stats.ram_total_mb > 0 { stats.ram_used_mb as f32 * 100.0 / stats.ram_total_mb as f32 } else { 0.0 };
@@ -449,7 +531,7 @@ fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) 
                 progress: Some(pct / 100.0),
                 // RAM is blue until it is nearly full (AppSystem tiles use #4aa8ff).
                 accent: if pct > 85.0 { 0xFF5D_5DFF } else { 0x4AA8_FFFF },
-                ..TileView::card("", format!("{pct:.0}"))
+                ..TileView::card("", format!("RAM {pct:.0}"))
             }
         }
         "clock" => {

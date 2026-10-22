@@ -59,11 +59,14 @@ pub fn refresh_git(repos: &[PathBuf]) -> GitSummary {
     let mut counts: HashMap<String, u32> = HashMap::new();
     let mut error = None;
 
+    let git_available = git(&["--version"], None).is_some();
     let author = git(&["config", "--global", "user.email"], None)
         .map(|o| o.trim().to_owned())
         .unwrap_or_default();
     let repo_dirs = find_repos(repos);
-    if author.is_empty() {
+    if !git_available {
+        error = Some("git.exe not found in PATH".to_owned());
+    } else if author.is_empty() {
         error = Some("git user.email is not set".to_owned());
     } else if repo_dirs.is_empty() {
         error = Some("no git repos in the configured folders".to_owned());

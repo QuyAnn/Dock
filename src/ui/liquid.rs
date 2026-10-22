@@ -133,7 +133,14 @@ fn render_with(wp: &WallpaperPixels, bar: RectF, screen: (i32, i32), o: &LensOpt
             let my = qy.max(0.0);
             let outside = mx.hypot(my);
             // Depth inside the rounded rect (>= 0 inside, negative outside).
-            let depth = -(outside + qx.max(qy).min(0.0) - radius);
+            let rounded_depth = -(outside + qx.max(qy).min(0.0) - radius);
+            // The dock is flush with the lower monitor edge: only its two upper corners are
+            // rounded. Keep the lower half rectangular so no wallpaper pinholes appear there.
+            let depth = if py >= 0.0 {
+                (hx - px.abs()).min(hy - py).max(0.0)
+            } else {
+                rounded_depth
+            };
             let fx = x as f32 + 0.5;
             let fy = y as f32 + 0.5;
             let (cr, cg, cb) = if depth >= band {

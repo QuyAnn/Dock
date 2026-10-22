@@ -86,13 +86,27 @@ pub fn load(max_w: u32) -> Result<WallpaperPixels> {
 }
 
 fn current_source() -> Option<Source> {
-    let transcoded = std::env::var_os("APPDATA")
-        .map(|a| PathBuf::from(a).join("Microsoft").join("Windows").join("Themes").join("TranscodedWallpaper"));
-    let path = reg_string(w!("WallPaper"))
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .filter(|p| p.is_file())
-        .or_else(|| transcoded.filter(|p| p.is_file()))?;
+    let themes = std::env::var_os("APPDATA")
+        .map(|a| PathBuf::from(a).join("Microsoft").join("Windows").join("Themes"));
+    let registry = [
+        reg_string(w!("WallPaper")),
+        reg_string_at(
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Wallpapers"),
+            w!("BackgroundHistoryPath0"),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|p| !p.is_empty())
+    .map(PathBuf::from)
+    .find(|p| p.is_file());
+    let transcoded = themes.as_ref().map(|d| d.join("TranscodedWallpaper")).filter(|p| p.is_file());
+    let generated = themes.as_ref().and_then(|d| newest_file(d, Some("Transcoded_")));
+    let cached = themes
+        .as_ref()
+        .map(|d| d.join("CachedFiles"))
+        .and_then(|d| newest_file(&d, Some("CachedImage_")));
+    let path = registry.or(transcoded).or(generated).or(cached)?;
     let meta = std::fs::metadata(&path).ok()?;
     let style = reg_string(w!("WallpaperStyle")).unwrap_or_else(|| "10".into());
     let tile = reg_string(w!("TileWallpaper")).unwrap_or_else(|| "0".into());
@@ -130,6 +144,10 @@ fn parse_rgb(s: &str) -> Option<[u8; 3]> {
 
 /// Reads a REG_SZ value from HKCU\Control Panel\Desktop. None if missing or not a string.
 fn reg_string(name: PCWSTR) -> Option<String> {
+    reg_string_at(w!("Control Panel\\Desktop"), name)
+}
+
+fn reg_string_at(subkey: PCWSTR, name: PCWSTR) -> Option<String> {
     let mut buf = vec![0u16; 1024];
     let mut bytes = (buf.len() * 2) as u32;
     // SAFETY: the subkey and value name are static literals; `buf` holds `bytes` bytes and
@@ -137,7 +155,7 @@ fn reg_string(name: PCWSTR) -> Option<String> {
     let err = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
-            w!("Control Panel\\Desktop"),
+            subkey,
             name,
             RRF_RT_REG_SZ,
             None,
@@ -150,6 +168,20 @@ fn reg_string(name: PCWSTR) -> Option<String> {
     }
     let n = (bytes as usize / 2).min(buf.len());
     Some(String::from_utf16_lossy(&buf[..n]).trim_end_matches('\0').to_string())
+}
+
+fn newest_file(dir: &Path, prefix: Option<&str>) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| prefix.is_none_or(|p| e.file_name().to_string_lossy().starts_with(p)))
+        .filter_map(|e| {
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, e.path()))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
 }
 
 /// Decodes the first frame, scaled down to at most `max_w` wide. Returns (w, h, orig_w, orig_h, rgba).

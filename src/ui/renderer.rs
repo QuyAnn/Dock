@@ -35,7 +35,9 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 use super::dock::RectF;
@@ -424,21 +426,17 @@ impl Renderer {
     }
 }
 
-/// Clips acrylic and rendered content to one physical rounded rectangle.
-/// On success Windows owns the region until it is replaced or the HWND is destroyed.
-pub fn apply_rounded_region(hwnd: HWND, width_px: i32, height_px: i32, radius_px: i32) -> bool {
+/// Asks the Windows 11 compositor for anti-aliased rounded corners.
+pub fn apply_dwm_rounding(hwnd: HWND) -> bool {
     unsafe {
-        let diameter = (radius_px.max(1) * 2).min(width_px.max(1)).min(height_px.max(1));
-        let region = CreateRoundRectRgn(0, 0, width_px + 1, height_px + 1, diameter, diameter);
-        if region.is_invalid() {
-            return false;
-        }
-        if SetWindowRgn(hwnd, region, true) != 0 {
-            true
-        } else {
-            let _ = DeleteObject(region);
-            false
-        }
+        let preference: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND;
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&preference as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        )
+        .is_ok()
     }
 }
 

@@ -63,7 +63,7 @@ fn tile(title: &str, value: String, progress: Option<f32>) -> TileView {
 pub fn git_tile(d: &DataState) -> TileView {
     match &d.git {
         None => tile("GIT", "–".to_owned(), None),
-        Some(g) if g.error.is_some() => tile("GIT", "Lỗi".to_owned(), None),
+        Some(g) if g.error.is_some() => tile("GIT", "—".to_owned(), None),
         Some(g) => TileView {
             style: Style::Git,
             cells: heat_levels(&g.heatmap, 16, 3),

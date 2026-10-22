@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::dock::RectF;
-use super::renderer::{apply_acrylic, apply_rounded_region, Renderer};
+use super::renderer::{apply_acrylic, apply_dwm_rounding, Renderer};
 use crate::win::dpi;
 
 const GAP: f32 = 8.0;
@@ -100,7 +100,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
                 SWP_NOACTIVATE,
             );
         }
-        apply_rounded_region(pw.hwnd, width_px, height_px, dpi::dip_to_px(RADIUS, dpi));
+        apply_dwm_rounding(pw.hwnd);
         apply_acrylic(pw.hwnd, 0x8C28_282C);
         unsafe {
             let _ = ShowWindow(pw.hwnd, SW_SHOWNOACTIVATE);
@@ -137,7 +137,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         mouse_down: true,
         esc_down: true,
     };
-    apply_rounded_region(hwnd, width_px, height_px, dpi::dip_to_px(RADIUS, dpi));
+    apply_dwm_rounding(hwnd);
     apply_acrylic(hwnd, 0x8C28_282C);
     POPUP.with(|p| *p.borrow_mut() = Some(pw));
 

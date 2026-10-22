@@ -81,10 +81,10 @@ pub fn apply(action: ControlAction) -> Result<()> {
 // .cc: padding 9, gap 8. .cc-grid: 1.35fr / 1fr. Every card has a 1 px border, included in the offsets.
 
 /// Total panel height: main controls + brightness + volume + now playing.
-pub const HEIGHT: f32 = 340.0;
+pub const HEIGHT: f32 = 356.0;
 const PAD: f32 = 9.0;
 const GAP: f32 = 8.0;
-const ROW1_H: f32 = 112.0; // connectivity column plus dark-mode mini and shortcut squares
+const ROW1_H: f32 = 80.0;
 const CAP_H: f32 = 65.0; // .cc-cap
 const MEDIA_H: f32 = 56.0;
 const CARD_R: f32 = 14.0;
@@ -143,13 +143,14 @@ fn layout(rect: RectF) -> Layout {
     let cap1 = row_y + ROW1_H + GAP;
     let cap2 = cap1 + CAP_H + GAP;
     let media = cap2 + CAP_H + GAP;
+    let dark = media + MEDIA_H + GAP;
     Layout {
         conn: RectF { x: x0, y: row_y, w: left_w, h: ROW1_H },
         wifi: toggle(row_y + 9.0),
         bluetooth: toggle(row_y + 9.0 + ROUND + 6.0),
-        dark: RectF { x: right_x, y: row_y, w: right_w, h: 32.0 },
-        net: RectF { x: right_x, y: row_y + 40.0, w: sq_w, h: ROW1_H - 40.0 },
-        sound: RectF { x: right_x + sq_w + GAP, y: row_y + 40.0, w: sq_w, h: ROW1_H - 40.0 },
+        dark: RectF { x: x0, y: dark, w, h: 40.0 },
+        net: RectF { x: right_x, y: row_y, w: sq_w, h: ROW1_H },
+        sound: RectF { x: right_x + sq_w + GAP, y: row_y, w: sq_w, h: ROW1_H },
         brightness: RectF { x: x0, y: cap1, w, h: CAP_H },
         volume: RectF { x: x0, y: cap2, w, h: CAP_H },
         media: RectF { x: x0, y: media, w, h: MEDIA_H },
@@ -303,7 +304,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     draw_square(r, l.sound, GLYPH_VOLUME, "Âm thanh")?;
     r.fill_rounded_rect(l.dark, CARD_R, CARD)?;
     r.stroke_rounded_rect(l.dark, CARD_R, CARD_BORDER, 1.0)?;
-    let moon = RectF { x: l.dark.x + 7.0, y: l.dark.y + 2.0, w: 28.0, h: 28.0 };
+    let moon = RectF { x: l.dark.x + 7.0, y: l.dark.y + 6.0, w: 28.0, h: 28.0 };
     draw_round(r, moon, GLYPH_MOON, 14.0, state.dark, 1.0, 1.0)?;
     r.draw_text("Chế độ tối", RectF { x: moon.x + 36.0, y: l.dark.y, w: l.dark.w - 45.0, h: l.dark.h }, 10.5, TEXT, Align::Left)?;
 

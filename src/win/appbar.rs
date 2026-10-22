@@ -89,11 +89,20 @@ pub fn register_appbar(hwnd: HWND, edge: AbEdge, height_px: i32) -> Result<RECT>
             return Err(Error::new(E_FAIL, "ABM_NEW failed"));
         }
         SHAppBarMessage(ABM_QUERYPOS, &mut data);
-        // The shell may move the strip; keep our exact height.
+        // ABM_QUERYPOS may return the edge above the old taskbar reservation even after its HWND is
+        // hidden. Anchor explicitly to rcMonitor so no taskbar-height wallpaper strip remains.
         match edge {
-            AbEdge::Top => data.rc.bottom = data.rc.top + height_px,
-            AbEdge::Bottom => data.rc.top = data.rc.bottom - height_px,
+            AbEdge::Top => {
+                data.rc.top = mon.top;
+                data.rc.bottom = mon.top + height_px;
+            }
+            AbEdge::Bottom => {
+                data.rc.top = mon.bottom - height_px;
+                data.rc.bottom = mon.bottom;
+            }
         }
+        data.rc.left = mon.left;
+        data.rc.right = mon.right;
         SHAppBarMessage(ABM_SETPOS, &mut data);
     }
     Ok(data.rc)

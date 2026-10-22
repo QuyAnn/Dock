@@ -34,7 +34,9 @@ const BADGE_H: f32 = 15.0;
 const BADGE_FONT: f32 = 9.5;
 const ATTN_PERIOD: f32 = 1.4; // animation: attn 1.4s ease-in-out infinite
 const MAG_RANGE: f32 = 64.0; // magnify falloff distance, px
-const MAG_MAX: f32 = 0.3; // --mag = 1 + 0.3 * falloff^2
+// A 46-DIP AppBar has room for ~35.5 DIP above the running dot. Cap magnification so the
+// squircle never crosses the HWND's top edge and gets clipped.
+const MAG_MAX: f32 = 0.18;
 
 thread_local! {
     /// Pointer x in dock-local DIPs (same space as the tile rects), None when not over the dock.

@@ -171,14 +171,16 @@ pub fn draw_dock(
     backdrop: Option<&LiquidBitmap>,
     opacity_pct: u8,
 ) -> Result<()> {
-    let (w, h) = r.size();
-    let bar = RectF { x: 0.0, y: 0.0, w, h };
+    let (w, _) = r.size();
+    let bar = RectF { x: 0.0, y: 0.0, w, h: DOCK_H };
     // The wallpaper blur is the backdrop. The readable smoky tint must sit above it, not below
     // an opaque bitmap where it would disappear.
     if let Some(b) = backdrop {
         r.draw_bitmap(b.w, b.h, &b.rgba, bar)?;
     }
-    r.fill_rounded_rect(bar, BAR_RADIUS, glass_fill_color(opacity_pct))?;
+    let tint = glass_fill_color(opacity_pct);
+    r.fill_rounded_rect(bar, BAR_RADIUS, tint)?;
+    r.fill_rect(RectF { x: bar.x, y: bar.y + BAR_RADIUS, w: bar.w, h: bar.h - BAR_RADIUS }, tint)?;
     r.fill_rounded_rect_gradient(bar, BAR_RADIUS, GLASS_SHEEN_TOP, 0xFFFF_FF00)?;
     r.stroke_rounded_rect(bar, BAR_RADIUS, BAR_BORDER, 1.0)?;
 
@@ -280,7 +282,7 @@ fn draw_ring(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
         let accent = if t.accent != 0 { t.accent } else { 0x4AA8_FFFF };
         r.stroke_arc(cx, cy, radius, -90.0, 360.0 * p.clamp(0.0, 1.0), accent, width)?;
     }
-    r.draw_text_styled(&t.value, rc, 9.5, TEXT, Align::Center, TextStyle::Bold)
+    r.draw_text_styled(&t.value, rc, 7.5, TEXT, Align::Center, TextStyle::Bold)
 }
 
 fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
@@ -290,7 +292,7 @@ fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
     r.draw_text_styled(&t.value, time, 11.0, 0xFFFF_FFFF, Align::Center, TextStyle::Bold)?;
 
     let row = RectF { x: rc.x + 4.0, y: time.y + time.h + 1.0, w: rc.w - 8.0, h: 12.0 };
-    let date_w = 18.0_f32.min(row.w);
+    let date_w = 26.0_f32.min(row.w);
     r.draw_text(&t.title, RectF { w: date_w, ..row }, 8.0, MUTED, Align::Left)?;
     r.draw_text(
         &t.sub,
