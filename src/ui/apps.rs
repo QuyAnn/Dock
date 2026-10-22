@@ -18,16 +18,19 @@ use crate::win::icons::{icon_for_window, IconBitmap};
 use crate::win::tasks::{list_windows, Attention};
 
 /// macOS-style icon size inside the 48-DIP bar (Variant A).
-pub const ICON: f32 = 36.0;
+pub const ICON: f32 = 34.0;
 /// Height of the centre cluster band (Start, separator zone, apps) = the glass shelf.
 /// Centred in the 48-DIP bar: 3 DIP clear above and below, all four shelf corners visible.
 pub const CLUSTER_H: f32 = 42.0;
-/// Icon top inside the cluster band: icon y 4..40, running dot 41..44, shelf rim at 45.
-pub const ICON_TOP: f32 = 1.0;
+/// Icon top inside the cluster band: equal 4-DIP gaps above and below the 34-DIP icon
+/// (icon optically centred in the shelf); the running dot sits inside the bottom gap.
+pub const ICON_TOP: f32 = (CLUSTER_H - ICON) / 2.0;
 const SLOT: f32 = ICON;
 const GAP: f32 = 5.0;
 const PITCH: f32 = SLOT + GAP;
-const DOT: f32 = 3.0;
+const DOT: f32 = 2.5;
+/// Space between the icon's bottom edge and the running dot.
+const DOT_GAP: f32 = 0.5;
 const DOT_RGBA: u32 = 0xFFFF_FFD9; // small white running dot
 /// Shadow under each icon (in composed-icon pixels: ICON_N px = ICON DIPs).
 const SHADOW_SIGMA_PX: f32 = 2.6;
@@ -168,7 +171,7 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
             draw_badge(r, ico, badge, t)?;
         }
         // Small white running dot under the icon.
-        let dot = RectF { x: cx - DOT / 2.0, y: base_bottom + 1.0, w: DOT, h: DOT };
+        let dot = RectF { x: cx - DOT / 2.0, y: base_bottom + DOT_GAP, w: DOT, h: DOT };
         r.fill_rounded_rect(dot, DOT / 2.0, DOT_RGBA)?;
     }
     Ok(())
@@ -449,7 +452,10 @@ mod tests {
         // A hovered icon grows upward by MAG_MAX but stays inside the bar.
         assert!(icon_bottom - ICON * (1.0 + MAG_MAX) >= 0.0);
         assert!(icon_top >= shelf.y && icon_bottom <= shelf.y + shelf.h);
-        let dot_bottom = icon_bottom + 1.0 + DOT;
+        // Icon optically centred in the shelf: equal gaps to the top and bottom rims.
+        let (gap_top, gap_bottom) = (icon_top - shelf.y, shelf.y + shelf.h - icon_bottom);
+        assert!((gap_top - gap_bottom).abs() < 0.01, "gaps {gap_top} vs {gap_bottom}");
+        let dot_bottom = icon_bottom + DOT_GAP + DOT;
         // At least 1 DIP between the dot and the shelf's bottom rim.
         assert!(dot_bottom <= shelf.y + shelf.h - 1.0, "dot {dot_bottom} touches shelf rim {shelf:?}");
         // Side tiles are vertically centred too.
