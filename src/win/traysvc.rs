@@ -288,6 +288,14 @@ fn run() {
     std::thread::spawn(|| {
         std::thread::sleep(Duration::from_secs(4));
         log_summary("after start");
+        // Some apps are busy at the first broadcast (or only listen once their UI is up):
+        // ask once more, then summarise again.
+        std::thread::sleep(Duration::from_secs(8));
+        if running() {
+            broadcast_taskbar_created("retry");
+            std::thread::sleep(Duration::from_secs(4));
+            log_summary("after retry");
+        }
     });
 
     let mut msg = MSG::default();

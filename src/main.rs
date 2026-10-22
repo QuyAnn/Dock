@@ -195,6 +195,10 @@ fn main() {
 /// Appends a line to `%APPDATA%\SmartDock\log.txt`. The GUI build has no console to print to.
 fn log(msg: &str) {
     use std::io::Write;
+    // Unit tests must never write into the user's real log.
+    if cfg!(test) {
+        return;
+    }
     let Ok(appdata) = std::env::var("APPDATA") else { return };
     let dir = std::path::Path::new(&appdata).join("SmartDock");
     let _ = std::fs::create_dir_all(&dir);
