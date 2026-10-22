@@ -430,29 +430,9 @@ fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
     }
     let x = rc.x + 65.0;
     let w = (rc.x + rc.w - 7.0 - x).max(0.0);
-    // Marquee long titles/artists (Vietnamese diacritics preserved — we scroll the full string).
-    let title = marquee(&t.title, elapsed, w, 11.5);
-    let artist = marquee(&t.sub, elapsed * 0.85 + 1.7, w, 8.5);
-    r.draw_text_styled(&title, RectF { x, y: rc.y + 4.0, w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(&artist, RectF { x, y: rc.y + 18.0, w, h: 11.0 }, 8.5, MUTED, Align::Left)
-}
-
-/// Scrolls `text` when it is wider than `max_w` DIPs (approx. by glyph count × font size × 0.55).
-fn marquee(text: &str, elapsed: f32, max_w: f32, font_px: f32) -> String {
-    if text.is_empty() || max_w <= 0.0 {
-        return String::new();
-    }
-    let approx = text.chars().count() as f32 * font_px * 0.55;
-    if approx <= max_w + 4.0 {
-        return text.to_owned();
-    }
-    // Pad so the scroll loops cleanly.
-    let padded = format!("{text}   ·   ");
-    let chars: Vec<char> = padded.chars().collect();
-    let n = chars.len().max(1);
-    let start = ((elapsed * 4.0) as usize) % n;
-    let visible = ((max_w / (font_px * 0.55)).ceil() as usize + 2).min(n);
-    chars.iter().cycle().skip(start).take(visible).collect()
+    // Full strings (Vietnamese diacritics intact); DirectWrite ellipsizes only when they overflow.
+    r.draw_text_styled(&t.title, RectF { x, y: rc.y + 4.0, w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(&t.sub, RectF { x, y: rc.y + 18.0, w, h: 11.0 }, 8.5, MUTED, Align::Left)
 }
 
 fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
