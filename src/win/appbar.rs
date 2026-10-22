@@ -56,8 +56,13 @@ fn primary_monitor_rect() -> Result<RECT> {
     // SAFETY: mi is correctly sized and lives across the call; (0,0) is on the primary monitor.
     unsafe {
         let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        // Some machines report failure with no error code; fall back to the screen size instead of aborting.
         if !GetMonitorInfoW(mon, &mut mi).as_bool() {
-            return Err(Error::from_win32());
+            let (w, h) = (
+                windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN),
+                windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN),
+            );
+            return Ok(RECT { left: 0, top: 0, right: w, bottom: h });
         }
     }
     Ok(mi.rcMonitor)
