@@ -18,7 +18,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory1, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
     ID2D1StrokeStyle, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE,
     D2D1_ARC_SIZE_SMALL, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA, D2D1_GAMMA_2_2,
@@ -26,7 +26,8 @@ use windows::Win32::Graphics::Direct2D::{
     ID2D1PathGeometry,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
     DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
@@ -34,6 +35,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, DeleteObject, SetWindowRgn};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 use super::dock::RectF;
@@ -120,6 +122,13 @@ fn text_format(size: f32, align: Align, style: TextStyle) -> Result<IDWriteTextF
         f.SetTextAlignment(text_align)?;
         f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
         f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        let sign = dw.CreateEllipsisTrimmingSign(&f)?;
+        let trimming = DWRITE_TRIMMING {
+            granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+            delimiter: 0,
+            delimiterCount: 0,
+        };
+        f.SetTrimming(&trimming, &sign)?;
     }
     FORMATS.with(|c| c.borrow_mut().push((key, f.clone())));
     Ok(f)
@@ -307,7 +316,14 @@ impl Renderer {
         let r = d2d_rect(rect);
         // SAFETY: slices and rect live for the call.
         unsafe {
-            rt.DrawText(&wide, &format, &r, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL)
+            rt.DrawText(
+                &wide,
+                &format,
+                &r,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                DWRITE_MEASURING_MODE_NATURAL,
+            )
         };
         Ok(())
     }
@@ -405,6 +421,24 @@ impl Renderer {
             )
         };
         Ok(())
+    }
+}
+
+/// Clips acrylic and rendered content to one physical rounded rectangle.
+/// On success Windows owns the region until it is replaced or the HWND is destroyed.
+pub fn apply_rounded_region(hwnd: HWND, width_px: i32, height_px: i32, radius_px: i32) -> bool {
+    unsafe {
+        let diameter = (radius_px.max(1) * 2).min(width_px.max(1)).min(height_px.max(1));
+        let region = CreateRoundRectRgn(0, 0, width_px + 1, height_px + 1, diameter, diameter);
+        if region.is_invalid() {
+            return false;
+        }
+        if SetWindowRgn(hwnd, region, true) != 0 {
+            true
+        } else {
+            let _ = DeleteObject(region);
+            false
+        }
     }
 }
 

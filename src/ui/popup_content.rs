@@ -101,8 +101,13 @@ pub enum MediaAction {
 
 thread_local! {
     static CONTENT: RefCell<Option<(PopupKind, DataState)>> = const { RefCell::new(None) };
+    static AI_PROVIDER: RefCell<Option<&'static str>> = const { RefCell::new(None) };
     /// Sample history per kind (Cpu, Ram), percent 0..=100, oldest first.
     static HISTORY: RefCell<Vec<(PopupKind, Vec<f32>)>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn set_ai_provider(provider: Option<&'static str>) {
+    AI_PROVIDER.with(|p| *p.borrow_mut() = provider);
 }
 
 /// Stores the samples for a sparkline (Cpu or Ram). Call `popup::invalidate` after updating while open.
@@ -357,13 +362,13 @@ fn row(
         c.fill(rect_at(c.rect.x, y, c.rect.w, h), STRIPE)?;
     }
     let (x, w) = (c.inner_x(), c.inner_w());
-    c.text(label, rect_at(x, y + 7.0, w * 0.5, 15.0), font(11.0, TEXT))?;
+    c.text(label, rect_at(x, y + 7.0, w * 0.5, 15.0), font(12.5, TEXT))?;
     if let Some(hint) = hint {
         let hint_w = if value.is_some() { w - VALUE_W } else { w };
-        c.text(hint, rect_at(x, y + 7.0, hint_w, 15.0), font(9.5, MUTED).right())?;
+        c.text(hint, rect_at(x, y + 7.0, hint_w, 15.0), font(10.5, MUTED).right())?;
     }
     if let Some(v) = value {
-        c.text(v, rect_at(x + w - VALUE_W, y + 7.0, VALUE_W, 15.0), font(11.0, TEXT).bold().right())?;
+        c.text(v, rect_at(x + w - VALUE_W, y + 7.0, VALUE_W, 15.0), font(12.5, TEXT).bold().right())?;
     }
     if let Some((frac, color)) = bar {
         let track = rect_at(x, y + 28.0, w * BAR_FRAC, 4.0);
@@ -487,16 +492,29 @@ fn draw_ai(c: &mut Ctx<'_>, y: f32, ai: &[AiUsage]) -> Result<f32> {
         return empty(c, y, "Đang tải…");
     }
     let mut y = section(c, y, "USAGE")?;
-    for (i, u) in ai.iter().enumerate() {
-        y = if u.session_pct.is_nan() {
-            // No data: reset_text holds the status (sign-in needed, error, ...).
-            row(c, y, i, &u.name, Some(u.reset_text.as_str()), None, None)?
-        } else {
-            let pct = u.session_pct;
-            let value = format!("{pct:.0}%");
-            let hint = (!u.reset_text.is_empty()).then_some(u.reset_text.as_str());
-            row(c, y, i, &u.name, hint, Some(value.as_str()), Some(((pct / 100.0).clamp(0.0, 1.0), ai_color(pct))))?
-        };
+    let selected = AI_PROVIDER.with(|p| *p.borrow());
+    let providers = ai.iter().filter(|u| selected.is_none_or(|name| u.name == name));
+    let mut row_index = 0usize;
+    for u in providers {
+        if u.windows.is_empty() {
+            y = row(c, y, row_index, &u.name, Some(u.reset_text.as_str()), None, None)?;
+            row_index += 1;
+            continue;
+        }
+        for window in &u.windows {
+            let value = format!("{:.0}%", window.used_pct);
+            let hint = (!window.reset_text.is_empty()).then_some(window.reset_text.as_str());
+            y = row(
+                c,
+                y,
+                row_index,
+                &window.label,
+                hint,
+                Some(value.as_str()),
+                Some(((window.used_pct / 100.0).clamp(0.0, 1.0), ai_color(window.used_pct))),
+            )?;
+            row_index += 1;
+        }
     }
     // No SUBSCRIPTION section: AiUsage carries no plan info yet.
     section_end(c, y)

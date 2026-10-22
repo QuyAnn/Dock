@@ -34,7 +34,7 @@ use ui::glass;
 use ui::liquid::{self, LiquidBitmap};
 use ui::popup;
 use ui::popup_content::{self, MediaAction as PopupMedia, PopupKind};
-use ui::renderer::Renderer;
+use ui::renderer::{apply_rounded_region, Renderer};
 use ui::svgpath;
 use ui::tiles::{self, DataState};
 use win::appbar::{self, AbEdge};
@@ -43,11 +43,12 @@ use win::system::{self, MediaAction};
 use win::tasks::{self, Attention, ShellEvent};
 use win::wallpaper;
 
-const DOCK_HEIGHT: f32 = 56.0;
+const DOCK_HEIGHT: f32 = 46.0;
 const POPUP_W: f32 = 320.0;
+const CONTROL_POPUP_W: f32 = 340.0;
 /// Height used when the popup content cannot be measured yet.
 const POPUP_H_DEFAULT: f32 = 260.0;
-const GLASS_OPACITY: u8 = 70;
+const GLASS_OPACITY: u8 = glass::DEFAULT_OPACITY_PCT;
 const TIMER_REFRESH: usize = 1; // 1 s: apps, stats, popup refresh, repaint
 const TIMER_GUARD: usize = 2; // 500 ms: keep the Windows taskbar hidden
 
@@ -99,6 +100,7 @@ thread_local! {
     static OPEN: Cell<Option<OpenPopup>> = const { Cell::new(None) };
     /// Height of the currently shown data popup, from `popup_content::content_height`.
     static POPUP_H_CUR: Cell<f32> = const { Cell::new(POPUP_H_DEFAULT) };
+    static POPUP_W_CUR: Cell<f32> = const { Cell::new(POPUP_W) };
     static SHELL_MSG: Cell<u32> = const { Cell::new(0) };
 }
 
@@ -277,6 +279,7 @@ fn run() -> windows::core::Result<()> {
         // SAFETY: hwnd is our live window.
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_width, dock_height_px, SWP_NOACTIVATE);
     }
+    apply_rounded_region(hwnd, pixel_width, dock_height_px, dpi::dip_to_px(16.0, dpi_value));
     appbar::hide_taskbar();
     glass::apply_dock_glass(hwnd, GLASS_OPACITY);
 
@@ -347,7 +350,14 @@ fn layout_tiles(app_count: usize) -> Zones {
     let apps_w = (16.0 + app_count as f32 * 38.0).max(72.0);
     let t = |id, width| Tile { id, width, height: 0.0 };
     Zones {
-        left: vec![t("git", 118.0), t("claude", 100.0), t("codex", 100.0), t("media", 142.0)],
+        left: vec![
+            t("git", 118.0),
+            t("claude", 100.0),
+            t("codex", 100.0),
+            t("cursor", 100.0),
+            t("grok", 100.0),
+            t("media", 142.0),
+        ],
         center: vec![Tile { id: "apps", width: apps_w, height: 44.0 }],
         right: vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 34.0), t("ram", 34.0), t("clock", 50.0)],
     }
@@ -379,7 +389,9 @@ fn gauge_color(pct: f32) -> u32 {
 fn ai_view(data: &DataState, name: &str) -> TileView {
     let (label, bg, glyph) = match name {
         "Claude" => ("Claude", 0xD977_57FF, (svgpath::CLAUDE_SPARK, None)),
-        _ => ("ChatGPT", 0x0D0D_0DFF, (svgpath::CODEX_ORBITS, Some(1.7))),
+        "Codex" => ("ChatGPT", 0x0D0D_0DFF, (svgpath::CODEX_ORBITS, Some(1.7))),
+        "Cursor" => ("Cursor", 0x1414_14FF, (svgpath::CURSOR_CUBE, Some(1.5))),
+        _ => ("Grok", 0x0000_00FF, (svgpath::GROK_SLASH, Some(2.0))),
     };
     let usage = data.ai.iter().find(|a| a.name == name);
     let (value, sub, progress, accent) = match usage {
@@ -417,6 +429,8 @@ fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) 
         "git" => tiles::git_tile(data),
         "claude" => ai_view(data, "Claude"),
         "codex" => ai_view(data, "Codex"),
+        "cursor" => ai_view(data, "Cursor"),
+        "grok" => ai_view(data, "Grok"),
         "media" => tiles::media_tile(data),
         // .cc-btn: Wi-Fi and volume glyphs (Segoe MDL2 Assets).
         "cc" => TileView { style: Style::Button, value: "\u{E701}\u{E767}".into(), ..TileView::card("", "") },
@@ -475,7 +489,14 @@ fn repaint() {
         let res = app
             .renderer
             .begin()
-            .and_then(|_| dock::draw_dock(&mut app.renderer, &views, &rects, app.hover, backdrop.as_deref()))
+            .and_then(|_| dock::draw_dock(
+                &mut app.renderer,
+                &views,
+                &rects,
+                app.hover,
+                backdrop.as_deref(),
+                GLASS_OPACITY,
+            ))
             .and_then(|_| match apps_rect {
                 Some(r) => apps::draw_apps(&mut app.renderer, r, &app.apps),
                 None => Ok(()),
@@ -517,7 +538,7 @@ fn dock_click(x: f32, y: f32) -> Click {
         match id {
             "apps" => apps::hit_app(x, y, rect, &app.apps).map_or(Click::None, Click::Activate),
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
-            "claude" | "codex" => Click::Open(OpenPopup::Data("ai"), anchor),
+            "claude" | "codex" | "cursor" | "grok" => Click::Open(OpenPopup::Data(id), anchor),
             "media" => Click::Open(OpenPopup::Data("media"), anchor),
             "clock" => Click::Open(OpenPopup::Data("clock"), anchor),
             "cpu" => Click::Open(OpenPopup::Data("cpu"), anchor),
@@ -531,7 +552,7 @@ fn dock_click(x: f32, y: f32) -> Click {
 fn popup_kind(id: &str) -> PopupKind {
     match id {
         "git" => PopupKind::Git,
-        "ai" => PopupKind::Ai,
+        "claude" | "codex" | "cursor" | "grok" | "ai" => PopupKind::Ai,
         "weather" => PopupKind::Weather,
         "clock" => PopupKind::Clock,
         "cpu" => PopupKind::Cpu,
@@ -562,6 +583,13 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
     match which {
         OpenPopup::Data(id) => {
             let kind = popup_kind(id);
+            popup_content::set_ai_provider(match id {
+                "claude" => Some("Claude"),
+                "codex" => Some("Codex"),
+                "cursor" => Some("Cursor"),
+                "grok" => Some("Grok"),
+                _ => None,
+            });
             let height = APP
                 .with(|a| {
                     let slot = a.borrow();
@@ -573,14 +601,16 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
                 .unwrap_or(POPUP_H_DEFAULT);
             CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
             POPUP_H_CUR.with(|h| h.set(height));
-            if popup::show(anchor, height as i32).is_ok() {
+            POPUP_W_CUR.with(|w| w.set(POPUP_W));
+            if popup::show(anchor, POPUP_W, height as i32).is_ok() {
                 OPEN.with(|o| o.set(Some(which)));
             }
         }
         OpenPopup::Control => {
             let state = APP.with(|a| a.borrow().as_ref().map(|app| app.shared.control.lock().unwrap().clone()));
             CONTROL_VIEW.with(|c| *c.borrow_mut() = state);
-            if popup::show(anchor, control_center::HEIGHT as i32).is_ok() {
+            POPUP_W_CUR.with(|w| w.set(CONTROL_POPUP_W));
+            if popup::show(anchor, CONTROL_POPUP_W, control_center::HEIGHT as i32).is_ok() {
                 OPEN.with(|o| o.set(Some(which)));
             }
         }
@@ -603,7 +633,12 @@ fn paint_popup(r: &mut Renderer, rect: RectF) {
     let control = CONTROL_VIEW.with(|c| c.borrow().clone());
     match control {
         Some(state) => {
-            let _ = control_center::draw(r, rect, &state);
+            let media = APP.with(|a| {
+                a.borrow()
+                    .as_ref()
+                    .and_then(|app| app.shared.data.lock().ok()?.media.clone())
+            });
+            let _ = control_center::draw(r, rect, &state, media.as_ref());
         }
         None => popup_content::paint_content(r, rect),
     }
@@ -611,7 +646,7 @@ fn paint_popup(r: &mut Renderer, rect: RectF) {
 
 fn popup_rect() -> RectF {
     let h = if CONTROL_VIEW.with(|c| c.borrow().is_some()) { control_center::HEIGHT } else { POPUP_H_CUR.with(Cell::get) };
-    RectF { x: 0.5, y: 0.5, w: POPUP_W - 1.0, h: h - 1.0 }
+    RectF { x: 0.5, y: 0.5, w: POPUP_W_CUR.with(Cell::get) - 1.0, h: h - 1.0 }
 }
 
 fn on_popup_click(x: f32, y: f32) {

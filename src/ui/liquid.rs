@@ -176,6 +176,8 @@ struct Placement {
     tile: bool,
     iw: f32,
     ih: f32,
+    sw: f32,
+    sh: f32,
     bg: [f32; 3],
 }
 
@@ -206,12 +208,22 @@ impl Placement {
             tile: wp.mode == FitMode::Tile,
             iw,
             ih,
+            sw,
+            sh,
             bg: wp.background.map(|c| c as f32),
         }
     }
 
     /// Wallpaper colour at a display pixel, composited over the background colour.
     fn sample(&self, wp: &WallpaperPixels, x: f32, y: f32) -> [f32; 3] {
+        // Blur requests pixels beyond the physical display at the bottom/side margins. Canvas
+        // effectively extends edge pixels there; clamping avoids blending the desktop background
+        // (usually near-black) into the dock's lower rim.
+        let (x, y) = if self.tile {
+            (x, y)
+        } else {
+            (x.clamp(0.0, self.sw - 1.0), y.clamp(0.0, self.sh - 1.0))
+        };
         let mut u = (x - self.dx) / self.sx;
         let mut v = (y - self.dy) / self.sy;
         if self.tile {

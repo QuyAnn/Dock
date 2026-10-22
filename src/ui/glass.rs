@@ -7,7 +7,7 @@ use super::dock::RectF;
 use super::renderer::{apply_acrylic, Renderer};
 
 /// Default Settings > Glass opacity (percent).
-pub const DEFAULT_OPACITY_PCT: u8 = 70;
+pub const DEFAULT_OPACITY_PCT: u8 = 55;
 /// Same cap as the CSS `glassVars` (alpha never exceeds 0.95).
 const MAX_OPACITY_PCT: u8 = 95;
 /// Smoky frosted tint, rgb(40, 40, 44), as in styles.css `.glass-liquid::before`.

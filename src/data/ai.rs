@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::model::AiUsage;
+use crate::model::{AiUsage, AiWindow};
 
 const TIMEOUT: Duration = Duration::from_secs(15);
 /// /api/oauth/usage is aggressively rate limited.
@@ -19,11 +19,21 @@ static CLAUDE_CACHE: Mutex<Option<(Instant, AiUsage)>> = Mutex::new(None);
 /// Usage for each provider. A provider with no data gets `session_pct = NaN`
 /// and a short status (sign-in needed, error, ...) in `reset_text`.
 pub fn refresh_ai() -> Vec<AiUsage> {
-    vec![claude(), codex(), grok()]
+    vec![claude(), codex(), cursor(), grok()]
 }
 
 fn no_data(name: &str, status: &str) -> AiUsage {
-    AiUsage { name: name.to_owned(), session_pct: f32::NAN, reset_text: status.to_owned() }
+    AiUsage { name: name.to_owned(), session_pct: f32::NAN, reset_text: status.to_owned(), windows: Vec::new() }
+}
+
+fn usage(name: &str, windows: Vec<AiWindow>) -> AiUsage {
+    let primary = windows.first();
+    AiUsage {
+        name: name.to_owned(),
+        session_pct: primary.map_or(f32::NAN, |w| w.used_pct),
+        reset_text: primary.map_or_else(String::new, |w| w.reset_text.clone()),
+        windows,
+    }
 }
 
 fn home() -> Option<PathBuf> {
@@ -47,18 +57,18 @@ fn to_ms(v: &Value) -> Option<i64> {
     }
 }
 
-/// "resets in 2h 05m", or empty when the time is unknown.
+/// Compact reset text used by the TS tiles (`3d`, `4h 05m`).
 fn reset_text(reset_ms: Option<i64>) -> String {
     let Some(ms) = reset_ms else { return String::new() };
     let secs = (ms - now_ms()) / 1000;
     if secs <= 0 {
-        return "resets now".to_owned();
+        return "đã reset".to_owned();
     }
     let (days, hours, mins) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
     if days > 0 {
-        format!("resets in {days}d {hours}h")
+        format!("{days}d")
     } else {
-        format!("resets in {hours}h {mins:02}m")
+        format!("{hours}h {mins:02}m")
     }
 }
 
@@ -111,17 +121,27 @@ fn claude() -> AiUsage {
         Ok(j) => j,
         Err(e) => return no_data(NAME, &e),
     };
-    let Some(window) = j.get("five_hour") else {
+    let specs = [
+        ("five_hour", "Session (5h)"),
+        ("seven_day", "Weekly"),
+        ("seven_day_opus", "Opus (weekly)"),
+        ("seven_day_sonnet", "Sonnet (weekly)"),
+    ];
+    let windows = specs
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let window = j.get(key)?;
+            Some(AiWindow {
+                label: label.to_owned(),
+                used_pct: window.get("utilization")?.as_f64()? as f32,
+                reset_text: reset_text(window.get("resets_at").and_then(to_ms)),
+            })
+        })
+        .collect::<Vec<_>>();
+    if windows.is_empty() {
         return no_data(NAME, "no usage data");
-    };
-    let Some(pct) = window.get("utilization").and_then(Value::as_f64) else {
-        return no_data(NAME, "no usage data");
-    };
-    let usage = AiUsage {
-        name: NAME.to_owned(),
-        session_pct: pct as f32,
-        reset_text: reset_text(window.get("resets_at").and_then(to_ms)),
-    };
+    }
+    let usage = usage(NAME, windows);
     *CLAUDE_CACHE.lock().unwrap_or_else(PoisonError::into_inner) = Some((Instant::now(), usage.clone()));
     usage
 }
@@ -147,11 +167,19 @@ fn codex() -> AiUsage {
         match send(req) {
             Ok(j) => {
                 if let Some(pct) = j.pointer("/rate_limit/primary_window/used_percent").and_then(Value::as_f64) {
-                    return AiUsage {
-                        name: NAME.to_owned(),
-                        session_pct: pct as f32,
+                    let mut windows = vec![AiWindow {
+                        label: "Session".to_owned(),
+                        used_pct: pct as f32,
                         reset_text: reset_text(j.pointer("/rate_limit/primary_window/reset_at").and_then(to_ms)),
-                    };
+                    }];
+                    if let Some(pct) = j.pointer("/rate_limit/secondary_window/used_percent").and_then(Value::as_f64) {
+                        windows.push(AiWindow {
+                            label: "Weekly".to_owned(),
+                            used_pct: pct as f32,
+                            reset_text: reset_text(j.pointer("/rate_limit/secondary_window/reset_at").and_then(to_ms)),
+                        });
+                    }
+                    return usage(NAME, windows);
                 }
                 api_err = Some("no usage data".to_owned());
             }
@@ -167,7 +195,11 @@ fn codex() -> AiUsage {
                     .and_then(Value::as_f64)
                     .map(|s| at_ms + (s * 1000.0) as i64)
             });
-            return AiUsage { name: NAME.to_owned(), session_pct: pct as f32, reset_text: reset_text(reset) };
+            return usage(NAME, vec![AiWindow {
+                label: "Session".to_owned(),
+                used_pct: pct as f32,
+                reset_text: reset_text(reset),
+            }]);
         }
     }
 
@@ -221,7 +253,13 @@ fn collect_jsonl(dir: &Path, depth: u32, out: &mut Vec<(PathBuf, i64)>) {
     }
 }
 
-// ---------------------------------------------------------------- Grok
+// ---------------------------------------------------------------- Cursor / Grok
+
+fn cursor() -> AiUsage {
+    // Cursor keeps its session in a SQLite state database. The native port deliberately exposes the
+    // provider tile even when that optional source cannot be read, rather than inventing usage.
+    no_data("Cursor", "sign in to Cursor")
+}
 
 /// xAI exposes no local sign-in or usage API that a desktop app can read.
 fn grok() -> AiUsage {

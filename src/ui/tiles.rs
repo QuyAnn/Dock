@@ -111,12 +111,21 @@ pub fn weather_tile(d: &DataState) -> TileView {
 }
 
 pub fn media_tile(d: &DataState) -> TileView {
-    let value = match &d.media {
-        Some(m) if !m.title.is_empty() && !m.artist.is_empty() => format!("{} – {}", m.title, m.artist),
-        Some(m) if !m.title.is_empty() => m.title.clone(),
-        _ => "Không phát".to_owned(),
-    };
-    tile("MEDIA", value, None)
+    match &d.media {
+        Some(m) if !m.title.is_empty() => TileView {
+            style: Style::Media,
+            title: m.title.clone(),
+            sub: m.artist.clone(),
+            progress: m.playing.then_some(1.0),
+            ..TileView::card("", "")
+        },
+        _ => TileView {
+            style: Style::Media,
+            title: "Không phát".to_owned(),
+            sub: "Media controls".to_owned(),
+            ..TileView::card("", "")
+        },
+    }
 }
 
 /// WMO weather code to short Vietnamese text (same table as the old app, no icons).

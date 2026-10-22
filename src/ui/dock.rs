@@ -3,25 +3,23 @@
 //! CPU, RAM, clock). Coordinates are dock-local DIPs (the dock window's client area).
 use windows::core::Result;
 
-use super::liquid::LiquidBitmap;
+use super::liquid::{glass_fill_color, LiquidBitmap, GLASS_SHEEN_TOP};
 use super::renderer::{Align, Renderer, TextStyle};
 use super::svgpath;
 
-pub const DOCK_H: f32 = 56.0;
-const BAR_RADIUS: f32 = 8.0;
+pub const DOCK_H: f32 = 46.0;
+const BAR_RADIUS: f32 = 16.0;
 const TILE_H: f32 = 34.0;
-const TILE_RADIUS: f32 = 7.0;
+const TILE_RADIUS: f32 = 10.0;
 const ROW_PAD: f32 = 5.0; // .dock-row padding
 const ZONE_GAP: f32 = 5.0; // .zone gap
 const ROW_GAP: f32 = 6.0; // .dock-row gap between zones
 
 // Colors from styles.css, 0xRRGGBBAA.
-const BAR_TOP: u32 = 0x2C2E_3838; // linear-gradient(180deg, rgba(44,46,56,.22), rgba(16,17,22,.34))
-const BAR_BOTTOM: u32 = 0x1011_1657;
-const BAR_BORDER: u32 = 0xFFFF_FF24; // rgba(255,255,255,.14)
-const TILE_FILL: u32 = 0x1C1C_20BD; // rgba(28,28,32,.74)
-const TILE_BORDER: u32 = 0xFFFF_FF13; // rgba(255,255,255,.075)
-const TILE_HOVER_FILL: u32 = 0x3030_36D1; // rgba(48,48,54,.82)
+const BAR_BORDER: u32 = 0xFFFF_FF42; // liquid rim top, rgba(255,255,255,.26)
+const TILE_FILL: u32 = 0x2C2C_30A1; // rgba(44,44,48,.63): --gt at default --ga .55
+const TILE_BORDER: u32 = 0xFFFF_FF1F; // rgba(255,255,255,.12)
+const TILE_HOVER_FILL: u32 = 0x1E1E_23A1; // rgba(30,30,35,.63)
 const TILE_HOVER_BORDER: u32 = 0xFFFF_FF24; // rgba(255,255,255,.14)
 const TEXT: u32 = 0xF1F1_F4FF;
 const MUTED: u32 = 0xFFFF_FF8C; // rgba(255,255,255,.55)
@@ -66,6 +64,8 @@ pub enum Style {
     Clock,
     /// Git card: numbers line above a 16x3 mini heatmap (`cells`).
     Git,
+    /// Now-playing tile: waveform plus ellipsized title/artist.
+    Media,
     /// Control Center button: value holds Segoe MDL2 glyphs drawn side by side.
     Button,
     /// No background (the apps zone, the settings gear). `value` is the glyph or text.
@@ -119,28 +119,37 @@ impl TileView {
 /// Returns one rect per tile, in the order: left, center, right.
 pub fn layout(left: &[Tile], center: &[Tile], right: &[Tile], screen_w: f32) -> Vec<RectF> {
     let mut out = Vec::with_capacity(left.len() + center.len() + right.len());
-    let place = |tiles: &[Tile], x: f32, out: &mut Vec<RectF>| -> f32 {
-        let mut x = x;
-        for t in tiles {
-            let h = if t.height > 0.0 { t.height } else { TILE_H };
-            out.push(RectF { x, y: (DOCK_H - h) / 2.0, w: t.width, h });
-            x += t.width + ZONE_GAP;
-        }
-        x
-    };
     let zone_w = |tiles: &[Tile]| -> f32 {
         tiles.iter().map(|t| t.width).sum::<f32>() + ZONE_GAP * tiles.len().saturating_sub(1) as f32
     };
-
-    place(left, ROW_PAD, &mut out);
+    let place = |tiles: &[Tile], x: f32, max_w: f32, out: &mut Vec<RectF>| -> f32 {
+        let mut x = x;
+        let gaps = ZONE_GAP * tiles.len().saturating_sub(1) as f32;
+        let widths = tiles.iter().map(|t| t.width).sum::<f32>();
+        let scale = if widths + gaps > max_w {
+            ((max_w - gaps).max(0.0) / widths.max(1.0)).min(1.0)
+        } else {
+            1.0
+        };
+        for t in tiles {
+            let h = if t.height > 0.0 { t.height } else { TILE_H };
+            let w = t.width * scale;
+            out.push(RectF { x, y: (DOCK_H - h) / 2.0, w, h });
+            x += w + ZONE_GAP;
+        }
+        x
+    };
 
     let center_w = zone_w(center);
     let center_x = (screen_w - center_w) / 2.0;
-    place(center, center_x, &mut out);
+    let side_w = (center_x - ROW_PAD - ROW_GAP).max(0.0);
+    place(left, ROW_PAD, side_w, &mut out);
+    place(center, center_x, center_w, &mut out);
 
     let right_w = zone_w(right);
-    let right_x = (screen_w - ROW_PAD - right_w).max(center_x + center_w + ROW_GAP);
-    place(right, right_x, &mut out);
+    let fitted_right_w = right_w.min(side_w);
+    let right_x = screen_w - ROW_PAD - fitted_right_w;
+    place(right, right_x, side_w, &mut out);
     out
 }
 
@@ -160,14 +169,17 @@ pub fn draw_dock(
     rects: &[RectF],
     hover: Option<usize>,
     backdrop: Option<&LiquidBitmap>,
+    opacity_pct: u8,
 ) -> Result<()> {
     let (w, h) = r.size();
     let bar = RectF { x: 0.0, y: 0.0, w, h };
-    r.fill_rounded_rect_gradient(bar, BAR_RADIUS, BAR_TOP, BAR_BOTTOM)?;
-    // Liquid Glass canvas sits over the tint, as `.liquid-canvas` does over `.dock`.
+    // The wallpaper blur is the backdrop. The readable smoky tint must sit above it, not below
+    // an opaque bitmap where it would disappear.
     if let Some(b) = backdrop {
         r.draw_bitmap(b.w, b.h, &b.rgba, bar)?;
     }
+    r.fill_rounded_rect(bar, BAR_RADIUS, glass_fill_color(opacity_pct))?;
+    r.fill_rounded_rect_gradient(bar, BAR_RADIUS, GLASS_SHEEN_TOP, 0xFFFF_FF00)?;
     r.stroke_rounded_rect(bar, BAR_RADIUS, BAR_BORDER, 1.0)?;
 
     for (i, (t, rc)) in tiles.iter().zip(rects).enumerate() {
@@ -178,6 +190,7 @@ pub fn draw_dock(
             Style::Ring => draw_ring(r, t, *rc, hovered)?,
             Style::Clock => draw_clock(r, t, *rc, hovered)?,
             Style::Git => draw_git(r, t, *rc, hovered)?,
+            Style::Media => draw_media(r, t, *rc, hovered)?,
             Style::Button => draw_button(r, t, *rc, hovered)?,
         }
     }
@@ -188,6 +201,12 @@ pub fn draw_dock(
 fn card_frame(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
     let (fill, border) = if hovered { (TILE_HOVER_FILL, TILE_HOVER_BORDER) } else { (TILE_FILL, TILE_BORDER) };
     r.fill_rounded_rect(rc, TILE_RADIUS, fill)?;
+    r.fill_rounded_rect_gradient(
+        rc,
+        TILE_RADIUS,
+        if hovered { 0xFFFF_FF24 } else { 0xFFFF_FF12 },
+        if hovered { 0xFFFF_FF0D } else { 0xFFFF_FF05 },
+    )?;
     r.stroke_rounded_rect(rc, TILE_RADIUS, border, 1.0)
 }
 
@@ -214,7 +233,12 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
         }
         if let Some((d, stroke)) = t.glyph {
             // Provider logos are 24-unit SVG paths in white.
-            svgpath::draw_path(r, d, RectF { x: sq.x + 4.0, y: sq.y + 4.0, w: 14.0, h: 14.0 }, 24.0, 0xFFFF_FFFF, stroke)?;
+            let area = RectF { x: sq.x + 4.0, y: sq.y + 4.0, w: 14.0, h: 14.0 };
+            svgpath::draw_path(r, d, area, 24.0, 0xFFFF_FFFF, stroke)?;
+            if t.title == "Cursor" {
+                svgpath::draw_path(r, svgpath::CURSOR_CUBE_INNER, area, 24.0, 0xE8E8_E8FF, Some(1.2))?;
+                svgpath::draw_path(r, svgpath::CURSOR_CUBE_TOP, area, 24.0, 0xE8E8_E8D9, None)?;
+            }
         }
         text_x = sq.x + 22.0 + 6.0;
     }
@@ -266,8 +290,15 @@ fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
     r.draw_text_styled(&t.value, time, 11.0, 0xFFFF_FFFF, Align::Center, TextStyle::Bold)?;
 
     let row = RectF { x: rc.x + 4.0, y: time.y + time.h + 1.0, w: rc.w - 8.0, h: 12.0 };
-    r.draw_text(&t.title, row, 8.0, MUTED, Align::Left)?;
-    r.draw_text(&t.sub, row, 8.0, 0xFFFF_FFCC, Align::Right)
+    let date_w = 18.0_f32.min(row.w);
+    r.draw_text(&t.title, RectF { w: date_w, ..row }, 8.0, MUTED, Align::Left)?;
+    r.draw_text(
+        &t.sub,
+        RectF { x: row.x + date_w + 1.0, w: (row.w - date_w - 1.0).max(0.0), ..row },
+        8.5,
+        0xFFFF_FFCC,
+        Align::Right,
+    )
 }
 
 fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
@@ -292,6 +323,23 @@ fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<
         r.fill_rounded_rect(RectF { x, y, w: cell, h: cell }, 1.5, color)?;
     }
     Ok(())
+}
+
+fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    const WAVE: [f32; 14] = [5.0, 9.0, 15.0, 7.0, 18.0, 11.0, 4.0, 13.0, 17.0, 8.0, 14.0, 5.0, 10.0, 16.0];
+    for (i, full) in WAVE.iter().enumerate() {
+        let h = if t.progress.is_some() { *full } else { 4.0 };
+        r.fill_rounded_rect(
+            RectF { x: rc.x + 7.0 + i as f32 * 4.0, y: rc.y + (rc.h - h) / 2.0, w: 2.0, h },
+            1.0,
+            if t.progress.is_some() { 0xC7A6_FFFF } else { 0xC7A6_FF8C },
+        )?;
+    }
+    let x = rc.x + 65.0;
+    let w = (rc.x + rc.w - 7.0 - x).max(0.0);
+    r.draw_text_styled(&t.title, RectF { x, y: rc.y + 4.0, w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(&t.sub, RectF { x, y: rc.y + 18.0, w, h: 11.0 }, 8.5, MUTED, Align::Left)
 }
 
 fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {

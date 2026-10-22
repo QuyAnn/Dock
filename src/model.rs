@@ -12,4 +12,12 @@ pub struct WindowEntry { pub hwnd: isize, pub title: String, pub exe: String, pu
 pub struct GitDay { pub date: String, pub commits: u32 }
 
 #[derive(Clone, Debug, Default)]
-pub struct AiUsage { pub name: String, pub session_pct: f32, pub reset_text: String }
+pub struct AiWindow { pub label: String, pub used_pct: f32, pub reset_text: String }
+
+#[derive(Clone, Debug, Default)]
+pub struct AiUsage {
+    pub name: String,
+    pub session_pct: f32,
+    pub reset_text: String,
+    pub windows: Vec<AiWindow>,
+}

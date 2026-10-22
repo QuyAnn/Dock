@@ -21,6 +21,12 @@ use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDev
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
+use windows::Win32::System::Registry::{
+    RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD,
+};
+use windows::core::w;
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::model::Media;
 
@@ -29,6 +35,53 @@ pub enum MediaAction {
     PlayPause,
     Next,
     Previous,
+}
+
+const PERSONALIZE: windows::core::PCWSTR =
+    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+
+pub fn dark_mode() -> bool {
+    let mut value = 1u32;
+    let mut bytes = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PERSONALIZE,
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut bytes),
+        )
+    };
+    status.is_ok() && value == 0
+}
+
+pub fn set_dark_mode(dark: bool) -> Result<()> {
+    let value = if dark { 0u32 } else { 1u32 };
+    unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            PERSONALIZE,
+            w!("AppsUseLightTheme"),
+            REG_DWORD.0,
+            Some((&value as *const u32).cast()),
+            std::mem::size_of::<u32>() as u32,
+        )
+        .ok()
+    }
+}
+
+pub fn open_settings(page: &str) -> Result<()> {
+    let uri = windows::core::HSTRING::from(page);
+    let result = unsafe {
+        ShellExecuteW(None, w!("open"), &uri, None, None, SW_SHOWNORMAL)
+    };
+    if result.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err(E_FAIL.into())
+    }
 }
 
 thread_local! {

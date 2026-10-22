@@ -17,19 +17,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect,
-    KillTimer, RegisterClassExW, SetTimer, ShowWindow,
-    SW_SHOWNOACTIVATE, WM_LBUTTONUP, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    KillTimer, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_LBUTTONUP, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
 use super::dock::RectF;
-use super::renderer::{apply_acrylic, Renderer};
+use super::renderer::{apply_acrylic, apply_rounded_region, Renderer};
 use crate::win::dpi;
 
-const POPUP_W: f32 = 320.0;
 const GAP: f32 = 8.0;
 const MARGIN: f32 = 6.0;
-const RADIUS: f32 = 8.0;
+const RADIUS: f32 = 14.0;
 const TIMER_ID: usize = 1;
 const POLL_MS: u32 = 100;
 
@@ -70,16 +69,46 @@ pub fn set_painter(f: fn(&mut Renderer, RectF)) {
 
 /// Opens the popup above (or below, if the anchor is in the top half) `anchor`, centered on it.
 /// `anchor` and the result are in screen coordinates. Replaces any open popup.
-pub fn show(anchor: RectF, height: i32) -> Result<()> {
+pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
     hide();
 
     let dpi = dpi::system_dpi();
-    let width_px = dpi::dip_to_px(POPUP_W, dpi);
+    let width_px = dpi::dip_to_px(width, dpi);
     let height_px = dpi::dip_to_px(height as f32, dpi);
     let monitor = monitor_rect(anchor);
     let rect = popup_rect_for(anchor, width_px, height_px, dpi, monitor);
 
     register_class();
+    let reused = POPUP.with(|p| {
+        let mut state = p.borrow_mut();
+        let Some(pw) = state.as_mut() else { return false };
+        pw.anchor = anchor;
+        pw.mouse_down = true;
+        pw.esc_down = true;
+        pw.renderer.resize(width_px, height_px, dpi);
+        unsafe {
+            let _ = SetWindowPos(
+                pw.hwnd,
+                HWND_TOPMOST,
+                rect.left,
+                rect.top,
+                width_px,
+                height_px,
+                SWP_NOACTIVATE,
+            );
+        }
+        apply_rounded_region(pw.hwnd, width_px, height_px, dpi::dip_to_px(RADIUS, dpi));
+        apply_acrylic(pw.hwnd, 0x8C28_282C);
+        unsafe {
+            let _ = ShowWindow(pw.hwnd, SW_SHOWNOACTIVATE);
+            SetTimer(pw.hwnd, TIMER_ID, POLL_MS, None);
+        }
+        true
+    });
+    if reused {
+        return Ok(());
+    }
+
     let hwnd = unsafe {
         // SAFETY: class is registered above; all string args are static literals.
         CreateWindowExW(
@@ -105,7 +134,8 @@ pub fn show(anchor: RectF, height: i32) -> Result<()> {
         mouse_down: true,
         esc_down: true,
     };
-    apply_acrylic(hwnd, 0x9E1E_1F24);
+    apply_rounded_region(hwnd, width_px, height_px, dpi::dip_to_px(RADIUS, dpi));
+    apply_acrylic(hwnd, 0x8C28_282C);
     POPUP.with(|p| *p.borrow_mut() = Some(pw));
 
     // SAFETY: hwnd is a live window owned by POPUP.
@@ -171,11 +201,17 @@ pub fn invalidate() {
     });
 }
 
-/// Destroys the popup and its D2D resources. No-op if nothing is open.
+/// Hides the persistent popup window. Keeping its HWND and D2D resources alive makes the next open
+/// a synchronous move/resize/show operation, matching the Electron fast path.
 pub fn hide() {
-    // Take it out first so Drop (which sends WM_DESTROY) never runs under a RefCell borrow.
-    let old = POPUP.with(|p| p.borrow_mut().take());
-    drop(old);
+    POPUP.with(|p| {
+        if let Some(pw) = p.borrow().as_ref() {
+            unsafe {
+                let _ = KillTimer(pw.hwnd, TIMER_ID);
+                let _ = ShowWindow(pw.hwnd, SW_HIDE);
+            }
+        }
+    });
 }
 
 fn hinstance() -> HINSTANCE {

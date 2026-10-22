@@ -6,7 +6,8 @@ use windows::Win32::Foundation::E_NOTIMPL;
 
 use super::dock::RectF;
 use super::renderer::{Align, Renderer, TextStyle};
-use crate::win::system;
+use crate::model::Media;
+use crate::win::system::{self, MediaAction};
 
 /// Snapshot of system state shown by the panel.
 #[derive(Clone, Debug, Default)]
@@ -16,6 +17,7 @@ pub struct ControlState {
     pub brightness: Option<u32>, // percent, None when DDC/CI is unsupported
     pub wifi: Option<bool>,     // None when there is no Wi-Fi radio
     pub bluetooth: Option<bool>, // None when there is no Bluetooth radio
+    pub dark: bool,
 }
 
 impl ControlState {
@@ -28,6 +30,7 @@ impl ControlState {
             brightness: system::get_brightness(),
             wifi: system::wifi_enabled(),
             bluetooth: system::bluetooth_enabled(),
+            dark: system::dark_mode(),
         }
     }
 }
@@ -39,6 +42,12 @@ pub enum ControlAction {
     SetBrightness(u32),
     ToggleWifi,
     ToggleBluetooth,
+    ToggleDark,
+    OpenNetworkSettings,
+    OpenSoundSettings,
+    MediaPrevious,
+    MediaPlayPause,
+    MediaNext,
 }
 
 /// Runs the system call for `action`. Blocking. Toggles re-read the live radio/mute state
@@ -59,18 +68,25 @@ pub fn apply(action: ControlAction) -> Result<()> {
             let on = system::bluetooth_enabled().ok_or_else(|| Error::from(E_NOTIMPL))?;
             system::set_bluetooth(!on)
         }
+        ControlAction::ToggleDark => system::set_dark_mode(!system::dark_mode()),
+        ControlAction::OpenNetworkSettings => system::open_settings("ms-settings:network-wifi"),
+        ControlAction::OpenSoundSettings => system::open_settings("ms-settings:sound"),
+        ControlAction::MediaPrevious => system::media_control(MediaAction::Previous),
+        ControlAction::MediaPlayPause => system::media_control(MediaAction::PlayPause),
+        ControlAction::MediaNext => system::media_control(MediaAction::Next),
     }
 }
 
 // ---------- layout (DIPs, relative to the panel rect) ----------
 // .cc: padding 9, gap 8. .cc-grid: 1.35fr / 1fr. Every card has a 1 px border, included in the offsets.
 
-/// Total panel height: 9 + 80 + 8 + 65 + 8 + 65 + 9.
-pub const HEIGHT: f32 = 244.0;
+/// Total panel height: main controls + brightness + volume + now playing.
+pub const HEIGHT: f32 = 340.0;
 const PAD: f32 = 9.0;
 const GAP: f32 = 8.0;
-const ROW1_H: f32 = 80.0; // .cc-conn and the square column
+const ROW1_H: f32 = 112.0; // connectivity column plus dark-mode mini and shortcut squares
 const CAP_H: f32 = 65.0; // .cc-cap
+const MEDIA_H: f32 = 56.0;
 const CARD_R: f32 = 14.0;
 const ROUND: f32 = 28.0; // .cc-round
 const CAP_INSET: f32 = 11.0; // 1 px border + 10 px padding
@@ -97,7 +113,8 @@ const GLYPH_BT: &str = "\u{E702}";
 const GLYPH_BRIGHTNESS: &str = "\u{E706}";
 const GLYPH_VOLUME: &str = "\u{E767}";
 const GLYPH_MUTE: &str = "\u{E74F}";
-const GLYPH_SETTINGS: &str = "\u{E713}";
+const GLYPH_NETWORK: &str = "\u{E968}";
+const GLYPH_MOON: &str = "\u{E708}";
 
 struct Layout {
     conn: RectF,
@@ -105,8 +122,10 @@ struct Layout {
     bluetooth: RectF,
     net: RectF,   // Mạng square
     sound: RectF, // Âm thanh square
+    dark: RectF,
     brightness: RectF,
     volume: RectF,
+    media: RectF,
 }
 
 fn layout(rect: RectF) -> Layout {
@@ -123,14 +142,17 @@ fn layout(rect: RectF) -> Layout {
     let sq_w = (right_w - GAP) / 2.0;
     let cap1 = row_y + ROW1_H + GAP;
     let cap2 = cap1 + CAP_H + GAP;
+    let media = cap2 + CAP_H + GAP;
     Layout {
         conn: RectF { x: x0, y: row_y, w: left_w, h: ROW1_H },
         wifi: toggle(row_y + 9.0),
         bluetooth: toggle(row_y + 9.0 + ROUND + 6.0),
-        net: RectF { x: right_x, y: row_y, w: sq_w, h: ROW1_H },
-        sound: RectF { x: right_x + sq_w + GAP, y: row_y, w: sq_w, h: ROW1_H },
+        dark: RectF { x: right_x, y: row_y, w: right_w, h: 32.0 },
+        net: RectF { x: right_x, y: row_y + 40.0, w: sq_w, h: ROW1_H - 40.0 },
+        sound: RectF { x: right_x + sq_w + GAP, y: row_y + 40.0, w: sq_w, h: ROW1_H - 40.0 },
         brightness: RectF { x: x0, y: cap1, w, h: CAP_H },
         volume: RectF { x: x0, y: cap2, w, h: CAP_H },
+        media: RectF { x: x0, y: media, w, h: MEDIA_H },
     }
 }
 
@@ -151,7 +173,8 @@ fn icon_of(s: RectF) -> RectF {
 
 /// Fraction 0..1 for pointer x on the capsule. The thumb center travels from s.x+11 to s.x+w-11.
 fn value_at(s: RectF, x: f32) -> f32 {
-    ((x - (s.x + THUMB / 2.0)) / (s.w - THUMB)).clamp(0.0, 1.0)
+    let track = RectF { x: s.x + 24.0, w: (s.w - 24.0).max(THUMB), ..s };
+    ((x - (track.x + THUMB / 2.0)) / (track.w - THUMB).max(1.0)).clamp(0.0, 1.0)
 }
 
 fn contains(r: RectF, x: f32, y: f32) -> bool {
@@ -219,12 +242,17 @@ fn draw_cap(r: &mut Renderer, card: RectF, title: &str, value: &str) -> Result<(
 /// Thumb-style capsule (`.cc-slider`): white fill to `frac`, white thumb circle, glyph at left.
 fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, glyph: &str) -> Result<()> {
     let k = if enabled { 1.0 } else { 0.4 };
-    let x0 = s.x + THUMB / 2.0;
-    let span = s.w - THUMB;
+    let track = RectF { x: s.x + 24.0, w: (s.w - 24.0).max(THUMB), ..s };
+    let x0 = track.x + THUMB / 2.0;
+    let span = track.w - THUMB;
     let end = x0 + span * frac.clamp(0.0, 1.0);
-    r.fill_rect(RectF { x: x0, y: s.y, w: span, h: s.h }, fade(TRACK, k))?;
+    r.fill_rounded_rect(track, track.h / 2.0, fade(TRACK, k))?;
     if end > x0 {
-        r.fill_rect(RectF { x: x0, y: s.y, w: end - x0, h: s.h }, fade(FILL, k))?;
+        r.fill_rounded_rect(
+            RectF { x: track.x, y: track.y, w: end - track.x, h: track.h },
+            track.h / 2.0,
+            fade(FILL, k),
+        )?;
     }
     // Thumb: no drop shadow (the CSS box-shadow is not drawn).
     r.fill_rounded_rect(RectF { x: end - THUMB / 2.0, y: s.y, w: THUMB, h: THUMB }, THUMB / 2.0, fade(WHITE, k))?;
@@ -240,7 +268,7 @@ fn radio_sub(v: Option<bool>) -> &'static str {
 }
 
 /// Draws the whole panel into `rect`.
-pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState) -> Result<()> {
+pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&Media>) -> Result<()> {
     let l = layout(rect);
 
     // Connectivity card.
@@ -271,8 +299,13 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState) -> Result<()> {
         },
     )?;
 
-    draw_square(r, l.net, GLYPH_SETTINGS, "Mạng")?;
+    draw_square(r, l.net, GLYPH_NETWORK, "Mạng")?;
     draw_square(r, l.sound, GLYPH_VOLUME, "Âm thanh")?;
+    r.fill_rounded_rect(l.dark, CARD_R, CARD)?;
+    r.stroke_rounded_rect(l.dark, CARD_R, CARD_BORDER, 1.0)?;
+    let moon = RectF { x: l.dark.x + 7.0, y: l.dark.y + 2.0, w: 28.0, h: 28.0 };
+    draw_round(r, moon, GLYPH_MOON, 14.0, state.dark, 1.0, 1.0)?;
+    r.draw_text("Chế độ tối", RectF { x: moon.x + 36.0, y: l.dark.y, w: l.dark.w - 45.0, h: l.dark.h }, 10.5, TEXT, Align::Left)?;
 
     // Brightness: unsupported shows the note and a disabled, empty capsule.
     let (br_frac, br_text) = match state.brightness {
@@ -287,7 +320,33 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState) -> Result<()> {
     let vol_text = if state.muted { "Đã tắt tiếng".to_string() } else { format!("{}%", (vol * 100.0).round() as u32) };
     draw_cap(r, l.volume, "Âm thanh", &vol_text)?;
     let glyph = if state.muted { GLYPH_MUTE } else { GLYPH_VOLUME };
-    draw_capsule(r, slider_of(l.volume), vol, true, glyph)
+    draw_capsule(r, slider_of(l.volume), vol, true, glyph)?;
+
+    draw_now_playing(r, l.media, media)
+}
+
+fn media_buttons(card: RectF) -> [RectF; 3] {
+    let x = card.x + card.w - 3.0 * 28.0 - 10.0;
+    [0.0, 1.0, 2.0].map(|i| RectF { x: x + i * 28.0, y: card.y + 14.0, w: 28.0, h: 28.0 })
+}
+
+fn draw_now_playing(r: &mut Renderer, card: RectF, media: Option<&Media>) -> Result<()> {
+    r.fill_rounded_rect(card, CARD_R, CARD)?;
+    r.stroke_rounded_rect(card, CARD_R, CARD_BORDER, 1.0)?;
+    let art = RectF { x: card.x + 8.0, y: card.y + 8.0, w: 40.0, h: 40.0 };
+    r.fill_rounded_rect_gradient(art, 8.0, 0xFF5F_6DFF, 0xFFC3_71FF)?;
+    r.draw_text("♪", art, 18.0, WHITE, Align::Center)?;
+    let has = media.is_some_and(|m| !m.title.is_empty());
+    let title = media.filter(|_| has).map_or("Không có gì đang phát", |m| m.title.as_str());
+    let artist = media.filter(|_| has).map_or("", |m| m.artist.as_str());
+    let text = RectF { x: art.x + art.w + 10.0, y: card.y + 9.0, w: (card.w - 196.0).max(40.0), h: 18.0 };
+    r.draw_text_styled(title, text, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(artist, RectF { y: text.y + 18.0, h: 15.0, ..text }, 10.5, SUB, Align::Left)?;
+    let glyphs = ["\u{E892}", if media.is_some_and(|m| m.playing) { "\u{E769}" } else { "\u{E768}" }, "\u{E893}"];
+    for (button, glyph) in media_buttons(card).into_iter().zip(glyphs) {
+        r.draw_text_styled(glyph, button, 13.0, fade(TEXT, if has { 1.0 } else { 0.35 }), Align::Center, TextStyle::Icon)?;
+    }
+    Ok(())
 }
 
 // ---------- hit testing ----------
@@ -301,6 +360,15 @@ pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Con
     if contains(l.bluetooth, x, y) {
         return state.bluetooth.map(|_| ControlAction::ToggleBluetooth);
     }
+    if contains(l.dark, x, y) {
+        return Some(ControlAction::ToggleDark);
+    }
+    if contains(l.net, x, y) {
+        return Some(ControlAction::OpenNetworkSettings);
+    }
+    if contains(l.sound, x, y) {
+        return Some(ControlAction::OpenSoundSettings);
+    }
     let vol = slider_of(l.volume);
     if contains(icon_of(vol), x, y) {
         return Some(ControlAction::ToggleMute);
@@ -312,6 +380,15 @@ pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Con
     if state.brightness.is_some() && contains(br, x, y) {
         let p = value_at(br, x) * 100.0;
         return Some(ControlAction::SetBrightness(p.round() as u32));
+    }
+    for (button, action) in media_buttons(l.media).into_iter().zip([
+        ControlAction::MediaPrevious,
+        ControlAction::MediaPlayPause,
+        ControlAction::MediaNext,
+    ]) {
+        if contains(button, x, y) {
+            return Some(action);
+        }
     }
     None
 }

@@ -75,7 +75,13 @@ pub struct AppsState {
 impl AppsState {
     /// Re-reads open windows, sets their attention flags and loads any missing icons.
     pub fn refresh(&mut self, attention: &Attention) {
-        self.windows = list_windows();
+        // EnumWindows is z-order based, so activating an app otherwise moves its icon. Keep the
+        // first-seen order from the TS implementation and append only genuinely new windows.
+        let previous: HashMap<isize, usize> =
+            self.windows.iter().enumerate().map(|(i, w)| (w.hwnd, i)).collect();
+        let mut fresh: Vec<(usize, WindowEntry)> = list_windows().into_iter().enumerate().collect();
+        fresh.sort_by_key(|(seen, w)| (previous.get(&w.hwnd).copied().unwrap_or(usize::MAX), *seen));
+        self.windows = fresh.into_iter().map(|(_, w)| w).collect();
         for w in &mut self.windows {
             w.attention = attention.contains(w.hwnd);
         }
