@@ -28,6 +28,8 @@ const MUTED: u32 = 0xFFFF_FF8C; // rgba(255,255,255,.55)
 const RING_TRACK: u32 = 0xFFFF_FF33; // rgba(255,255,255,.20) — visible grey track behind accent arc
 const BTN_FILL: u32 = 0xFFFF_FF12; // .cc-btn background, rgba(255,255,255,.07)
 const BTN_BORDER: u32 = 0xFFFF_FF14; // rgba(255,255,255,.08)
+const NO_BACKDROP_TOP: u32 = 0x6E68_62FF;
+const NO_BACKDROP_BOTTOM: u32 = 0x5A55_50FF;
 const CLOCK_TOP: u32 = 0xFF5A_3CFF;
 const CLOCK_BOTTOM: u32 = 0xE832_1EFF;
 const HM_EMPTY: u32 = 0xFFFF_FF14; // .hm.l0
@@ -222,8 +224,11 @@ pub fn draw_dock(
     let bar = RectF { x: 0.0, y: 0.0, w, h: DOCK_H };
     // The wallpaper blur is the backdrop. The readable smoky tint must sit above it, not below
     // an opaque bitmap where it would disappear.
-    if let Some(b) = backdrop {
-        r.draw_bitmap(b.w, b.h, &b.rgba, bar)?;
+    match backdrop {
+        Some(b) => r.draw_bitmap(b.w, b.h, &b.rgba, bar)?,
+        // No wallpaper crop yet: the HWND target has no real alpha, so a transparent clear
+        // shows as black. Paint a neutral mid-tone glass base instead of a near-black bar.
+        None => r.fill_top_rounded_rect_gradient(bar, BAR_RADIUS, NO_BACKDROP_TOP, NO_BACKDROP_BOTTOM)?,
     }
     let tint = glass_fill_color(opacity_pct);
     // Flush to the monitor edge: round only the top corners. Rounding the bottom lets a few

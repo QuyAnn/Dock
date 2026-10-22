@@ -209,33 +209,17 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> BOOL {
 }
 
 fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
+    let liquid_shared = shared.clone();
     thread::spawn(move || {
         let mut tick: u64 = 0;
+        let mut have = false;
         loop {
-            // Control state every 2 s (volume, mute, radios, brightness).
-            if tick % 2 == 0 {
-                let c = ControlState::read();
-                *shared.control.lock().unwrap() = c;
-            }
-            // Media every 3 s.
-            if tick % 3 == 0 {
-                let mut local = shared.data.lock().unwrap().clone();
-                local.refresh_media();
-                *shared.data.lock().unwrap() = local;
-            }
-            // Git, AI usage and weather every 10 min (first pass runs immediately).
-            if tick % 600 == 0 || shared.refresh_slow.swap(false, Ordering::SeqCst) {
-                let current = shared.settings.lock().unwrap().clone();
-                let repos = if current.git_folders.is_empty() { default_repos() } else { current.git_folders };
-                let mut local = shared.data.lock().unwrap().clone();
-                local.refresh_slow(&repos, &current.git_author, &current.weather_location);
-                *shared.data.lock().unwrap() = local;
-            }
             // Liquid Glass backdrop: one crop per monitor, refreshed when wallpaper/topology changes.
-            if tick % 15 == 0
-                && (tick == 0
-                    || shared.refresh_liquid.swap(false, Ordering::SeqCst)
-                    || wallpaper::wallpaper_changed())
+            // Own thread: the slow pass (git/AI/weather over the network) used to run first and
+            // left the bar as bare black + tint for many seconds after every start.
+            if (!have && tick % 20 == 0)
+                || liquid_shared.refresh_liquid.swap(false, Ordering::SeqCst)
+                || (tick % 15 == 0 && wallpaper::wallpaper_changed())
             {
                 let virtual_screen = RECT {
                     left: unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) },
@@ -300,11 +284,39 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
                             );
                         }
                         let n = map.len();
-                        *shared.liquid.lock().unwrap() = map;
+                        *liquid_shared.liquid.lock().unwrap() = map;
+                        have = n > 0;
                         log(&format!("liquid backdrop rendered for {n} monitor(s)"));
                     }
                     Err(e) => log(&format!("wallpaper load failed: {e}")),
                 }
+            }
+            tick += 1;
+            // Poll fast until the first backdrop exists, then once a second.
+            thread::sleep(Duration::from_millis(if have { 1000 } else { 250 }));
+        }
+    });
+    thread::spawn(move || {
+        let mut tick: u64 = 0;
+        loop {
+            // Control state every 2 s (volume, mute, radios, brightness).
+            if tick % 2 == 0 {
+                let c = ControlState::read();
+                *shared.control.lock().unwrap() = c;
+            }
+            // Media every 3 s.
+            if tick % 3 == 0 {
+                let mut local = shared.data.lock().unwrap().clone();
+                local.refresh_media();
+                *shared.data.lock().unwrap() = local;
+            }
+            // Git, AI usage and weather every 10 min (first pass runs immediately).
+            if tick % 600 == 0 || shared.refresh_slow.swap(false, Ordering::SeqCst) {
+                let current = shared.settings.lock().unwrap().clone();
+                let repos = if current.git_folders.is_empty() { default_repos() } else { current.git_folders };
+                let mut local = shared.data.lock().unwrap().clone();
+                local.refresh_slow(&repos, &current.git_author, &current.weather_location);
+                *shared.data.lock().unwrap() = local;
             }
             tick += 1;
             thread::sleep(Duration::from_secs(1));
@@ -947,6 +959,8 @@ fn liquid_for(map: &HashMap<(i32, i32, i32, i32), Arc<LiquidBitmap>>, mon: RECT)
             x1 > x0 && y1 > y0
         })
         .map(|(_, bmp)| bmp.clone())
+        // A crop from another monitor still beats a black bar until topology catches up.
+        .or_else(|| map.values().next().cloned())
 }
 
 fn repaint() {
