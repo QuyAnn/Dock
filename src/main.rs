@@ -14,8 +14,8 @@ use std::thread;
 use std::time::Duration;
 
 use chrono::{Datelike, Local};
-use windows::core::w;
-use windows::Win32::Foundation::{GetLastError, BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{GetLastError, BOOL, E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -167,6 +167,31 @@ fn start_background_refresh(shared: Arc<Shared>) {
     });
 }
 
+/// Creates the dock window. Tries the full dock style first, then plainer styles, logging each attempt.
+fn create_dock_window(hinst: HINSTANCE, class: PCWSTR, screen_w: i32, screen_h: i32) -> windows::core::Result<HWND> {
+    let y = screen_h - DOCK_HEIGHT;
+    let attempts = [
+        ("dock", WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, WS_POPUP, 0, y, screen_w, DOCK_HEIGHT),
+        ("plain popup", WINDOW_EX_STYLE(0), WS_POPUP, 0, y, screen_w, DOCK_HEIGHT),
+        ("overlapped", WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW, 100, 100, 400, 200),
+    ];
+    for (name, ex, style, x, y, w, h) in attempts {
+        // SAFETY: class is registered by the caller; all string args are static literals.
+        let res = unsafe { CreateWindowExW(ex, class, w!("SmartDock"), style, x, y, w, h, None, None, hinst, None) };
+        match res {
+            Ok(hwnd) if !hwnd.is_invalid() => {
+                log(&format!("window '{name}' created"));
+                return Ok(hwnd);
+            }
+            _ => {
+                let err = unsafe { GetLastError() };
+                log(&format!("window '{name}' failed, last_error={err:?}"));
+            }
+        }
+    }
+    Err(windows::core::Error::new(E_FAIL, "CreateWindowExW failed for every style"))
+}
+
 fn run() -> windows::core::Result<()> {
     log("start");
     let hinst: HINSTANCE = match unsafe { GetModuleHandleW(None) } {
@@ -193,30 +218,7 @@ fn run() -> windows::core::Result<()> {
 
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let hwnd = unsafe {
-        // SAFETY: class is registered above; the window is never activated (WS_EX_NOACTIVATE).
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-            class,
-            w!("SmartDock"),
-            WS_POPUP,
-            0,
-            screen_h - DOCK_HEIGHT,
-            screen_w,
-            DOCK_HEIGHT,
-            None,
-            None,
-            hinst,
-            None,
-        )
-    };
-    let hwnd = match hwnd {
-        Ok(h) => h,
-        Err(e) => {
-            log(&format!("CreateWindowExW failed: {e} last_error={:?}", unsafe { GetLastError() }));
-            return Err(e);
-        }
-    };
+    let hwnd = create_dock_window(hinst, class, screen_w, screen_h)?;
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
     log("window created");
