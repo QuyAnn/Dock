@@ -470,10 +470,8 @@ fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resu
 }
 
 fn draw_start(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
-    if hovered {
-        r.fill_rounded_rect(rc, 10.0, 0xFFFF_FF20)?;
-        r.stroke_rounded_rect(rc, 10.0, 0xFFFF_FF2E, 1.0)?;
-    }
+    // Liquid-glass plate — same helper / radius as centre app icon plates.
+    super::glass::draw_liquid_plate(r, rc, super::glass::PLATE_RADIUS, hovered)?;
     let d = 8.0;
     let gap = 1.5;
     let total = d * 2.0 + gap;

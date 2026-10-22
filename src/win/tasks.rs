@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::model::WindowEntry;
+use crate::win::icons::{aumid_from_hwnd, SETTINGS_AUMID};
 
 /// Shell window classes that are never listed.
 const SKIP_CLASSES: [&str; 4] = [
@@ -59,24 +60,24 @@ pub fn list_windows() -> Vec<WindowEntry> {
     }
     // CoreWindows may be enumerated after their frame: resolve remaining frames by title.
     for entry in &mut state.out {
-        if !is_frame_host(&entry.exe) {
-            continue;
-        }
-        if let Some(&pid) = state.core_by_title.get(&entry.title) {
-            let identity = process_identity(pid);
-            if !identity.0.is_empty() && !is_frame_host(&identity.0) {
-                entry.exe = identity.0.clone();
-                if !identity.1.is_empty() {
-                    entry.aumid = identity.1;
-                }
-                if !identity.2.is_empty() {
-                    entry.package_path = identity.2;
-                }
-                if let Ok(mut memo) = FRAME_MEMO.lock() {
-                    memo.insert(entry.hwnd, identity.0);
+        if is_frame_host(&entry.exe) {
+            if let Some(&pid) = state.core_by_title.get(&entry.title) {
+                let identity = process_identity(pid);
+                if !identity.0.is_empty() && !is_frame_host(&identity.0) {
+                    entry.exe = identity.0.clone();
+                    if !identity.1.is_empty() {
+                        entry.aumid = identity.1;
+                    }
+                    if !identity.2.is_empty() {
+                        entry.package_path = identity.2;
+                    }
+                    if let Ok(mut memo) = FRAME_MEMO.lock() {
+                        memo.insert(entry.hwnd, identity.0);
+                    }
                 }
             }
         }
+        fill_aumid(entry);
     }
     if let Ok(mut memo) = FRAME_MEMO.lock() {
         memo.retain(|hwnd, _| state.out.iter().any(|w| w.hwnd == *hwnd));
@@ -196,14 +197,35 @@ unsafe fn task_entry(hwnd: HWND, core_by_title: &HashMap<String, u32>) -> Option
             }
         }
     }
-    Some(WindowEntry {
+    let mut entry = WindowEntry {
         hwnd: hwnd.0 as isize,
         title,
         exe,
         aumid,
         package_path,
         attention: false,
-    })
+    };
+    fill_aumid(&mut entry);
+    Some(entry)
+}
+
+/// Prefer SHGetPropertyStoreForWindow, then known Settings AUMID for SystemSettings.exe.
+fn fill_aumid(entry: &mut WindowEntry) {
+    if entry.aumid.is_empty() {
+        if let Some(id) = aumid_from_hwnd(entry.hwnd) {
+            entry.aumid = id;
+        }
+    }
+    if entry.aumid.is_empty() && is_settings_exe(&entry.exe) {
+        entry.aumid = SETTINGS_AUMID.to_owned();
+    }
+}
+
+fn is_settings_exe(exe: &str) -> bool {
+    Path::new(exe)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("SystemSettings.exe"))
 }
 
 fn is_frame_host(exe: &str) -> bool {

@@ -18,6 +18,20 @@ const FILL_RGBA: u32 = 0xFFFF_FF1A;
 const BORDER_RGBA: u32 = 0xFFFF_FF2E;
 const BORDER_WIDTH: f32 = 1.0;
 
+/// Start / app icon plate: dark frosted glass (matches `.tile` / Start).
+/// rgba(44, 44, 48, .63) — same as dock `TILE_FILL`.
+pub const PLATE_FILL: u32 = 0x2C2C_30A1;
+/// Hover plate: slightly deeper frost.
+pub const PLATE_HOVER_FILL: u32 = 0x1E1E_23B8;
+/// Light rim on resting plates, rgba(255,255,255,.12).
+pub const PLATE_BORDER: u32 = 0xFFFF_FF1F;
+/// Light rim on hover, rgba(255,255,255,.18).
+pub const PLATE_HOVER_BORDER: u32 = 0xFFFF_FF2E;
+/// Corner radius of the Start tile (and app icon plates), DIP.
+pub const PLATE_RADIUS: f32 = 10.0;
+/// Start tile height / app plate edge length, DIP (matches `TILE_H`).
+pub const PLATE_SIZE: f32 = 34.0;
+
 /// Enables acrylic blur on the dock window, tinted by `opacity_pct` (0..=95 effective).
 /// If the API is missing, the window keeps only the CSS fallback.
 pub fn apply_dock_glass(hwnd: HWND, opacity_pct: u8) {
@@ -34,4 +48,22 @@ pub fn apply_dock_glass(hwnd: HWND, opacity_pct: u8) {
 pub fn draw_glass_fill(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
     r.fill_rounded_rect(rect, radius, FILL_RGBA)?;
     r.stroke_rounded_rect(rect, radius, BORDER_RGBA, BORDER_WIDTH)
+}
+
+/// Liquid-glass plate shared by the Start button and centre app icons:
+/// dark frosted fill, top sheen, light rim. No opaque white.
+pub fn draw_liquid_plate(r: &mut Renderer, rect: RectF, radius: f32, hovered: bool) -> Result<()> {
+    let (fill, border) = if hovered {
+        (PLATE_HOVER_FILL, PLATE_HOVER_BORDER)
+    } else {
+        (PLATE_FILL, PLATE_BORDER)
+    };
+    r.fill_rounded_rect(rect, radius, fill)?;
+    r.fill_rounded_rect_gradient(
+        rect,
+        radius,
+        if hovered { 0xFFFF_FF24 } else { 0xFFFF_FF14 },
+        if hovered { 0xFFFF_FF0D } else { 0xFFFF_FF05 },
+    )?;
+    r.stroke_rounded_rect(rect, radius, border, BORDER_WIDTH)
 }

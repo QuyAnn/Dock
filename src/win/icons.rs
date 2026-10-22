@@ -1,4 +1,4 @@
-//! App icons: exe -> 32x32 RGBA via the shell icon, cached per path.
+//! App icons: exe / AUMID -> 32x32 RGBA via shell AppsFolder, Appx logos, or SHGetFileInfo.
 use std::collections::HashMap;
 use std::iter::once;
 use std::mem::{size_of, zeroed};
@@ -6,11 +6,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
-use windows::core::{PCWSTR, Result};
-use windows::Win32::Foundation::{GENERIC_READ, HWND};
+use windows::core::{PCWSTR, Result, BSTR};
+use windows::Win32::Foundation::{GENERIC_READ, HWND, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    DeleteObject, GetDC, GetDIBits, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
-    HBITMAP, HDC, HGDIOBJ,
+    DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER,
+    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
 };
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICImagingFactory,
@@ -19,12 +19,29 @@ use windows::Win32::Graphics::Imaging::{
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
-use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
+use windows::Win32::UI::Shell::{
+    SHCreateItemFromParsingName, SHGetFileInfoW, IShellItemImageFactory, SHFILEINFOW, SHGFI_ICON,
+    SHGFI_LARGEICON, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+};
+use windows::Win32::UI::Shell::PropertiesSystem::{
+    IPropertyStore, PROPERTYKEY, SHGetPropertyStoreForWindow,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, GetIconInfo, GetSystemMetrics, HICON, ICONINFO, SM_CXICON, SM_CYICON,
 };
 
 const CACHE_LIMIT: usize = 128;
+const ICON_PX: i32 = 32;
+
+/// Inbox Settings AUMID used when SystemSettings.exe is resolved but process AUMID is empty.
+pub const SETTINGS_AUMID: &str =
+    "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel";
+
+/// PKEY_AppUserModel_ID — defined here to avoid the EnhancedStorage feature.
+const PKEY_APPUSERMODEL_ID: PROPERTYKEY = PROPERTYKEY {
+    fmtid: windows::core::GUID::from_u128(0x9f4c2855_9f79_4b39_a8d0_e1d42de1d5f3),
+    pid: 5,
+};
 
 #[derive(Clone, Debug)]
 pub struct IconBitmap {
@@ -36,16 +53,19 @@ pub struct IconBitmap {
 
 static CACHE: OnceLock<Mutex<HashMap<String, IconBitmap>>> = OnceLock::new();
 
-/// Shell icon of an exe as RGBA pixels. Successful results are cached (bounded to CACHE_LIMIT).
+/// Shell icon of an exe / packaged app as RGBA pixels. Successful results are cached.
 pub fn icon_for_exe(exe_path: &str, aumid: &str, package_path: &str) -> Option<IconBitmap> {
+    icon_for_window(0, exe_path, aumid, package_path)
+}
+
+/// Same as [`icon_for_exe`], but may read `PKEY_AppUserModel_ID` from `hwnd` when AUMID is empty.
+pub fn icon_for_window(hwnd: isize, exe_path: &str, aumid: &str, package_path: &str) -> Option<IconBitmap> {
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let frame_host = Path::new(exe_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.eq_ignore_ascii_case("ApplicationFrameHost.exe"));
+    let frame_host = is_frame_host(exe_path);
+    let resolved = resolve_aumid(hwnd, exe_path, aumid);
     // Prefer AUMID as cache key. Never key ApplicationFrameHost by its shared host path.
-    let key = if !aumid.is_empty() {
-        aumid.to_owned()
+    let key = if !resolved.is_empty() {
+        resolved.clone()
     } else if frame_host {
         format!("hwnd-frame:{exe_path}:{package_path}")
     } else {
@@ -54,16 +74,15 @@ pub fn icon_for_exe(exe_path: &str, aumid: &str, package_path: &str) -> Option<I
     if let Some(hit) = cache.lock().ok()?.get(&key).cloned() {
         return Some(hit);
     }
-    // Packaged/UWP: prefer AppxManifest Square44x44Logo. Skip the host exe's generic icon.
-    let icon = appx_icon(exe_path, package_path, aumid)
+    // Packaged/UWP: AppsFolder (scale/targetsize/plated) first; AppxManifest only after that fails.
+    let icon = apps_folder_icon(&resolved)
+        .filter(|b| !is_blank_white(b))
+        .or_else(|| appx_icon(exe_path, package_path, &resolved).filter(|b| !is_blank_white(b)))
         .or_else(|| if frame_host { None } else { extract(exe_path) })
         .or_else(|| {
-            // Settings hosted by ApplicationFrameHost often lacks a resolvable package path.
-            if looks_like_settings(aumid, exe_path) {
+            if looks_like_settings(&resolved, exe_path) {
                 generic_settings_icon()
-            } else if frame_host || !aumid.is_empty() {
-                // Never hide a UWP window — letter-tile fallback is drawn by apps.rs when
-                // icon_for_exe returns None, but a simple package glyph keeps the slot filled.
+            } else if frame_host || !resolved.is_empty() {
                 generic_uwp_icon()
             } else {
                 None
@@ -77,6 +96,45 @@ pub fn icon_for_exe(exe_path: &str, aumid: &str, package_path: &str) -> Option<I
     Some(icon)
 }
 
+/// AUMID from the window property store (works on ApplicationFrameHost frames).
+pub fn aumid_from_hwnd(hwnd: isize) -> Option<String> {
+    if hwnd == 0 {
+        return None;
+    }
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let store: IPropertyStore = SHGetPropertyStoreForWindow(HWND(hwnd as _)).ok()?;
+        let value = store.GetValue(&PKEY_APPUSERMODEL_ID).ok()?;
+        let bstr = BSTR::try_from(&value).ok()?;
+        let s = bstr.to_string().trim().to_owned();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+}
+
+fn resolve_aumid(hwnd: isize, exe_path: &str, aumid: &str) -> String {
+    if !aumid.is_empty() {
+        return aumid.to_owned();
+    }
+    if let Some(from_hwnd) = aumid_from_hwnd(hwnd) {
+        return from_hwnd;
+    }
+    if looks_like_settings("", exe_path) {
+        return SETTINGS_AUMID.to_owned();
+    }
+    String::new()
+}
+
+fn is_frame_host(exe_path: &str) -> bool {
+    Path::new(exe_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
+}
+
 fn looks_like_settings(aumid: &str, exe_path: &str) -> bool {
     let a = aumid.to_ascii_lowercase();
     a.contains("windows.immersivecontrolpanel")
@@ -85,6 +143,35 @@ fn looks_like_settings(aumid: &str, exe_path: &str) -> bool {
             .file_name()
             .and_then(|n| n.to_str())
             .is_some_and(|n| n.eq_ignore_ascii_case("SystemSettings.exe"))
+}
+
+/// `shell:AppsFolder\<AUMID>` via IShellItemImageFactory — preferred path for all UWPs.
+fn apps_folder_icon(aumid: &str) -> Option<IconBitmap> {
+    if aumid.is_empty() {
+        return None;
+    }
+    let path = format!("shell:AppsFolder\\{aumid}");
+    let wide: Vec<u16> = path.encode_utf16().chain(once(0)).collect();
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let factory: IShellItemImageFactory = SHCreateItemFromParsingName(
+            PCWSTR(wide.as_ptr()),
+            None::<&windows::Win32::System::Com::IBindCtx>,
+        )
+        .ok()?;
+        let hbmp = factory
+            .GetImage(
+                SIZE {
+                    cx: ICON_PX,
+                    cy: ICON_PX,
+                },
+                SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+            )
+            .ok()?;
+        let result = hbitmap_to_rgba(hbmp);
+        let _ = DeleteObject(HGDIOBJ(hbmp.0));
+        result
+    }
 }
 
 /// Simple gear glyph as RGBA when package logo discovery fails for Settings.
@@ -98,7 +185,6 @@ fn generic_settings_icon() -> Option<IconBitmap> {
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
             let r = (dx * dx + dy * dy).sqrt();
-            // Outer ring + hub — readable on dark dock glass.
             let on = (r > 8.0 && r < 12.5) || r < 4.0 || (dx.abs() < 2.2 && r < 13.0) || (dy.abs() < 2.2 && r < 13.0);
             let i = ((y * w + x) * 4) as usize;
             if on {
@@ -189,7 +275,6 @@ fn best_logo(configured: &Path) -> Option<PathBuf> {
             if !name.starts_with(&stem.to_ascii_lowercase()) || path.extension()?.to_string_lossy().to_ascii_lowercase() != "png" {
                 return None;
             }
-            // Prefer unplated target-size assets, then high-DPI scale assets, then the base logo.
             let score = if name.contains("targetsize-48") && name.contains("unplated") {
                 300
             } else if name.contains("targetsize-48") {
@@ -204,6 +289,28 @@ fn best_logo(configured: &Path) -> Option<PathBuf> {
         .collect();
     candidates.sort_by_key(|(score, _)| *score);
     candidates.pop().map(|(_, path)| path)
+}
+
+/// Reject opaque near-white bitmaps (bad Square44x44Logo / white plate) so callers can fall through.
+fn is_blank_white(icon: &IconBitmap) -> bool {
+    let mut opaque = 0u32;
+    let mut bright = 0u32;
+    for px in icon.rgba.chunks_exact(4) {
+        if px[3] < 200 {
+            continue;
+        }
+        opaque += 1;
+        let lum = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 255.0;
+        if lum > 0.92 {
+            bright += 1;
+        }
+    }
+    if opaque == 0 {
+        return true;
+    }
+    let coverage = opaque as f32 / (icon.w * icon.h) as f32;
+    let bright_share = bright as f32 / opaque as f32;
+    coverage > 0.85 && bright_share > 0.9
 }
 
 fn decode_image(path: &Path) -> Result<IconBitmap> {
@@ -238,7 +345,6 @@ fn decode_image(path: &Path) -> Result<IconBitmap> {
 
 fn extract(exe_path: &str) -> Option<IconBitmap> {
     let wide: Vec<u16> = exe_path.encode_utf16().chain(Some(0)).collect();
-    // SAFETY: `wide` is NUL-terminated and outlives the call; SHFILEINFOW is plain data.
     unsafe {
         let mut info: SHFILEINFOW = zeroed();
         let ok = SHGetFileInfoW(
@@ -257,12 +363,10 @@ fn extract(exe_path: &str) -> Option<IconBitmap> {
     }
 }
 
-/// Reads the colour and mask bitmaps of `hicon` into RGBA. Does not destroy the icon.
 unsafe fn decode(hicon: HICON) -> Option<IconBitmap> {
     let mut ii: ICONINFO = zeroed();
     GetIconInfo(hicon, &mut ii).ok()?;
     let (color, mask) = (ii.hbmColor, ii.hbmMask);
-    // Monochrome icons have no colour bitmap; they are skipped.
     let result = if color.is_invalid() {
         None
     } else {
@@ -273,6 +377,32 @@ unsafe fn decode(hicon: HICON) -> Option<IconBitmap> {
     }
     let _ = DeleteObject(HGDIOBJ(mask.0));
     result
+}
+
+unsafe fn hbitmap_to_rgba(hbmp: HBITMAP) -> Option<IconBitmap> {
+    let mut bm: BITMAP = zeroed();
+    if GetObjectW(HGDIOBJ(hbmp.0), size_of::<BITMAP>() as i32, Some((&mut bm as *mut BITMAP).cast())) == 0 {
+        return None;
+    }
+    let w = bm.bmWidth.max(0) as u32;
+    let h = bm.bmHeight.max(0) as u32;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let hdc = GetDC(HWND::default());
+    let mut bgra = vec![0u8; (w * h * 4) as usize];
+    let ok = read_pixels(hdc, hbmp, w, h, &mut bgra);
+    ReleaseDC(HWND::default(), hdc);
+    if !ok {
+        return None;
+    }
+    let has_alpha = bgra.chunks_exact(4).any(|p| p[3] != 0);
+    let mut rgba = Vec::with_capacity(bgra.len());
+    for p in bgra.chunks_exact(4) {
+        let a = if has_alpha { p[3] } else { 255 };
+        rgba.extend_from_slice(&[p[2], p[1], p[0], a]);
+    }
+    Some(IconBitmap { w, h, rgba })
 }
 
 unsafe fn read_rgba(color: HBITMAP, mask: HBITMAP) -> Option<IconBitmap> {
@@ -286,7 +416,6 @@ unsafe fn read_rgba(color: HBITMAP, mask: HBITMAP) -> Option<IconBitmap> {
     if !ok {
         return None;
     }
-    // Legacy icons have no alpha channel: opacity then comes from the AND mask (black = opaque).
     let has_alpha = bgra.chunks_exact(4).any(|p| p[3] != 0);
     let mut rgba = Vec::with_capacity(bgra.len());
     for (p, m) in bgra.chunks_exact(4).zip(mask_px.chunks_exact(4)) {
@@ -300,7 +429,6 @@ unsafe fn read_rgba(color: HBITMAP, mask: HBITMAP) -> Option<IconBitmap> {
     Some(IconBitmap { w, h, rgba })
 }
 
-/// Copies a bitmap into `out` as top-down 32-bit BGRA.
 unsafe fn read_pixels(hdc: HDC, bmp: HBITMAP, w: u32, h: u32, out: &mut [u8]) -> bool {
     let mut bmi: BITMAPINFO = zeroed();
     bmi.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;

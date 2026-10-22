@@ -10,10 +10,11 @@ use std::time::Instant;
 use windows::core::Result;
 
 use super::dock::{hit_test, RectF};
+use super::glass::{self, PLATE_RADIUS, PLATE_SIZE};
 use super::renderer::{Align, Renderer, TextStyle};
 use super::squircle::{drop_shadow, rounded_rect_alpha, shadow_pad, squircle_mask};
 use crate::model::WindowEntry;
-use crate::win::icons::{icon_for_exe, IconBitmap};
+use crate::win::icons::{icon_for_window, IconBitmap};
 use crate::win::tasks::{list_windows, Attention};
 
 const ICON: f32 = 30.0; // .ico / .sq size
@@ -92,7 +93,7 @@ impl AppsState {
             if w.exe.is_empty() || self.icons.contains_key(key) {
                 continue;
             }
-            if let Some(b) = icon_for_exe(&w.exe, &w.aumid, &w.package_path) {
+            if let Some(b) = icon_for_window(w.hwnd, &w.exe, &w.aumid, &w.package_path) {
                 self.icons.insert(key.to_owned(), AppIcon::new(b));
             }
         }
@@ -170,18 +171,34 @@ fn magnify(cx: f32, pointer: Option<f32>) -> f32 {
     }
 }
 
-/// Icon colour and shadow, drawn at the (possibly magnified) box `ico`.
+/// Liquid-glass plate matching the Start tile (size + corner radius), then the icon on top.
 fn draw_icon(r: &mut Renderer, icon: &AppIcon, ico: RectF) -> Result<()> {
+    draw_app_plate(r, ico)?;
     draw_shadow(r, &icon.shadow, icon.w, ico)?;
     r.draw_bitmap(icon.w, icon.h, &icon.rgba, ico)
 }
 
 /// Gradient tile with the uppercase initial, used until the icon is loaded.
 fn draw_fallback(r: &mut Renderer, ico: RectF, label: &str) -> Result<()> {
+    draw_app_plate(r, ico)?;
     draw_shadow(r, fallback_shadow(), FALLBACK_SRC, ico)?;
     let k = ico.w / ICON;
     r.fill_rounded_rect_gradient(ico, FALLBACK_RADIUS * ico.w, FALLBACK_TOP, FALLBACK_BOTTOM)?;
     r.draw_text_styled(label, ico, FALLBACK_FONT * k, WHITE, Align::Center, TextStyle::Bold)
+}
+
+/// Start-matching liquid-glass plate behind an app icon (`PLATE_SIZE` / `PLATE_RADIUS`, magnified).
+fn draw_app_plate(r: &mut Renderer, ico: RectF) -> Result<()> {
+    let k = ico.w / ICON;
+    let size = PLATE_SIZE * k;
+    let radius = PLATE_RADIUS * k;
+    let plate = RectF {
+        x: ico.x + (ico.w - size) / 2.0,
+        y: ico.y + (ico.h - size) / 2.0,
+        w: size,
+        h: size,
+    };
+    glass::draw_liquid_plate(r, plate, radius, false)
 }
 
 /// Source size used for the fallback shadow bitmap.

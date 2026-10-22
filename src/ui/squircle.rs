@@ -1,5 +1,9 @@
-//! macOS-style icon composition, a CPU port of squircle.ts, plus the `.sq` drop shadow.
+//! Icon composition for dock app tiles, plus the `.sq` drop shadow.
 //! Icons are composed once per exe and cached by the caller; nothing here runs per frame.
+//!
+//! Liquid-glass plates (dark frosted fill + light rim) are drawn at paint time by
+//! `glass::draw_liquid_plate` — same helper as the Start button — so this module never
+//! bakes an opaque white/light plate behind the glyph.
 
 /// Apple-like superellipse exponent (|u|^N + |v|^N = 1).
 const EXP: f32 = 5.0;
@@ -8,9 +12,10 @@ const SHADOW_SIGMA: f32 = 0.75;
 /// Opacity of `rgba(0,0,0,0.45)`.
 const SHADOW_ALPHA: f32 = 0.45;
 
-/// Composes an icon into the squircle shape: a full-bleed icon fills the mask, anything else sits
-/// at 70% on a white (or dark, for white glyphs) plate. Adds the top highlight and the hairline
-/// outline. Returns straight RGBA of the same size with alpha 0 outside the squircle.
+/// Composes an icon into the squircle shape with a transparent exterior.
+/// Full-bleed artwork fills the mask; everything else is centred at 70% with **no**
+/// opaque plate (the caller draws liquid glass behind it). Natural colours are kept.
+/// Returns straight RGBA of the same size with alpha 0 outside the squircle.
 pub fn squircle_mask(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
     let n = w as usize;
     if w != h || rgba.len() != n * n * 4 || n == 0 {
@@ -18,58 +23,42 @@ pub fn squircle_mask(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
     }
     let s = n as f32;
 
-    // Analysis, as in squircle.ts: opaque share, opaque at the four edge midpoints, mean luminance.
+    // Analysis, as in squircle.ts: opaque share, opaque at the four edge midpoints.
     let mut opaque = 0usize;
-    let mut lum = 0.0f32;
     for px in rgba.chunks_exact(4) {
         if px[3] > 200 {
             opaque += 1;
-            lum += (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 255.0;
         }
     }
     let at = |x: usize, y: usize| rgba[(y * n + x) * 4 + 3];
     let (mid, lo, hi) = (n / 2, (n / 32).max(1), n - (n / 32).max(1) - 1);
     let edges = [at(mid, lo), at(mid, hi), at(lo, mid), at(hi, mid)].iter().all(|&a| a > 200);
     let coverage = opaque as f32 / (n * n) as f32;
-    let mean_lum = if opaque > 0 { lum / opaque as f32 } else { 0.0 };
 
-    // Premultiplied float canvas, composited with source-over.
+    // Premultiplied float canvas, composited with source-over. Starts transparent —
+    // never fill a white / opaque plate here.
     let mut out = vec![[0.0f32; 4]; n * n];
     if coverage > 0.78 && edges {
         // Full-bleed artwork: over-scaled by 8% to hide its own corners.
         draw_scaled(&mut out, n, rgba, n, s * 1.08);
-    } else {
-        // Plate gradient: dark for white glyphs, light otherwise.
-        let (top, bottom) = if mean_lum > 0.82 {
-            ([0x3a, 0x3a, 0x40], [0x1c, 0x1c, 0x20])
-        } else {
-            ([0xff, 0xff, 0xff], [0xe3, 0xe3, 0xe8])
-        };
+        // Soft top sheen on full-bleed art only (plates get sheen from draw_liquid_plate).
+        let half = s * 0.5;
         for y in 0..n {
-            let t = (y as f32 + 0.5) / s;
-            let c = lerp3(top, bottom, t);
+            let t = (y as f32 + 0.5) / half;
+            if t >= 1.0 {
+                break;
+            }
+            let a = 0.14 * (1.0 - t);
             for x in 0..n {
-                out[y * n + x] = [c[0], c[1], c[2], 1.0];
+                composite(&mut out[y * n + x], [a, a, a, a]);
             }
         }
+    } else {
+        // Glyph / padded icon: sit at 70% on transparent — liquid glass is the plate.
         draw_scaled(&mut out, n, rgba, n, s * 0.7);
     }
 
-    // Top highlight: rgba(255,255,255,.22) fading to 0 over the upper half.
-    let half = s * 0.5;
-    for y in 0..n {
-        let t = (y as f32 + 0.5) / half;
-        if t >= 1.0 {
-            break;
-        }
-        let a = 0.22 * (1.0 - t);
-        for x in 0..n {
-            composite(&mut out[y * n + x], [a, a, a, a]);
-        }
-    }
-
-    // Clip to the squircle, then stroke a 1 px hairline on the edge (not clipped).
-    let lw = (s / 64.0).max(1.0);
+    // Clip to the squircle. No dark hairline — the glass plate supplies the light rim.
     let mut dst = Vec::with_capacity(n * n * 4);
     for y in 0..n {
         for x in 0..n {
@@ -79,8 +68,6 @@ pub fn squircle_mask(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
             for c in p.iter_mut() {
                 *c *= clip;
             }
-            let stroke = (lw / 2.0 - d.abs() + 0.5).clamp(0.0, 1.0) * 0.14;
-            composite(&mut p, [0.0, 0.0, 0.0, stroke]);
             let a = p[3];
             let (r, g, b) = if a > 0.0 {
                 (p[0] / a, p[1] / a, p[2] / a)
@@ -231,12 +218,6 @@ fn composite(dst: &mut [f32; 4], src: [f32; 4]) {
     for c in 0..4 {
         dst[c] = src[c] + dst[c] * inv;
     }
-}
-
-fn lerp3(a: [u8; 3], b: [u8; 3], t: f32) -> [f32; 3] {
-    let t = t.clamp(0.0, 1.0);
-    let mix = |i: usize| (a[i] as f32 + (b[i] as f32 - a[i] as f32) * t) / 255.0;
-    [mix(0), mix(1), mix(2)]
 }
 
 fn to_u8(v: f32) -> u8 {
