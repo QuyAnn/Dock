@@ -140,30 +140,47 @@ fn rounded(r: RectF, radius: f32) -> D2D1_ROUNDED_RECT {
 
 pub struct Renderer {
     hwnd: HWND,
-    w: u32,
-    h: u32,
+    pixel_w: u32,
+    pixel_h: u32,
+    dpi: u32,
     target: Option<ID2D1HwndRenderTarget>,
     brush: Option<ID2D1SolidColorBrush>,
 }
 
 impl Renderer {
     /// Lightweight: no Direct2D resources are created until the first draw.
-    pub fn new(hwnd: HWND, w: i32, h: i32) -> Self {
-        Self { hwnd, w: w.max(1) as u32, h: h.max(1) as u32, target: None, brush: None }
+    pub fn new(hwnd: HWND, pixel_w: i32, pixel_h: i32, dpi: u32) -> Self {
+        Self {
+            hwnd,
+            pixel_w: pixel_w.max(1) as u32,
+            pixel_h: pixel_h.max(1) as u32,
+            dpi: dpi.max(96),
+            target: None,
+            brush: None,
+        }
     }
 
+    /// Client size in device-independent pixels, matching all drawing coordinates.
     pub fn size(&self) -> (f32, f32) {
-        (self.w as f32, self.h as f32)
+        let scale = self.dpi as f32 / 96.0;
+        (self.pixel_w as f32 / scale, self.pixel_h as f32 / scale)
     }
 
-    pub fn resize(&mut self, w: i32, h: i32) {
-        self.w = w.max(1) as u32;
-        self.h = h.max(1) as u32;
+    pub fn dpi(&self) -> u32 {
+        self.dpi
+    }
+
+    pub fn resize(&mut self, pixel_w: i32, pixel_h: i32, dpi: u32) {
+        self.pixel_w = pixel_w.max(1) as u32;
+        self.pixel_h = pixel_h.max(1) as u32;
+        self.dpi = dpi.max(96);
         if let Some(rt) = &self.target {
-            let size = D2D_SIZE_U { width: self.w, height: self.h };
+            let size = D2D_SIZE_U { width: self.pixel_w, height: self.pixel_h };
             // SAFETY: `size` lives for the call.
             if unsafe { rt.Resize(&size) }.is_err() {
                 self.release();
+            } else {
+                unsafe { rt.SetDpi(self.dpi as f32, self.dpi as f32) };
             }
         }
     }
@@ -186,7 +203,7 @@ impl Renderer {
             };
             let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd: self.hwnd,
-                pixelSize: D2D_SIZE_U { width: self.w, height: self.h },
+                pixelSize: D2D_SIZE_U { width: self.pixel_w, height: self.pixel_h },
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
             let rt = unsafe {
@@ -195,6 +212,7 @@ impl Renderer {
             };
             let brush = unsafe {
                 // SAFETY: null brush properties are the documented default.
+                rt.SetDpi(self.dpi as f32, self.dpi as f32);
                 rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
                 rt.CreateSolidColorBrush(&color(0), None)?
             };

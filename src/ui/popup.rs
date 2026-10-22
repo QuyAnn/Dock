@@ -7,24 +7,28 @@ use std::sync::Once;
 
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetSystemMetrics, GetWindowRect,
-    KillTimer, RegisterClassExW, SetTimer, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect,
+    KillTimer, RegisterClassExW, SetTimer, ShowWindow,
     SW_SHOWNOACTIVATE, WM_LBUTTONUP, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
 use super::dock::RectF;
 use super::renderer::{apply_acrylic, Renderer};
+use crate::win::dpi;
 
-const POPUP_W: i32 = 320;
+const POPUP_W: f32 = 320.0;
 const GAP: f32 = 8.0;
-const MARGIN: i32 = 6;
+const MARGIN: f32 = 6.0;
 const RADIUS: f32 = 8.0;
 const TIMER_ID: usize = 1;
 const POLL_MS: u32 = 100;
@@ -69,16 +73,11 @@ pub fn set_painter(f: fn(&mut Renderer, RectF)) {
 pub fn show(anchor: RectF, height: i32) -> Result<()> {
     hide();
 
-    // SAFETY: plain metric queries.
-    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-    let cx = (anchor.x + anchor.w / 2.0) as i32;
-    let x = (cx - POPUP_W / 2).clamp(MARGIN, (sw - POPUP_W - MARGIN).max(MARGIN));
-    let below = anchor.y + anchor.h / 2.0 < sh as f32 / 2.0;
-    let y = (if below {
-        anchor.y + anchor.h + GAP
-    } else {
-        anchor.y - height as f32 - GAP
-    }) as i32;
+    let dpi = dpi::system_dpi();
+    let width_px = dpi::dip_to_px(POPUP_W, dpi);
+    let height_px = dpi::dip_to_px(height as f32, dpi);
+    let monitor = monitor_rect(anchor);
+    let rect = popup_rect_for(anchor, width_px, height_px, dpi, monitor);
 
     register_class();
     let hwnd = unsafe {
@@ -88,10 +87,10 @@ pub fn show(anchor: RectF, height: i32) -> Result<()> {
             w!("SmartDockPopup"),
             w!(""),
             WS_POPUP,
-            x,
-            y,
-            POPUP_W,
-            height,
+            rect.left,
+            rect.top,
+            width_px,
+            height_px,
             None,
             None,
             hinstance(),
@@ -101,7 +100,7 @@ pub fn show(anchor: RectF, height: i32) -> Result<()> {
     // Own the window before anything else can fail, so Drop destroys it on error.
     let pw = Popup {
         hwnd,
-        renderer: Renderer::new(hwnd, POPUP_W, height),
+        renderer: Renderer::new(hwnd, width_px, height_px, dpi),
         anchor,
         mouse_down: true,
         esc_down: true,
@@ -115,6 +114,48 @@ pub fn show(anchor: RectF, height: i32) -> Result<()> {
         SetTimer(hwnd, TIMER_ID, POLL_MS, None);
     }
     Ok(())
+}
+
+fn monitor_rect(anchor: RectF) -> RECT {
+    let point = POINT {
+        x: (anchor.x + anchor.w / 2.0).round() as i32,
+        y: (anchor.y + anchor.h / 2.0).round() as i32,
+    };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return info.rcMonitor;
+        }
+    }
+    let width = unsafe { windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+        windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
+    ) };
+    let height = unsafe { windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+        windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
+    ) };
+    RECT { left: 0, top: 0, right: width, bottom: height }
+}
+
+fn popup_rect_for(anchor: RectF, width: i32, height: i32, dpi: u32, monitor: RECT) -> RECT {
+    let margin = dpi::dip_to_px(MARGIN, dpi);
+    let gap = dpi::dip_to_px(GAP, dpi);
+    let min_x = monitor.left + margin;
+    let max_x = (monitor.right - width - margin).max(min_x);
+    let x = ((anchor.x + anchor.w / 2.0).round() as i32 - width / 2).clamp(min_x, max_x);
+    let below = anchor.y + anchor.h / 2.0 < (monitor.top + monitor.bottom) as f32 / 2.0;
+    let preferred_y = if below {
+        (anchor.y + anchor.h).round() as i32 + gap
+    } else {
+        anchor.y.round() as i32 - height - gap
+    };
+    let min_y = monitor.top + margin;
+    let max_y = (monitor.bottom - height - margin).max(min_y);
+    let y = preferred_y.clamp(min_y, max_y);
+    RECT { left: x, top: y, right: x + width, bottom: y + height }
 }
 
 /// Asks for a repaint of the open popup (e.g. after new sparkline samples). No-op if nothing is open.
@@ -175,8 +216,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let x = (lp.0 & 0xffff) as i16 as f32;
-            let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
+            let dpi = POPUP.with(|p| p.borrow().as_ref().map(|p| p.renderer.dpi()).unwrap_or(96));
+            let x = dpi::px_to_dip((lp.0 & 0xffff) as i16 as i32, dpi);
+            let y = dpi::px_to_dip(((lp.0 >> 16) & 0xffff) as i16 as i32, dpi);
             if let Some(f) = CLICK.with(Cell::get) {
                 f(x, y);
             }

@@ -37,11 +37,12 @@ use ui::renderer::Renderer;
 use ui::svgpath;
 use ui::tiles::{self, DataState};
 use win::appbar::{self, AbEdge};
+use win::dpi;
 use win::system::{self, MediaAction};
 use win::tasks::{self, Attention, ShellEvent};
 use win::wallpaper;
 
-const DOCK_HEIGHT: i32 = 56;
+const DOCK_HEIGHT: f32 = 56.0;
 const POPUP_W: f32 = 320.0;
 /// Height used when the popup content cannot be measured yet.
 const POPUP_H_DEFAULT: f32 = 260.0;
@@ -61,6 +62,7 @@ struct App {
     hwnd: HWND,
     /// Dock top-left in screen coordinates, for popup anchors.
     origin: (f32, f32),
+    dpi: u32,
     width: f32,
     renderer: Renderer,
     shared: Arc<Shared>,
@@ -104,6 +106,7 @@ fn default_repos() -> Vec<PathBuf> {
 }
 
 fn main() {
+    dpi::enable_per_monitor_v2();
     appbar::recover_from_previous_crash();
 
     // Restore the taskbar on any panic before the default hook prints.
@@ -153,7 +156,7 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> BOOL {
     std::process::exit(0);
 }
 
-fn start_background_refresh(shared: Arc<Shared>, screen: (i32, i32)) {
+fn start_background_refresh(shared: Arc<Shared>, screen: (i32, i32), dock_height_px: i32) {
     thread::spawn(move || {
         let repos = default_repos();
         let mut tick: u64 = 0;
@@ -179,7 +182,12 @@ fn start_background_refresh(shared: Arc<Shared>, screen: (i32, i32)) {
             if tick % 15 == 0 && (tick == 0 || wallpaper::wallpaper_changed()) {
                 match wallpaper::load(screen.0 as u32) {
                     Ok(wp) => {
-                        let bar = RectF { x: 0.0, y: 0.0, w: screen.0 as f32, h: DOCK_HEIGHT as f32 };
+                        let bar = RectF {
+                            x: 0.0,
+                            y: (screen.1 - dock_height_px) as f32,
+                            w: screen.0 as f32,
+                            h: dock_height_px as f32,
+                        };
                         let bitmap = liquid::render_liquid(&wp, bar, screen);
                         *shared.liquid.lock().unwrap() = Some(Arc::new(bitmap));
                         log("liquid backdrop rendered");
@@ -194,11 +202,17 @@ fn start_background_refresh(shared: Arc<Shared>, screen: (i32, i32)) {
 }
 
 /// Creates the dock window. Tries the full dock style first, then plainer styles, logging each attempt.
-fn create_dock_window(hinst: HINSTANCE, class: PCWSTR, screen_w: i32, screen_h: i32) -> windows::core::Result<HWND> {
-    let y = screen_h - DOCK_HEIGHT;
+fn create_dock_window(
+    hinst: HINSTANCE,
+    class: PCWSTR,
+    screen_w: i32,
+    screen_h: i32,
+    dock_height_px: i32,
+) -> windows::core::Result<HWND> {
+    let y = screen_h - dock_height_px;
     let attempts = [
-        ("dock", WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, WS_POPUP, 0, y, screen_w, DOCK_HEIGHT),
-        ("plain popup", WINDOW_EX_STYLE(0), WS_POPUP, 0, y, screen_w, DOCK_HEIGHT),
+        ("dock", WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, WS_POPUP, 0, y, screen_w, dock_height_px),
+        ("plain popup", WINDOW_EX_STYLE(0), WS_POPUP, 0, y, screen_w, dock_height_px),
         ("overlapped", WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW, 100, 100, 400, 200),
     ];
     let mut created = None;
@@ -248,15 +262,19 @@ fn run() -> windows::core::Result<()> {
 
     let screen_w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
     let screen_h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
-    let hwnd = create_dock_window(hinst, class, screen_w, screen_h)?;
+    let initial_height = dpi::dip_to_px(DOCK_HEIGHT, dpi::system_dpi());
+    let hwnd = create_dock_window(hinst, class, screen_w, screen_h, initial_height)?;
+    let dpi_value = dpi::window_dpi(hwnd);
+    let dock_height_px = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
-    let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, DOCK_HEIGHT)?;
+    let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, dock_height_px)?;
     log(&format!("appbar rect {:?}", (rect.left, rect.top, rect.right, rect.bottom)));
-    let width = (rect.right - rect.left) as f32;
+    let pixel_width = rect.right - rect.left;
+    let width = dpi::px_to_dip(pixel_width, dpi_value);
     unsafe {
         // SAFETY: hwnd is our live window.
-        let _ = SetWindowPos(hwnd, HWND_TOPMOST, rect.left, rect.top, width as i32, DOCK_HEIGHT, SWP_NOACTIVATE);
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_width, dock_height_px, SWP_NOACTIVATE);
     }
     appbar::hide_taskbar();
     glass::apply_dock_glass(hwnd, GLASS_OPACITY);
@@ -272,17 +290,18 @@ fn run() -> windows::core::Result<()> {
         control: Mutex::new(ControlState::read()),
         liquid: Mutex::new(None),
     });
-    start_background_refresh(shared.clone(), (screen_w, screen_h));
+    start_background_refresh(shared.clone(), (screen_w, screen_h), dock_height_px);
 
     let mut apps = AppsState::default();
     let attention = Attention::default();
     apps.refresh(&attention);
 
-    let renderer = Renderer::new(hwnd, width as i32, DOCK_HEIGHT);
+    let renderer = Renderer::new(hwnd, pixel_width, dock_height_px, dpi_value);
     APP.with(|a| {
         *a.borrow_mut() = Some(App {
             hwnd,
             origin: (rect.left as f32, rect.top as f32),
+            dpi: dpi_value,
             width,
             renderer,
             shared,
@@ -487,7 +506,13 @@ fn dock_click(x: f32, y: f32) -> Click {
         let Some((id, rect)) = app.tiles.iter().find(|(_, r)| dock::hit_test(x, y, &[*r]).is_some()).copied() else {
             return Click::None;
         };
-        let anchor = RectF { x: app.origin.0 + rect.x, y: app.origin.1, w: rect.w, h: DOCK_HEIGHT as f32 };
+        let scale = dpi::scale(app.dpi);
+        let anchor = RectF {
+            x: app.origin.0 + rect.x * scale,
+            y: app.origin.1,
+            w: rect.w * scale,
+            h: DOCK_HEIGHT * scale,
+        };
         match id {
             "apps" => apps::hit_app(x, y, rect, &app.apps).map_or(Click::None, Click::Activate),
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
@@ -643,6 +668,13 @@ fn on_shell_event(event: ShellEvent) {
     repaint();
 }
 
+fn client_point(lparam: LPARAM) -> (f32, f32) {
+    let x = (lparam.0 & 0xffff) as i16 as i32;
+    let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+    let dpi_value = APP.with(|a| a.borrow().as_ref().map(|app| app.dpi).unwrap_or(96));
+    (dpi::px_to_dip(x, dpi_value), dpi::px_to_dip(y, dpi_value))
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Returning TRUE from WM_NCCREATE tells Windows to continue creating the window. Letting
     // DefWindowProc answer it made CreateWindowExW fail for this window class.
@@ -686,8 +718,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let x = (lparam.0 & 0xffff) as i16 as f32;
-            let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
+            let (x, y) = client_point(lparam);
             let click = dock_click(x, y);
             log(&format!("click at ({x},{y}) -> {}", match &click {
                 Click::None => "none",
@@ -702,8 +733,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            let x = (lparam.0 & 0xffff) as i16 as f32;
-            let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
+            let (x, y) = client_point(lparam);
             // Ask for WM_MOUSELEAVE; Windows cancels the request after each leave.
             let mut tme = TRACKMOUSEEVENT {
                 cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
