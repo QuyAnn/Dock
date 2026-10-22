@@ -689,7 +689,8 @@ struct Zones {
 }
 
 fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
-    let apps_w = (16.0 + app_count as f32 * 38.0).max(72.0);
+    // Tight to the drawn slots: padding here would push the visible cluster off the centre.
+    let apps_w = apps::cluster_width(app_count);
     let t = |id, width| Tile { id, width, height: 0.0 };
     let mut left = Vec::new();
     let enabled = &settings.tiles;
@@ -708,7 +709,11 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     right.push(t("clock", 64.0));
     Zones {
         left,
-        center: vec![t("start", 38.0), Tile { id: "apps", width: apps_w, height: 44.0 }],
+        center: if app_count == 0 {
+            vec![t("start", 38.0)]
+        } else {
+            vec![t("start", 38.0), Tile { id: "apps", width: apps_w, height: 44.0 }]
+        },
         right,
     }
 }

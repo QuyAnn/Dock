@@ -198,6 +198,16 @@ pub fn icon_pixels(state: &AppsState, w: &WindowEntry) -> Option<IconBitmap> {
     state.icons.get(key).map(AppIcon::bitmap)
 }
 
+/// Exact width of `n` app slots (no side padding), so the centre cluster is measured by what
+/// is drawn and Start + icons sit symmetrically around the monitor centre.
+pub fn cluster_width(n: usize) -> f32 {
+    if n == 0 {
+        0.0
+    } else {
+        n as f32 * SLOT + (n - 1) as f32 * GAP
+    }
+}
+
 /// Slot rects for the first `n` windows that fit in `rect`, horizontally centered.
 fn slots(rect: RectF, n: usize) -> Vec<RectF> {
     let fit = ((rect.w + GAP) / PITCH).floor().max(0.0) as usize;

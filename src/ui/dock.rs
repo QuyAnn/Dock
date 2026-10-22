@@ -122,27 +122,21 @@ impl TileView {
     }
 }
 
-/// Places tiles in three zones. Center stays screen-centered; left/right expand toward it
-/// (extra space goes to flexible tiles like `media`) so the bar does not look sparse.
-/// Returns one rect per tile, in the order: left, center, right.
+/// Minimum clear space between a side zone and the centre cluster.
+pub const CENTER_GAP: f32 = 12.0;
+/// Media keeps at least this width before other left tiles are squeezed.
+const MEDIA_MIN_W: f32 = 150.0;
+
+/// Places tiles in three zones. Returns one rect per tile, in the order: left, center, right.
+///
+/// The centre cluster (Start + app icons) is centred on `screen_w / 2` exactly and never moves
+/// for the side zones: left/right tiles are clamped to stop `CENTER_GAP` short of it. When a
+/// side zone has spare room, the flexible tile (`media`) grows toward the cluster; when it is
+/// too wide, `media` shrinks first (down to `MEDIA_MIN_W`), then every tile scales down.
 pub fn layout(left: &[Tile], center: &[Tile], right: &[Tile], screen_w: f32) -> Vec<RectF> {
     let mut out = Vec::with_capacity(left.len() + center.len() + right.len());
-    let zone_w = |tiles: &[Tile]| -> f32 {
-        tiles.iter().map(|t| t.width).sum::<f32>() + ZONE_GAP * tiles.len().saturating_sub(1) as f32
-    };
-    // Extra width for tiles that should soak leftover side space toward the center cluster.
-    let flex_extra = |tiles: &[Tile], extra: f32, prefer: &str| -> Vec<f32> {
-        if extra <= 0.0 || tiles.is_empty() {
-            return tiles.iter().map(|t| t.width).collect();
-        }
-        let mut widths: Vec<f32> = tiles.iter().map(|t| t.width).collect();
-        if let Some(i) = tiles.iter().position(|t| t.id == prefer) {
-            widths[i] += extra;
-        } else if let Some(last) = widths.last_mut() {
-            *last += extra;
-        }
-        widths
-    };
+    let gaps = |n: usize| ZONE_GAP * n.saturating_sub(1) as f32;
+    let zone_w = |tiles: &[Tile]| -> f32 { tiles.iter().map(|t| t.width).sum::<f32>() + gaps(tiles.len()) };
     let place = |tiles: &[Tile], widths: &[f32], x: f32, out: &mut Vec<RectF>| {
         let mut x = x;
         for (t, &w) in tiles.iter().zip(widths) {
@@ -151,43 +145,59 @@ pub fn layout(left: &[Tile], center: &[Tile], right: &[Tile], screen_w: f32) -> 
             x += w + ZONE_GAP;
         }
     };
-    let fit_scale = |tiles: &[Tile], max_w: f32| -> Vec<f32> {
-        let gaps = ZONE_GAP * tiles.len().saturating_sub(1) as f32;
-        let widths = tiles.iter().map(|t| t.width).sum::<f32>();
-        let scale = if widths + gaps > max_w {
-            ((max_w - gaps).max(0.0) / widths.max(1.0)).min(1.0)
-        } else {
-            1.0
-        };
-        tiles.iter().map(|t| t.width * scale).collect()
-    };
 
     let center_w = zone_w(center);
     let center_x = (screen_w - center_w) / 2.0;
-    let side_w = (center_x - ROW_PAD - ROW_GAP).max(0.0);
-
-    let left_natural = zone_w(left);
-    let left_widths = if left_natural > side_w {
-        fit_scale(left, side_w)
+    let center_right = center_x + center_w;
+    let (left_max, right_max) = if center.is_empty() {
+        let half = (screen_w / 2.0 - ROW_PAD - CENTER_GAP / 2.0).max(0.0);
+        (half, half)
     } else {
-        flex_extra(left, side_w - left_natural, "media")
+        (
+            (center_x - CENTER_GAP - ROW_PAD).max(0.0),
+            (screen_w - ROW_PAD - CENTER_GAP - center_right).max(0.0),
+        )
     };
+
+    let left_widths = side_widths(left, left_max, true);
     place(left, &left_widths, ROW_PAD, &mut out);
     place(center, &center.iter().map(|t| t.width).collect::<Vec<_>>(), center_x, &mut out);
-
-    let right_natural = zone_w(right);
-    let right_widths = if right_natural > side_w {
-        fit_scale(right, side_w)
-    } else {
-        // Right packs to the trailing edge (clock / rings stay put). Leftover side glass is
-        // intentional; growing CC would make a huge Wi-Fi tile. Media on the left soaks its side.
-        right.iter().map(|t| t.width).collect()
-    };
-    let fitted_right_w: f32 =
-        right_widths.iter().sum::<f32>() + ZONE_GAP * right.len().saturating_sub(1) as f32;
-    let right_x = screen_w - ROW_PAD - fitted_right_w;
-    place(right, &right_widths, right_x, &mut out);
+    // Right packs to the trailing edge (clock / rings stay put); only media would grow there.
+    let right_widths = side_widths(right, right_max, false);
+    let fitted_right_w: f32 = right_widths.iter().sum::<f32>() + gaps(right.len());
+    place(right, &right_widths, screen_w - ROW_PAD - fitted_right_w, &mut out);
     out
+}
+
+/// Tile widths for one side zone so the zone fits in `max_w`. `grow` lets `media` soak spare room.
+fn side_widths(tiles: &[Tile], max_w: f32, grow: bool) -> Vec<f32> {
+    let mut widths: Vec<f32> = tiles.iter().map(|t| t.width).collect();
+    if tiles.is_empty() {
+        return widths;
+    }
+    let gaps = ZONE_GAP * tiles.len().saturating_sub(1) as f32;
+    let natural = widths.iter().sum::<f32>() + gaps;
+    let media = tiles.iter().position(|t| t.id == "media");
+    if natural <= max_w {
+        if let (true, Some(i)) = (grow, media) {
+            widths[i] += max_w - natural;
+        }
+        return widths;
+    }
+    let mut over = natural - max_w;
+    if let Some(i) = media {
+        let give = (widths[i] - MEDIA_MIN_W).max(0.0).min(over);
+        widths[i] -= give;
+        over -= give;
+    }
+    if over > 0.0 {
+        let total: f32 = widths.iter().sum();
+        let scale = ((total - over).max(0.0) / total.max(1.0)).clamp(0.0, 1.0);
+        for w in &mut widths {
+            *w *= scale;
+        }
+    }
+    widths
 }
 
 /// Index of the rect containing (x, y), if any.
@@ -489,4 +499,56 @@ fn draw_start(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(id: &'static str, width: f32) -> Tile {
+        Tile { id, width, height: 0.0 }
+    }
+
+    fn home_zones(apps: usize) -> (Vec<Tile>, Vec<Tile>, Vec<Tile>) {
+        let left = vec![t("git", 118.0), t("claude", 100.0), t("codex", 100.0), t("cursor", 155.0), t("grok", 100.0), t("media", 200.0)];
+        let center = vec![t("start", 38.0), Tile { id: "apps", width: super::super::apps::cluster_width(apps), height: 44.0 }];
+        let right = vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
+        (left, center, right)
+    }
+
+    #[test]
+    fn dock_layout_center_cluster_is_screen_centred() {
+        for &(w, apps) in &[(1920.0, 5), (1920.0, 1), (1536.0, 9), (2560.0, 12), (1280.0, 30)] {
+            let (l, c, r) = home_zones(apps);
+            let rects = layout(&l, &c, &r, w);
+            let first = rects[l.len()];
+            let last = rects[l.len() + c.len() - 1];
+            let mid = (first.x + last.x + last.w) / 2.0;
+            assert!((mid - w / 2.0).abs() < 0.01, "w={w} apps={apps} mid={mid}");
+        }
+    }
+
+    #[test]
+    fn dock_layout_sides_never_overlap_cluster() {
+        for &(w, apps) in &[(1920.0, 5), (1280.0, 12), (1024.0, 8)] {
+            let (l, c, r) = home_zones(apps);
+            let rects = layout(&l, &c, &r, w);
+            let left_end = rects[l.len() - 1].x + rects[l.len() - 1].w;
+            let c0 = rects[l.len()].x;
+            let c1 = rects[l.len() + c.len() - 1].x + rects[l.len() + c.len() - 1].w;
+            let right_start = rects[l.len() + c.len()].x;
+            assert!(c0 - left_end >= CENTER_GAP - 0.01, "w={w} left_end={left_end} c0={c0}");
+            assert!(right_start - c1 >= CENTER_GAP - 0.01, "w={w} c1={c1} right={right_start}");
+        }
+    }
+
+    #[test]
+    fn dock_layout_media_grows_up_to_cluster_gap() {
+        let (l, c, r) = home_zones(5);
+        let rects = layout(&l, &c, &r, 1920.0);
+        let media = rects[l.len() - 1];
+        let c0 = rects[l.len()].x;
+        assert!((c0 - (media.x + media.w) - CENTER_GAP).abs() < 0.01);
+        assert!(media.w >= 200.0);
+    }
 }
