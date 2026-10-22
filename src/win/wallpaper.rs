@@ -35,6 +35,7 @@ pub enum FitMode {
 /// Decoded wallpaper. `w`/`h` can be smaller than `orig_w`/`orig_h` (width is capped at load time),
 /// so placement must scale by `orig / w` for center/tile.
 pub struct WallpaperPixels {
+    pub source: PathBuf,
     pub w: u32,
     pub h: u32,
     /// Straight (non-premultiplied) RGBA, `w * h * 4` bytes.
@@ -71,6 +72,11 @@ pub fn wallpaper_changed() -> bool {
     current != seen
 }
 
+/// Path selected by the same discovery order as `load`, for diagnostics even if WIC decode fails.
+pub fn source_path() -> Option<PathBuf> {
+    current_source().map(|source| source.path)
+}
+
 /// Reads and decodes the current wallpaper. Width is capped to `max_w` (use the primary display
 /// width, at least 1920). Records the signature so `wallpaper_changed` reports false afterwards.
 /// Errors: no wallpaper file, or WIC cannot decode it.
@@ -82,17 +88,38 @@ pub fn load(max_w: u32) -> Result<WallpaperPixels> {
     }
     let Some(src) = source else { return Err(E_FAIL.into()) };
     let (w, h, orig_w, orig_h, rgba) = decode(&src.path, max_w)?;
-    Ok(WallpaperPixels { w, h, rgba, orig_w, orig_h, mode: src.mode, background: src.background })
+    Ok(WallpaperPixels {
+        source: src.path,
+        w,
+        h,
+        rgba,
+        orig_w,
+        orig_h,
+        mode: src.mode,
+        background: src.background,
+    })
 }
 
 fn current_source() -> Option<Source> {
-    let transcoded = std::env::var_os("APPDATA")
-        .map(|a| PathBuf::from(a).join("Microsoft").join("Windows").join("Themes").join("TranscodedWallpaper"));
-    let path = reg_string(w!("WallPaper"))
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-        .filter(|p| p.is_file())
-        .or_else(|| transcoded.filter(|p| p.is_file()))?;
+    let themes = std::env::var_os("APPDATA")
+        .map(|a| PathBuf::from(a).join("Microsoft").join("Windows").join("Themes"));
+    let desktop = reg_string(w!("WallPaper")).filter(|p| !p.is_empty()).map(PathBuf::from).filter(|p| p.is_file());
+    let history = reg_string_at(
+        w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Wallpapers"),
+        w!("BackgroundHistoryPath0"),
+    )
+    .filter(|p| !p.is_empty())
+    .map(PathBuf::from)
+    .filter(|p| p.is_file());
+    let transcoded = themes.as_ref().map(|d| d.join("TranscodedWallpaper")).filter(|p| p.is_file());
+    let generated = themes.as_ref().and_then(|d| newest_file(d, Some("Transcoded_")));
+    let cached = themes
+        .as_ref()
+        .map(|d| d.join("CachedFiles"))
+        .and_then(|d| newest_file(&d, Some("CachedImage_")));
+    // BackgroundHistoryPath0 is not guaranteed to be the image currently on screen. Prefer the
+    // transcoded/cached output that Windows updates for slideshow and Spotlight sessions.
+    let path = desktop.or(transcoded).or(generated).or(cached).or(history)?;
     let meta = std::fs::metadata(&path).ok()?;
     let style = reg_string(w!("WallpaperStyle")).unwrap_or_else(|| "10".into());
     let tile = reg_string(w!("TileWallpaper")).unwrap_or_else(|| "0".into());
@@ -130,6 +157,10 @@ fn parse_rgb(s: &str) -> Option<[u8; 3]> {
 
 /// Reads a REG_SZ value from HKCU\Control Panel\Desktop. None if missing or not a string.
 fn reg_string(name: PCWSTR) -> Option<String> {
+    reg_string_at(w!("Control Panel\\Desktop"), name)
+}
+
+fn reg_string_at(subkey: PCWSTR, name: PCWSTR) -> Option<String> {
     let mut buf = vec![0u16; 1024];
     let mut bytes = (buf.len() * 2) as u32;
     // SAFETY: the subkey and value name are static literals; `buf` holds `bytes` bytes and
@@ -137,7 +168,7 @@ fn reg_string(name: PCWSTR) -> Option<String> {
     let err = unsafe {
         RegGetValueW(
             HKEY_CURRENT_USER,
-            w!("Control Panel\\Desktop"),
+            subkey,
             name,
             RRF_RT_REG_SZ,
             None,
@@ -150,6 +181,20 @@ fn reg_string(name: PCWSTR) -> Option<String> {
     }
     let n = (bytes as usize / 2).min(buf.len());
     Some(String::from_utf16_lossy(&buf[..n]).trim_end_matches('\0').to_string())
+}
+
+fn newest_file(dir: &Path, prefix: Option<&str>) -> Option<PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| prefix.is_none_or(|p| e.file_name().to_string_lossy().starts_with(p)))
+        .filter_map(|e| {
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, e.path()))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, path)| path)
 }
 
 /// Decodes the first frame, scaled down to at most `max_w` wide. Returns (w, h, orig_w, orig_h, rgba).

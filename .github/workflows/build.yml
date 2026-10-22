@@ -16,8 +16,50 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: ilammy/msvc-dev-cmd@v1
+
       - name: Build release
         run: cargo build --release --locked
+
+      - name: Verify ureq TLS feature wiring
+        shell: pwsh
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          if ($manifest -notmatch 'ureq\s*=\s*\{[^}]*native-tls') {
+            throw "Cargo.toml must enable ureq native-tls (HTTPS agents need an explicit TlsConnector)."
+          }
+          $http = Get-Content src/data/http.rs -Raw
+          if ($http -notmatch 'tls_connector') {
+            throw "src/data/http.rs must call AgentBuilder::tls_connector — native-tls alone does not enable HTTPS."
+          }
+          Write-Host "TLS wiring OK: native-tls feature + tls_connector in http.rs"
+
+      - name: Unit tests (TLS + monitor selection + dock layout)
+        # cargo test accepts only one TESTNAME filter per invocation.
+        shell: pwsh
+        run: |
+          cargo test --locked native_tls_backend_is_configured -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked secondary_selection -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked dock_appbar_strip -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked dock_layout_ -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify static CRT dependencies
+        shell: pwsh
+        run: |
+          $dependencies = (& dumpbin /dependents target/release/smartdock.exe | Out-String)
+          $dependencies
+          $dynamicCrt = [regex]::Matches(
+            $dependencies,
+            '(?im)^\s*(VCRUNTIME140\S*\.dll|api-ms-win-crt-\S*\.dll)\s*$'
+          ).Value
+          if ($dynamicCrt.Count -gt 0) {
+            throw "Dynamic Visual C++ CRT dependencies remain: $($dynamicCrt -join ', ')"
+          }
+          Write-Host "Static CRT verified: no VCRUNTIME140*.dll or api-ms-win-crt-*.dll dependencies."
 
       - uses: actions/upload-artifact@v4
         with:

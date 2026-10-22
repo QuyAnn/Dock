@@ -6,10 +6,26 @@ pub struct Stats { pub cpu_pct: f32, pub ram_used_mb: u64, pub ram_total_mb: u64
 pub struct Media { pub title: String, pub artist: String, pub playing: bool }
 
 #[derive(Clone, Debug)]
-pub struct WindowEntry { pub hwnd: isize, pub title: String, pub exe: String, pub attention: bool }
+pub struct WindowEntry {
+    pub hwnd: isize,
+    pub title: String,
+    pub exe: String,
+    pub aumid: String,
+    pub package_path: String,
+    pub attention: bool,
+    pub minimized: bool,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct GitDay { pub date: String, pub commits: u32 }
 
 #[derive(Clone, Debug, Default)]
-pub struct AiUsage { pub name: String, pub session_pct: f32, pub reset_text: String }
+pub struct AiWindow { pub label: String, pub used_pct: f32, pub reset_text: String }
+
+#[derive(Clone, Debug, Default)]
+pub struct AiUsage {
+    pub name: String,
+    pub session_pct: f32,
+    pub reset_text: String,
+    pub windows: Vec<AiWindow>,
+}

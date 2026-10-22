@@ -9,7 +9,7 @@ use super::dock::{RectF, Style, TileView};
 use super::renderer::Renderer;
 use crate::data::ai::refresh_ai;
 use crate::data::git::{refresh_git, GitSummary};
-use crate::data::weather::{refresh_weather_at, Weather, DEFAULT_LOCATION};
+use crate::data::weather::{refresh_weather_at, Weather};
 use crate::model::{AiUsage, Media};
 use crate::win::system::current_media;
 
@@ -34,10 +34,10 @@ pub enum DataUpdate {
 
 impl DataState {
     /// Blocking network and disk reads (git, AI usage, weather). Run on a worker thread.
-    pub fn refresh_slow(&mut self, repos: &[PathBuf]) {
-        self.apply(DataUpdate::Git(refresh_git(repos)));
+    pub fn refresh_slow(&mut self, repos: &[PathBuf], git_author: &str, weather_location: &str) {
+        self.apply(DataUpdate::Git(refresh_git(repos, git_author)));
         self.apply(DataUpdate::Ai(refresh_ai()));
-        self.apply(DataUpdate::Weather(refresh_weather_at(DEFAULT_LOCATION)));
+        self.apply(DataUpdate::Weather(refresh_weather_at(weather_location)));
     }
 
     /// Reads the current media session. Blocks on WinRT; keep it off the UI thread.
@@ -63,7 +63,14 @@ fn tile(title: &str, value: String, progress: Option<f32>) -> TileView {
 pub fn git_tile(d: &DataState) -> TileView {
     match &d.git {
         None => tile("GIT", "–".to_owned(), None),
-        Some(g) if g.error.is_some() => tile("GIT", "Lỗi".to_owned(), None),
+        Some(g) if g.error.is_some() => {
+            // Hint belongs in Settings / Git popup; tile stays a quiet dash + empty grid.
+            TileView {
+                style: Style::Git,
+                cells: heat_levels(&g.heatmap, 16, 3),
+                ..TileView::card("GIT", "—".to_owned())
+            }
+        }
         Some(g) => TileView {
             style: Style::Git,
             cells: heat_levels(&g.heatmap, 16, 3),
@@ -111,12 +118,21 @@ pub fn weather_tile(d: &DataState) -> TileView {
 }
 
 pub fn media_tile(d: &DataState) -> TileView {
-    let value = match &d.media {
-        Some(m) if !m.title.is_empty() && !m.artist.is_empty() => format!("{} – {}", m.title, m.artist),
-        Some(m) if !m.title.is_empty() => m.title.clone(),
-        _ => "Không phát".to_owned(),
-    };
-    tile("MEDIA", value, None)
+    match &d.media {
+        Some(m) if !m.title.is_empty() => TileView {
+            style: Style::Media,
+            title: m.title.clone(),
+            sub: m.artist.clone(),
+            progress: m.playing.then_some(1.0),
+            ..TileView::card("", "")
+        },
+        _ => TileView {
+            style: Style::Media,
+            title: "Không phát".to_owned(),
+            sub: "Media controls".to_owned(),
+            ..TileView::card("", "")
+        },
+    }
 }
 
 /// WMO weather code to short Vietnamese text (same table as the old app, no icons).

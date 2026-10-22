@@ -16,11 +16,22 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::{E_ACCESSDENIED, E_FAIL, E_NOTIMPL, FALSE, HANDLE, POINT, TRUE};
 use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTOPRIMARY};
-use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
-use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+use windows::Win32::Media::Audio::Endpoints::{
+    IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl, IAudioMeterInformation,
+};
+use windows::Win32::Media::Audio::AUDIO_VOLUME_NOTIFICATION_DATA;
+use windows::Win32::Media::Audio::{
+    eConsole, eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
+};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
+use windows::Win32::System::Registry::{
+    RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD,
+};
+use windows::core::w;
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::model::Media;
 
@@ -29,6 +40,59 @@ pub enum MediaAction {
     PlayPause,
     Next,
     Previous,
+}
+
+const PERSONALIZE: windows::core::PCWSTR =
+    w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+
+pub fn dark_mode() -> bool {
+    let mut value = 1u32;
+    let mut bytes = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PERSONALIZE,
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut bytes),
+        )
+    };
+    status.is_ok() && value == 0
+}
+
+pub fn set_dark_mode(dark: bool) -> Result<()> {
+    let value = if dark { 0u32 } else { 1u32 };
+    unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            PERSONALIZE,
+            w!("AppsUseLightTheme"),
+            REG_DWORD.0,
+            Some((&value as *const u32).cast()),
+            std::mem::size_of::<u32>() as u32,
+        )
+        .ok()
+    }
+}
+
+pub fn open_settings(page: &str) -> Result<()> {
+    let uri = windows::core::HSTRING::from(page);
+    let result = unsafe {
+        ShellExecuteW(None, w!("open"), &uri, None, None, SW_SHOWNORMAL)
+    };
+    if result.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err(E_FAIL.into())
+    }
+}
+
+pub fn open_path(path: &std::path::Path) -> Result<()> {
+    let value = windows::core::HSTRING::from(path.as_os_str());
+    let result = unsafe { ShellExecuteW(None, w!("open"), &value, None, None, SW_SHOWNORMAL) };
+    if result.0 as isize > 32 { Ok(()) } else { Err(E_FAIL.into()) }
 }
 
 thread_local! {
@@ -86,6 +150,24 @@ fn endpoint_volume() -> Result<IAudioEndpointVolume> {
     }
 }
 
+/// Current peak level of the default output endpoint (WASAPI endpoint meter), 0.0..=1.0.
+/// Tries `eMultimedia` first (music / media sessions), then `eConsole`.
+pub fn audio_peak() -> f32 {
+    let read = |role| -> Result<f32> {
+        init_com();
+        let meter: IAudioMeterInformation = unsafe {
+            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let device = enumerator.GetDefaultAudioEndpoint(eRender, role)?;
+            device.Activate(CLSCTX_ALL, None)?
+        };
+        unsafe { meter.GetPeakValue() }
+    };
+    read(eMultimedia)
+        .or_else(|_| read(eConsole))
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0)
+}
+
 /// Master volume as a scalar 0.0..=1.0 and mute state. Returns (0.0, false) when no device.
 pub fn get_volume() -> (f32, bool) {
     let read = || -> Result<(f32, bool)> {
@@ -94,6 +176,61 @@ pub fn get_volume() -> (f32, bool) {
         unsafe { Ok((vol.GetMasterVolumeLevelScalar()?, vol.GetMute()?.0 != 0)) }
     };
     read().unwrap_or((0.0, false))
+}
+
+// ---------- live volume notifications ----------
+
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// Latest master volume (f32 bits) and mute from IAudioEndpointVolumeCallback.
+static NOTIFIED_VOLUME: AtomicU32 = AtomicU32::new(0);
+static NOTIFIED_MUTED: AtomicBool = AtomicBool::new(false);
+/// Set by the callback, cleared by `take_volume_change`.
+static VOLUME_DIRTY: AtomicBool = AtomicBool::new(false);
+
+#[windows::core::implement(IAudioEndpointVolumeCallback)]
+struct VolumeWatcher;
+
+impl IAudioEndpointVolumeCallback_Impl for VolumeWatcher_Impl {
+    fn OnNotify(&self, data: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> Result<()> {
+        if data.is_null() {
+            return Ok(());
+        }
+        // SAFETY: the audio service passes a valid struct for the duration of the call.
+        let d = unsafe { &*data };
+        NOTIFIED_VOLUME.store(d.fMasterVolume.to_bits(), Ordering::SeqCst);
+        NOTIFIED_MUTED.store(d.bMuted.as_bool(), Ordering::SeqCst);
+        VOLUME_DIRTY.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Registers an IAudioEndpointVolumeCallback on the default output once (dedicated thread that
+/// keeps the endpoint + callback alive). Volume/mute changes from anywhere (keyboard keys,
+/// other apps, our own slider) are then available through `take_volume_change`.
+pub fn watch_volume() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(|| {
+        let Ok(vol) = endpoint_volume() else { return };
+        let cb: IAudioEndpointVolumeCallback = VolumeWatcher.into();
+        // SAFETY: vol is live; cb stays alive with this thread (parked forever).
+        if unsafe { vol.RegisterControlChangeNotify(&cb) }.is_err() {
+            return;
+        }
+        loop {
+            std::thread::park();
+        }
+    });
+}
+
+/// (volume, muted) if it changed since the last call.
+pub fn take_volume_change() -> Option<(f32, bool)> {
+    VOLUME_DIRTY.swap(false, Ordering::SeqCst).then(|| {
+        (f32::from_bits(NOTIFIED_VOLUME.load(Ordering::SeqCst)), NOTIFIED_MUTED.load(Ordering::SeqCst))
+    })
 }
 
 /// Sets master volume, scalar 0.0..=1.0 (clamped).
@@ -201,6 +338,48 @@ fn set_radio(kind: RadioKind, on: bool) -> Result<()> {
 /// None when there is no Wi-Fi radio (or its state cannot be read).
 pub fn wifi_enabled() -> Option<bool> {
     radio_enabled(RadioKind::WiFi)
+}
+
+/// Signal quality (0..=100) of the best connected WLAN interface; None when not connected.
+pub fn wifi_signal() -> Option<u8> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::NetworkManagement::WiFi::{
+        wlan_interface_state_connected, wlan_intf_opcode_current_connection, WlanCloseHandle, WlanEnumInterfaces,
+        WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
+    };
+    // SAFETY: every WLAN allocation is freed with WlanFreeMemory and the handle is closed;
+    // the slice covers exactly dwNumberOfItems entries of the returned list.
+    unsafe {
+        let mut version = 0u32;
+        let mut h = HANDLE::default();
+        if WlanOpenHandle(2, None, &mut version, &mut h) != 0 {
+            return None;
+        }
+        let mut best: Option<u8> = None;
+        let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
+        if WlanEnumInterfaces(h, None, &mut list) == 0 && !list.is_null() {
+            let n = (*list).dwNumberOfItems as usize;
+            let items = std::slice::from_raw_parts((*list).InterfaceInfo.as_ptr(), n);
+            for it in items {
+                if it.isState != wlan_interface_state_connected {
+                    continue;
+                }
+                let mut size = 0u32;
+                let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+                if WlanQueryInterface(h, &it.InterfaceGuid, wlan_intf_opcode_current_connection, None, &mut size, &mut data, None) == 0
+                    && !data.is_null()
+                {
+                    let attr = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
+                    let q = attr.wlanAssociationAttributes.wlanSignalQuality.min(100) as u8;
+                    best = Some(best.map_or(q, |b| b.max(q)));
+                    WlanFreeMemory(data);
+                }
+            }
+            WlanFreeMemory(list as *const std::ffi::c_void);
+        }
+        let _ = WlanCloseHandle(h, None);
+        best
+    }
 }
 
 pub fn set_wifi(on: bool) -> Result<()> {

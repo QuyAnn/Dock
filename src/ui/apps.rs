@@ -4,6 +4,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -11,30 +12,44 @@ use windows::core::Result;
 
 use super::dock::{hit_test, RectF};
 use super::renderer::{Align, Renderer, TextStyle};
-use super::squircle::{drop_shadow, rounded_rect_alpha, shadow_pad, squircle_mask};
+use super::squircle::{rounded_rect_alpha, shadow_pad, soft_shadow, squircle_mask, start_icon_rgba, ICON_N};
 use crate::model::WindowEntry;
-use crate::win::icons::{icon_for_exe, IconBitmap};
+use crate::win::icons::{icon_for_window, IconBitmap};
 use crate::win::tasks::{list_windows, Attention};
 
-const ICON: f32 = 30.0; // .ico / .sq size
-const ICO_MARGIN: f32 = 4.0; // .ico margin-bottom
-const SLOT: f32 = 36.0; // .app width
-const GAP: f32 = 2.0; // .apps gap
+/// macOS-style icon size inside the 48-DIP bar (Variant A).
+pub const ICON: f32 = 34.0;
+/// Height of the centre cluster band (Start, separator zone, apps) = the glass shelf.
+/// Centred in the 48-DIP bar: 3 DIP clear above and below, all four shelf corners visible.
+pub const CLUSTER_H: f32 = 42.0;
+/// Icon top inside the cluster band: equal 4-DIP gaps above and below the 34-DIP icon
+/// (icon optically centred in the shelf); the running dot sits inside the bottom gap.
+pub const ICON_TOP: f32 = (CLUSTER_H - ICON) / 2.0;
+const SLOT: f32 = ICON;
+const GAP: f32 = 5.0;
 const PITCH: f32 = SLOT + GAP;
-const DOT: f32 = 3.0; // .dots i
-const DOT_RGBA: u32 = 0xFFFF_FFB3; // rgba(255,255,255,.7)
+const DOT: f32 = 2.5;
+/// Space between the icon's bottom edge and the running dot.
+const DOT_GAP: f32 = 0.5;
+const DOT_RGBA: u32 = 0xFFFF_FFD9; // small white running dot
+/// Shadow under each icon (in composed-icon pixels: ICON_N px = ICON DIPs).
+const SHADOW_SIGMA_PX: f32 = 2.6;
+const SHADOW_OPACITY: f32 = 0.38;
+const SHADOW_DY_PX: usize = 2;
 const FALLBACK_TOP: u32 = 0x5B6C_FFFF; // .fallback-icon gradient
 const FALLBACK_BOTTOM: u32 = 0x7C4D_FFFF;
-const FALLBACK_RADIUS: f32 = 0.27; // border-radius: 27%
-const FALLBACK_FONT: f32 = 13.0;
+const FALLBACK_RADIUS: f32 = 0.225; // ~ macOS squircle
+const FALLBACK_FONT: f32 = 16.0;
 const WHITE: u32 = 0xFFFF_FFFF;
 const BADGE_RED: u32 = 0xFF3B_30FF; // #ff3b30
 const BADGE_SHADOW: u32 = 0x0000_0066; // box-shadow 0 1px 2px rgba(0,0,0,.4)
 const BADGE_H: f32 = 15.0;
 const BADGE_FONT: f32 = 9.5;
 const ATTN_PERIOD: f32 = 1.4; // animation: attn 1.4s ease-in-out infinite
-const MAG_RANGE: f32 = 64.0; // magnify falloff distance, px
-const MAG_MAX: f32 = 0.3; // --mag = 1 + 0.3 * falloff^2
+const MAG_RANGE: f32 = 40.0; // magnify falloff distance, px
+// Hover only lifts slightly (scales around the bottom centre, ~2 DIP taller at most) so the
+// icon never leaves the 48-DIP bar and nothing else moves.
+const MAG_MAX: f32 = 0.05;
 
 thread_local! {
     /// Pointer x in dock-local DIPs (same space as the tile rects), None when not over the dock.
@@ -58,10 +73,18 @@ struct AppIcon {
 
 impl AppIcon {
     fn new(b: IconBitmap) -> Self {
-        let rgba = squircle_mask(b.w, b.h, &b.rgba);
+        Self::from_composed(squircle_mask(b.w, b.h, &b.rgba))
+    }
+
+    /// From an already composed ICON_N x ICON_N squircle.
+    fn from_composed(rgba: Vec<u8>) -> Self {
         let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
-        let shadow = drop_shadow(b.w, b.h, &alpha);
-        Self { w: b.w, h: b.h, rgba, shadow }
+        let shadow = soft_shadow(ICON_N, ICON_N, &alpha, SHADOW_SIGMA_PX, SHADOW_OPACITY, SHADOW_DY_PX);
+        Self { w: ICON_N, h: ICON_N, rgba, shadow }
+    }
+
+    fn bitmap(&self) -> IconBitmap {
+        IconBitmap { w: self.w, h: self.h, rgba: self.rgba.clone() }
     }
 }
 
@@ -70,26 +93,58 @@ pub struct AppsState {
     pub windows: Vec<WindowEntry>,
     /// Composed icons keyed by exe path. Pruned to the exes that are still open.
     icons: HashMap<String, AppIcon>,
+    /// Pinned apps (exe path, display name). Pins with no open window get a launcher slot
+    /// (`hwnd == 0`) after the running windows.
+    pub pins: Vec<(String, String)>,
 }
 
 impl AppsState {
     /// Re-reads open windows, sets their attention flags and loads any missing icons.
     pub fn refresh(&mut self, attention: &Attention) {
-        self.windows = list_windows();
+        // EnumWindows is z-order based, so activating an app otherwise moves its icon. Keep the
+        // first-seen order from the TS implementation and append only genuinely new windows.
+        let previous: HashMap<isize, usize> =
+            self.windows.iter().enumerate().map(|(i, w)| (w.hwnd, i)).collect();
+        let mut fresh: Vec<(usize, WindowEntry)> = list_windows().into_iter().enumerate().collect();
+        fresh.sort_by_key(|(seen, w)| (previous.get(&w.hwnd).copied().unwrap_or(usize::MAX), *seen));
+        self.windows = fresh.into_iter().map(|(_, w)| w).collect();
         for w in &mut self.windows {
             w.attention = attention.contains(w.hwnd);
         }
+        let launchers = pinned_launchers(&self.pins, &self.windows);
+        self.windows.extend(launchers);
         for w in &self.windows {
-            if w.exe.is_empty() || self.icons.contains_key(&w.exe) {
+            let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
+            if w.exe.is_empty() || self.icons.contains_key(key) {
                 continue;
             }
-            if let Some(b) = icon_for_exe(&w.exe) {
-                self.icons.insert(w.exe.clone(), AppIcon::new(b));
+            if let Some(b) = icon_for_window(w.hwnd, &w.exe, &w.aumid, &w.package_path) {
+                self.icons.insert(key.to_owned(), AppIcon::new(b));
             }
         }
-        let live: HashSet<&str> = self.windows.iter().map(|w| w.exe.as_str()).collect();
+        let live: HashSet<&str> = self
+            .windows
+            .iter()
+            .map(|w| if w.aumid.is_empty() { w.exe.as_str() } else { w.aumid.as_str() })
+            .collect();
         self.icons.retain(|k, _| live.contains(k.as_str()));
     }
+}
+
+/// Launcher entries for pins whose exe has no open window.
+fn pinned_launchers(pins: &[(String, String)], open: &[WindowEntry]) -> Vec<WindowEntry> {
+    pins.iter()
+        .filter(|(exe, _)| !exe.is_empty() && !open.iter().any(|w| w.exe.eq_ignore_ascii_case(exe)))
+        .map(|(exe, name)| WindowEntry {
+            hwnd: 0,
+            title: name.clone(),
+            exe: exe.clone(),
+            aumid: String::new(),
+            package_path: String::new(),
+            attention: false,
+            minimized: false,
+        })
+        .collect()
 }
 
 /// Draws one slot per window that fits in `rect`, centered. Extra windows are clipped.
@@ -101,37 +156,91 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
         let cx = s.x + SLOT / 2.0;
         let k = magnify(cx, pointer);
         let size = ICON * k;
-        // .ico is centred in the slot above its margin, and scales around its bottom centre.
-        let base_top = s.y + (s.h - (ICON + ICO_MARGIN)) / 2.0;
-        let ico = RectF {
-            x: cx - size / 2.0,
-            y: base_top + ICON - size,
-            w: size,
-            h: size,
-        };
-        match state.icons.get(&w.exe) {
+        // Scales around the bottom centre; the base position never moves.
+        let base_bottom = s.y + ICON_TOP + ICON;
+        let ico = RectF { x: cx - size / 2.0, y: base_bottom - size, w: size, h: size };
+        let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
+        match state.icons.get(key) {
             Some(icon) => draw_icon(r, icon, ico)?,
             None => draw_fallback(r, ico, &initial(w))?,
+        }
+        if w.hwnd == 0 {
+            continue; // pinned launcher: no badge, no running dot
         }
         if let Some(badge) = badge_of(w) {
             draw_badge(r, ico, badge, t)?;
         }
-        // Running dot: .dots sits 1 px above the slot bottom. One dot per window slot.
-        let dot = RectF {
-            x: s.x + (SLOT - DOT) / 2.0,
-            y: s.y + s.h - 1.0 - DOT,
-            w: DOT,
-            h: DOT,
-        };
+        // Small white running dot under the icon.
+        let dot = RectF { x: cx - DOT / 2.0, y: base_bottom + DOT_GAP, w: DOT, h: DOT };
         r.fill_rounded_rect(dot, DOT / 2.0, DOT_RGBA)?;
     }
     Ok(())
 }
 
-/// HWND of the window whose slot contains (x, y), if any.
-pub fn hit_app(x: f32, y: f32, rect: RectF, state: &AppsState) -> Option<isize> {
+/// The dock's Start button: white Windows logo on a blue squircle, same size/shadow as the apps.
+pub fn draw_start_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
+    static START: OnceLock<AppIcon> = OnceLock::new();
+    let icon = START.get_or_init(|| AppIcon::from_composed(start_icon_rgba()));
+    let k = if hovered { 1.0 + MAG_MAX } else { 1.0 };
+    let size = ICON * k;
+    let cx = rc.x + rc.w / 2.0;
+    let bottom = rc.y + ICON_TOP + ICON;
+    draw_icon(r, icon, RectF { x: cx - size / 2.0, y: bottom - size, w: size, h: size })
+}
+
+/// Index into `state.windows` for the slot under (x, y).
+pub fn hit_app_index(x: f32, y: f32, rect: RectF, state: &AppsState) -> Option<usize> {
     let slots = slots(rect, state.windows.len());
-    hit_test(x, y, &slots).map(|i| state.windows[i].hwnd)
+    hit_test(x, y, &slots)
+}
+
+/// Slot rect for window index `i`, if it fits.
+pub fn slot_rect(rect: RectF, state: &AppsState, i: usize) -> Option<RectF> {
+    slots(rect, state.windows.len()).get(i).copied()
+}
+
+/// Display name for an app icon (exe stem, else window title).
+pub fn app_name(w: &WindowEntry) -> String {
+    Path::new(&w.exe)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| {
+            let mut c = s.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => w.title.clone(),
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| w.title.clone())
+}
+
+/// All listed windows that share the same exe (case-insensitive) as `w`.
+pub fn group_windows<'a>(state: &'a AppsState, w: &WindowEntry) -> Vec<&'a WindowEntry> {
+    if w.exe.is_empty() {
+        return state.windows.iter().filter(|o| o.hwnd == w.hwnd).collect();
+    }
+    state
+        .windows
+        .iter()
+        .filter(|o| o.exe.eq_ignore_ascii_case(&w.exe))
+        .collect()
+}
+
+/// Icon bitmap pixels for a window's cache key, if loaded.
+pub fn icon_pixels(state: &AppsState, w: &WindowEntry) -> Option<IconBitmap> {
+    let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
+    state.icons.get(key).map(AppIcon::bitmap)
+}
+
+/// Exact width of `n` app slots (no side padding), so the centre cluster is measured by what
+/// is drawn and Start + icons sit symmetrically around the monitor centre.
+pub fn cluster_width(n: usize) -> f32 {
+    if n == 0 {
+        0.0
+    } else {
+        n as f32 * SLOT + (n - 1) as f32 * GAP
+    }
 }
 
 /// Slot rects for the first `n` windows that fit in `rect`, horizontally centered.
@@ -156,13 +265,13 @@ fn magnify(cx: f32, pointer: Option<f32>) -> f32 {
     }
 }
 
-/// Icon colour and shadow, drawn at the (possibly magnified) box `ico`.
+/// Full-bleed squircle icon with its soft shadow; no plate behind it.
 fn draw_icon(r: &mut Renderer, icon: &AppIcon, ico: RectF) -> Result<()> {
     draw_shadow(r, &icon.shadow, icon.w, ico)?;
     r.draw_bitmap(icon.w, icon.h, &icon.rgba, ico)
 }
 
-/// Gradient tile with the uppercase initial, used until the icon is loaded.
+/// Gradient squircle-ish tile with the uppercase initial, used until the icon is loaded.
 fn draw_fallback(r: &mut Renderer, ico: RectF, label: &str) -> Result<()> {
     draw_shadow(r, fallback_shadow(), FALLBACK_SRC, ico)?;
     let k = ico.w / ICON;
@@ -178,7 +287,7 @@ fn fallback_shadow() -> &'static (u32, u32, Vec<u8>) {
     static SHADOW: OnceLock<(u32, u32, Vec<u8>)> = OnceLock::new();
     SHADOW.get_or_init(|| {
         let alpha = rounded_rect_alpha(FALLBACK_SRC, FALLBACK_SRC, FALLBACK_RADIUS * FALLBACK_SRC as f32);
-        drop_shadow(FALLBACK_SRC, FALLBACK_SRC, &alpha)
+        soft_shadow(FALLBACK_SRC, FALLBACK_SRC, &alpha, 0.9, SHADOW_OPACITY, 1)
     })
 }
 
@@ -289,4 +398,166 @@ fn with_alpha(rgba: u32, a: f32) -> u32 {
 fn now_secs() -> f32 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_secs_f32()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::dock::{layout, Tile};
+
+    fn entry(hwnd: isize, exe: &str) -> WindowEntry {
+        WindowEntry {
+            hwnd,
+            title: String::new(),
+            exe: exe.to_owned(),
+            aumid: String::new(),
+            package_path: String::new(),
+            attention: false,
+            minimized: false,
+        }
+    }
+
+    fn t(id: &'static str, width: f32) -> Tile {
+        Tile { id, width, height: 0.0 }
+    }
+
+    /// Lays out the home-PC dock (1080p) with `n` apps; returns (rects, start index, apps index).
+    fn centred(n: usize, screen_w: f32) -> (Vec<RectF>, usize, usize) {
+        let left = vec![t("git", 118.0), t("cursor", 112.0), t("media", 200.0)];
+        let center = vec![
+            Tile { id: "start", width: ICON, height: CLUSTER_H },
+            Tile { id: "sep", width: 1.0, height: 24.0 },
+            Tile { id: "apps", width: cluster_width(n), height: CLUSTER_H },
+        ];
+        let right = vec![t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
+        (layout(&left, &center, &right, screen_w), left.len(), left.len() + 2)
+    }
+
+    fn mid(r: RectF) -> (f32, f32) {
+        (r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
+    #[test]
+    fn dock_layout_shelf_icons_and_dots_vertically_centred_with_margin() {
+        use crate::ui::dock::{shelf_for, DOCK_H};
+        let (rects, start, apps) = centred(5, 1920.0);
+        let shelf = shelf_for(rects[start], rects[apps]);
+        // Clear margin above the shelf rim and below it; shelf centred in the bar.
+        assert!(shelf.y >= 3.0, "shelf top {}", shelf.y);
+        // Rounded bottom corners stay inside the visible bar (the window extends below the screen).
+        assert!(shelf.y + shelf.h <= DOCK_H - 3.0, "shelf bottom {shelf:?}");
+        assert!((shelf.y - (DOCK_H - shelf.y - shelf.h)).abs() < 0.01, "shelf not centred: {shelf:?}");
+        let icon_top = rects[apps].y + ICON_TOP;
+        let icon_bottom = icon_top + ICON;
+        // A hovered icon grows upward by MAG_MAX but stays inside the bar.
+        assert!(icon_bottom - ICON * (1.0 + MAG_MAX) >= 0.0);
+        assert!(icon_top >= shelf.y && icon_bottom <= shelf.y + shelf.h);
+        // Icon optically centred in the shelf: equal gaps to the top and bottom rims.
+        let (gap_top, gap_bottom) = (icon_top - shelf.y, shelf.y + shelf.h - icon_bottom);
+        assert!((gap_top - gap_bottom).abs() < 0.01, "gaps {gap_top} vs {gap_bottom}");
+        let dot_bottom = icon_bottom + DOT_GAP + DOT;
+        // At least 1 DIP between the dot and the shelf's bottom rim.
+        assert!(dot_bottom <= shelf.y + shelf.h - 1.0, "dot {dot_bottom} touches shelf rim {shelf:?}");
+        // Side tiles are vertically centred too.
+        for (i, r) in rects.iter().enumerate() {
+            if i == start + 1 {
+                continue;
+            }
+            assert!((r.y - (DOCK_H - r.y - r.h)).abs() < 0.01, "tile {i} not centred: {r:?}");
+        }
+    }
+
+    #[test]
+    fn dock_layout_hit_start_button_on_centred_layout() {
+        for &(n, w) in &[(1usize, 1920.0f32), (5, 1920.0), (9, 2560.0)] {
+            let (rects, start, _) = centred(n, w);
+            let (x, y) = mid(rects[start]);
+            assert_eq!(hit_test(x, y, &rects), Some(start), "n={n} w={w}");
+            // The cluster straddles the screen centre, so Start sits left of it.
+            assert!(rects[start].x < w / 2.0);
+            // Variant A: Start is a 38-DIP icon, the cluster (Start .. last app) is centred.
+            assert_eq!(rects[start].w, ICON);
+            let last = rects[start + 2];
+            let mid = (rects[start].x + last.x + last.w) / 2.0;
+            assert!((mid - w / 2.0).abs() < 0.01, "n={n} mid={mid}");
+        }
+    }
+
+    #[test]
+    fn dock_layout_hit_every_app_slot_on_centred_layout() {
+        for &(n, w) in &[(1usize, 1920.0f32), (5, 1920.0), (12, 1920.0), (9, 2560.0)] {
+            let (rects, _, apps) = centred(n, w);
+            let mut state = AppsState::default();
+            state.windows = (0..n).map(|i| entry(100 + i as isize, "x.exe")).collect();
+            let rect = rects[apps];
+            for i in 0..n {
+                let slot = slot_rect(rect, &state, i).expect("slot fits");
+                let (x, y) = mid(slot);
+                assert_eq!(hit_test(x, y, &rects), Some(apps), "tile n={n} i={i}");
+                assert_eq!(hit_app_index(x, y, rect, &state), Some(i), "slot n={n} i={i}");
+                assert_eq!(state.windows[hit_app_index(x, y, rect, &state).unwrap()].hwnd, 100 + i as isize);
+            }
+            // The 5-DIP gaps between icons are not part of any slot.
+            if n > 1 {
+                let s0 = slot_rect(rect, &state, 0).unwrap();
+                assert_eq!(s0.w, ICON);
+                assert_eq!(hit_app_index(s0.x + s0.w + GAP / 2.0, s0.y + s0.h / 2.0, rect, &state), None);
+            }
+            // Outside the cluster nothing is hit.
+            let y = rect.y + rect.h / 2.0;
+            assert_eq!(hit_app_index(rect.x - 1.0, y, rect, &state), None);
+            assert_eq!(hit_app_index(rect.x + rect.w + 1.0, y, rect, &state), None);
+        }
+    }
+
+    #[test]
+    fn dock_layout_pinned_not_running_gets_launcher_slot() {
+        let pins = vec![
+            ("C:\\Apps\\Code.exe".to_owned(), "Code".to_owned()),
+            ("C:\\Apps\\Notes.exe".to_owned(), "Notes".to_owned()),
+        ];
+        let open = vec![entry(7, "c:\\apps\\code.exe")];
+        let launchers = pinned_launchers(&pins, &open);
+        assert_eq!(launchers.len(), 1, "running pin is not duplicated");
+        assert_eq!(launchers[0].hwnd, 0);
+        assert_eq!(launchers[0].exe, "C:\\Apps\\Notes.exe");
+    }
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use crate::ui::squircle::{choose_backing, squircle_mask, Backing, ICON_N};
+
+    fn solid(n: usize, f: impl Fn(usize, usize) -> [u8; 4]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(n * n * 4);
+        for y in 0..n {
+            for x in 0..n {
+                v.extend_from_slice(&f(x, y));
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn dock_layout_icon_backing_choice() {
+        let n = 64;
+        // Full square art -> full-bleed.
+        let full = solid(n, |_, _| [200, 40, 40, 255]);
+        assert_eq!(choose_backing(n, &full), Backing::FullBleed);
+        // A circle (Chrome-like, colourful) -> light backing.
+        let circle = solid(n, |x, y| {
+            let (dx, dy) = (x as f32 - 31.5, y as f32 - 31.5);
+            if dx * dx + dy * dy < 31.0 * 31.0 { [220, 60, 50, 255] } else { [0, 0, 0, 0] }
+        });
+        assert_eq!(choose_backing(n, &circle), Backing::Light);
+        // Blue monochrome wide art (Task Manager-like) -> dark backing.
+        let blue = solid(n, |_, y| if (8..56).contains(&y) { [40, 140, 230, 255] } else { [0, 0, 0, 0] });
+        assert_eq!(choose_backing(n, &blue), Backing::Dark);
+        // Composed output is always ICON_N square with transparent corners.
+        let out = squircle_mask(n as u32, n as u32, &circle);
+        assert_eq!(out.len(), (ICON_N * ICON_N * 4) as usize);
+        assert_eq!(out[3], 0, "corner outside the squircle is transparent");
+        let c = ((ICON_N / 2 * ICON_N + ICON_N / 2) * 4) as usize;
+        assert_eq!(out[c + 3], 255, "centre is opaque (backing)");
+    }
 }

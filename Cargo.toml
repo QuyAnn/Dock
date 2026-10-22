@@ -11,18 +11,22 @@ panic = "abort"
 strip = true
 
 [dependencies]
+windows-core = "0.58"
 windows = { version = "0.58", features = [
+  "implement",
   "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_Dxgi_Common", "Win32_Storage_FileSystem",
   "Win32_Graphics_DirectWrite", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_Imaging",
-  "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_HiDpi", "Win32_UI_Accessibility", "Win32_UI_Controls",
   "Win32_System_Threading", "Win32_System_Com", "Win32_System_LibraryLoader",
   "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com_StructuredStorage",
   "Win32_System_Power", "Win32_System_Console", "Win32_System_Registry", "Win32_System_SystemInformation",
   "Win32_System_ProcessStatus", "Win32_System_Variant", "Win32_Devices_Display",
-  "Win32_NetworkManagement_IpHelper", "Foundation", "Media_Control", "Devices_Radios",
+  "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_WiFi", "Win32_Storage_Packaging_Appx", "Foundation", "Media_Control", "Devices_Radios",
   "Storage_Streams", "Networking_Connectivity", "Foundation_Collections", "Foundation_Numerics"
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", default-features = false, features = ["json", "native-tls"] }
 chrono = "0.4"
+base64 = "0.23.1"

@@ -7,25 +7,30 @@ use std::sync::Once;
 
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::Graphics::Gdi::UpdateWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, VK_ESCAPE, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetSystemMetrics, GetWindowRect,
-    KillTimer, RegisterClassExW, SetTimer, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
-    SW_SHOWNOACTIVATE, WM_LBUTTONUP, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect,
+    KillTimer, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
 use super::dock::RectF;
-use super::renderer::{apply_acrylic, Renderer};
+use super::renderer::{apply_acrylic, apply_popup_corners, Renderer, POPUP_CORNER_RADIUS};
+use crate::win::dpi;
 
-const POPUP_W: i32 = 320;
 const GAP: f32 = 8.0;
-const MARGIN: i32 = 6;
-const RADIUS: f32 = 8.0;
+const MARGIN: f32 = 6.0;
+/// Must equal the DWM corner so the drawn panel and the window clip match exactly.
+const RADIUS: f32 = POPUP_CORNER_RADIUS;
 const TIMER_ID: usize = 1;
 const POLL_MS: u32 = 100;
 
@@ -52,6 +57,84 @@ thread_local! {
     static POPUP: RefCell<Option<Popup>> = const { RefCell::new(None) };
     static PAINTER: Cell<Option<fn(&mut Renderer, RectF)>> = const { Cell::new(None) };
     static CLICK: Cell<Option<fn(f32, f32)>> = const { Cell::new(None) };
+    static ON_HIDE: Cell<Option<fn()>> = const { Cell::new(None) };
+    static DRAG: Cell<Option<fn(DragPhase, f32, f32) -> bool>> = const { Cell::new(None) };
+    static TICK: Cell<Option<fn()>> = const { Cell::new(None) };
+    static RCLICK: Cell<Option<fn(f32, f32)>> = const { Cell::new(None) };
+    /// True between a captured mouse-down and its mouse-up.
+    static DRAGGING: Cell<bool> = const { Cell::new(false) };
+    static LAST_POS: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+}
+
+/// Phase of a captured drag inside the popup (sliders).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DragPhase {
+    Down,
+    Move,
+    Up,
+}
+
+/// Drag handler: called on mouse-down with `Down`; returning true captures the mouse, and then
+/// every WM_MOUSEMOVE (`Move`) and the release (`Up`) go to it instead of the click handler.
+pub fn set_drag_handler(f: fn(DragPhase, f32, f32) -> bool) {
+    DRAG.with(|c| c.set(Some(f)));
+}
+
+/// Receives right clicks (button up) inside the popup, in client DIPs.
+pub fn set_rclick_handler(f: fn(f32, f32)) {
+    RCLICK.with(|c| c.set(Some(f)));
+}
+
+/// Pointer position in popup client DIPs while it is over the visible popup.
+pub fn cursor_in_popup() -> Option<(f32, f32)> {
+    POPUP.with(|p| {
+        let g = p.try_borrow().ok()?;
+        let pw = g.as_ref()?;
+        let mut pt = POINT::default();
+        let mut rc = RECT::default();
+        // SAFETY: out-params are valid locals; hwnd is our live popup.
+        unsafe {
+            if !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(pw.hwnd).as_bool() {
+                return None;
+            }
+            GetCursorPos(&mut pt).ok()?;
+            GetWindowRect(pw.hwnd, &mut rc).ok()?;
+        }
+        if pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom {
+            return None;
+        }
+        let dpi = pw.renderer.dpi();
+        Some((dpi::px_to_dip(pt.x - rc.left, dpi), dpi::px_to_dip(pt.y - rc.top, dpi)))
+    })
+}
+
+/// Called every poll tick (~100 ms) while the popup is visible.
+pub fn set_tick_handler(f: fn()) {
+    TICK.with(|c| c.set(Some(f)));
+}
+
+/// True while a slider drag holds the mouse capture.
+pub fn is_dragging() -> bool {
+    DRAGGING.with(Cell::get)
+}
+
+/// Invalidates and paints the popup synchronously (live slider feedback).
+pub fn repaint_now() {
+    let hwnd = POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|pw| pw.hwnd)));
+    if let Some(hwnd) = hwnd {
+        // SAFETY: hwnd is our live popup.
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+            let _ = UpdateWindow(hwnd);
+        }
+    }
+}
+
+fn client_dip(lp: LPARAM) -> (f32, f32) {
+    let dpi = POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|p| p.renderer.dpi())).unwrap_or(96));
+    let x = dpi::px_to_dip((lp.0 & 0xffff) as i16 as i32, dpi);
+    let y = dpi::px_to_dip(((lp.0 >> 16) & 0xffff) as i16 as i32, dpi);
+    (x, y)
 }
 
 /// Sets the body painter, called inside each frame after the background (see `paint`).
@@ -64,23 +147,50 @@ pub fn set_painter(f: fn(&mut Renderer, RectF)) {
     PAINTER.with(|p| p.set(Some(f)));
 }
 
+pub fn set_on_hide(f: fn()) {
+    ON_HIDE.with(|c| c.set(Some(f)));
+}
+
 /// Opens the popup above (or below, if the anchor is in the top half) `anchor`, centered on it.
 /// `anchor` and the result are in screen coordinates. Replaces any open popup.
-pub fn show(anchor: RectF, height: i32) -> Result<()> {
-    hide();
-
-    // SAFETY: plain metric queries.
-    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
-    let cx = (anchor.x + anchor.w / 2.0) as i32;
-    let x = (cx - POPUP_W / 2).clamp(MARGIN, (sw - POPUP_W - MARGIN).max(MARGIN));
-    let below = anchor.y + anchor.h / 2.0 < sh as f32 / 2.0;
-    let y = (if below {
-        anchor.y + anchor.h + GAP
-    } else {
-        anchor.y - height as f32 - GAP
-    }) as i32;
+pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
+    let dpi = dpi::system_dpi();
+    let width_px = dpi::dip_to_px(width, dpi);
+    let height_px = dpi::dip_to_px(height as f32, dpi);
+    let monitor = monitor_rect(anchor);
+    let rect = popup_rect_for(anchor, width_px, height_px, dpi, monitor);
 
     register_class();
+    let reused = POPUP.with(|p| {
+        let mut state = p.borrow_mut();
+        let Some(pw) = state.as_mut() else { return false };
+        pw.anchor = anchor;
+        pw.mouse_down = true;
+        pw.esc_down = true;
+        pw.renderer.resize(width_px, height_px, dpi);
+        unsafe {
+            let _ = SetWindowPos(
+                pw.hwnd,
+                HWND_TOPMOST,
+                rect.left,
+                rect.top,
+                width_px,
+                height_px,
+                SWP_NOACTIVATE,
+            );
+        }
+        apply_popup_corners(pw.hwnd);
+        apply_acrylic(pw.hwnd, super::glass::PANEL_ACRYLIC_TINT);
+        unsafe {
+            let _ = ShowWindow(pw.hwnd, SW_SHOWNOACTIVATE);
+            SetTimer(pw.hwnd, TIMER_ID, POLL_MS, None);
+        }
+        true
+    });
+    if reused {
+        return Ok(());
+    }
+
     let hwnd = unsafe {
         // SAFETY: class is registered above; all string args are static literals.
         CreateWindowExW(
@@ -88,10 +198,10 @@ pub fn show(anchor: RectF, height: i32) -> Result<()> {
             w!("SmartDockPopup"),
             w!(""),
             WS_POPUP,
-            x,
-            y,
-            POPUP_W,
-            height,
+            rect.left,
+            rect.top,
+            width_px,
+            height_px,
             None,
             None,
             hinstance(),
@@ -101,12 +211,13 @@ pub fn show(anchor: RectF, height: i32) -> Result<()> {
     // Own the window before anything else can fail, so Drop destroys it on error.
     let pw = Popup {
         hwnd,
-        renderer: Renderer::new(hwnd, POPUP_W, height),
+        renderer: Renderer::new(hwnd, width_px, height_px, dpi),
         anchor,
         mouse_down: true,
         esc_down: true,
     };
-    apply_acrylic(hwnd, 0x9E1E_1F24);
+    apply_popup_corners(hwnd);
+    apply_acrylic(hwnd, super::glass::PANEL_ACRYLIC_TINT);
     POPUP.with(|p| *p.borrow_mut() = Some(pw));
 
     // SAFETY: hwnd is a live window owned by POPUP.
@@ -115,6 +226,48 @@ pub fn show(anchor: RectF, height: i32) -> Result<()> {
         SetTimer(hwnd, TIMER_ID, POLL_MS, None);
     }
     Ok(())
+}
+
+fn monitor_rect(anchor: RectF) -> RECT {
+    let point = POINT {
+        x: (anchor.x + anchor.w / 2.0).round() as i32,
+        y: (anchor.y + anchor.h / 2.0).round() as i32,
+    };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return info.rcMonitor;
+        }
+    }
+    let width = unsafe { windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+        windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN,
+    ) };
+    let height = unsafe { windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+        windows::Win32::UI::WindowsAndMessaging::SM_CYSCREEN,
+    ) };
+    RECT { left: 0, top: 0, right: width, bottom: height }
+}
+
+fn popup_rect_for(anchor: RectF, width: i32, height: i32, dpi: u32, monitor: RECT) -> RECT {
+    let margin = dpi::dip_to_px(MARGIN, dpi);
+    let gap = dpi::dip_to_px(GAP, dpi);
+    let min_x = monitor.left + margin;
+    let max_x = (monitor.right - width - margin).max(min_x);
+    let x = ((anchor.x + anchor.w / 2.0).round() as i32 - width / 2).clamp(min_x, max_x);
+    let below = anchor.y + anchor.h / 2.0 < (monitor.top + monitor.bottom) as f32 / 2.0;
+    let preferred_y = if below {
+        (anchor.y + anchor.h).round() as i32 + gap
+    } else {
+        anchor.y.round() as i32 - height - gap
+    };
+    let min_y = monitor.top + margin;
+    let max_y = (monitor.bottom - height - margin).max(min_y);
+    let y = preferred_y.clamp(min_y, max_y);
+    RECT { left: x, top: y, right: x + width, bottom: y + height }
 }
 
 /// Asks for a repaint of the open popup (e.g. after new sparkline samples). No-op if nothing is open.
@@ -130,11 +283,26 @@ pub fn invalidate() {
     });
 }
 
-/// Destroys the popup and its D2D resources. No-op if nothing is open.
+/// Hides the persistent popup window. Keeping its HWND and D2D resources alive makes the next open
+/// a synchronous move/resize/show operation, matching the Electron fast path.
 pub fn hide() {
-    // Take it out first so Drop (which sends WM_DESTROY) never runs under a RefCell borrow.
-    let old = POPUP.with(|p| p.borrow_mut().take());
-    drop(old);
+    if DRAGGING.with(Cell::get) {
+        // SAFETY: drops our own capture; WM_CAPTURECHANGED finishes the drag.
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
+    POPUP.with(|p| {
+        if let Some(pw) = p.borrow().as_ref() {
+            unsafe {
+                let _ = KillTimer(pw.hwnd, TIMER_ID);
+                let _ = ShowWindow(pw.hwnd, SW_HIDE);
+            }
+        }
+    });
+    if let Some(f) = ON_HIDE.with(Cell::get) {
+        f();
+    }
 }
 
 fn hinstance() -> HINSTANCE {
@@ -174,11 +342,61 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             poll();
             LRESULT(0)
         }
+        WM_LBUTTONDOWN => {
+            let (x, y) = client_dip(lp);
+            LAST_POS.with(|p| p.set((x, y)));
+            if let Some(f) = DRAG.with(Cell::get) {
+                if f(DragPhase::Down, x, y) {
+                    DRAGGING.with(|d| d.set(true));
+                    // SAFETY: our own window takes the capture until mouse-up.
+                    unsafe {
+                        SetCapture(hwnd);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            if DRAGGING.with(Cell::get) {
+                let (x, y) = client_dip(lp);
+                LAST_POS.with(|p| p.set((x, y)));
+                if let Some(f) = DRAG.with(Cell::get) {
+                    f(DragPhase::Move, x, y);
+                }
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
-            let x = (lp.0 & 0xffff) as i16 as f32;
-            let y = ((lp.0 >> 16) & 0xffff) as i16 as f32;
+            let (x, y) = client_dip(lp);
+            if DRAGGING.with(|d| d.replace(false)) {
+                // SAFETY: releases the capture taken on mouse-down.
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                if let Some(f) = DRAG.with(Cell::get) {
+                    f(DragPhase::Up, x, y);
+                }
+                return LRESULT(0);
+            }
             if let Some(f) = CLICK.with(Cell::get) {
                 f(x, y);
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let (x, y) = client_dip(lp);
+            if let Some(f) = RCLICK.with(Cell::get) {
+                f(x, y);
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            // Capture lost without a mouse-up (e.g. popup hidden): finish the drag where it was.
+            if DRAGGING.with(|d| d.replace(false)) {
+                let (x, y) = LAST_POS.with(Cell::get);
+                if let Some(f) = DRAG.with(Cell::get) {
+                    f(DragPhase::Up, x, y);
+                }
             }
             LRESULT(0)
         }
@@ -195,9 +413,8 @@ fn paint() {
             let rect = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
             let _ = pw.renderer.begin().and_then(|_| {
                 // .popup: gradient fill (rgba(30,31,36,.62) to rgba(18,18,22,.74)), inset top highlight, 1px border.
-                pw.renderer.fill_rounded_rect_gradient(rect, RADIUS, 0x1E1F_249E, 0x1212_16BD)?;
-                pw.renderer.fill_rect(RectF { x: rect.x + 4.0, y: rect.y + 0.5, w: rect.w - 8.0, h: 1.0 }, 0xFFFF_FF14)?;
-                pw.renderer.stroke_rounded_rect(rect, RADIUS, 0xFFFF_FF21, 1.0)?;
+                // Liquid Glass panel over live DWM acrylic: light dim, top highlight, specular rims.
+                super::glass::draw_panel(&mut pw.renderer, rect, RADIUS)?;
                 if let Some(f) = PAINTER.with(Cell::get) {
                     f(&mut pw.renderer, rect);
                 }
@@ -215,6 +432,9 @@ fn key_down(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> boo
 /// Closes on Esc (rising edge) or on a click outside both the popup and its anchor.
 /// Clicks on the anchor are left to the dock, which toggles or switches the popup.
 fn poll() {
+    if let Some(f) = TICK.with(Cell::get) {
+        f();
+    }
     let close = POPUP.with(|p| {
         let Ok(mut g) = p.try_borrow_mut() else { return false };
         let Some(pw) = g.as_mut() else { return false };

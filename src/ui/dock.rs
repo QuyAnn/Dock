@@ -2,32 +2,30 @@
 //! Three zones: left (git, AI, media), center (running apps), right (Control Center, settings,
 //! CPU, RAM, clock). Coordinates are dock-local DIPs (the dock window's client area).
 use windows::core::Result;
+use std::cell::Cell;
+use std::sync::OnceLock;
+use std::time::Instant;
 
-use super::liquid::LiquidBitmap;
+use super::liquid::{glass_fill_color, LiquidBitmap, GLASS_SHEEN_TOP};
 use super::renderer::{Align, Renderer, TextStyle};
 use super::svgpath;
 
-pub const DOCK_H: f32 = 56.0;
-const BAR_RADIUS: f32 = 8.0;
+/// Bar height in DIPs. 48 leaves a 3-DIP clear margin above and below the 42-DIP centre
+/// cluster (shelf + 38 px icons + running dots), so the shelf's top rim is never clipped.
+pub const DOCK_H: f32 = 48.0;
+const BAR_RADIUS: f32 = 18.0;
 const TILE_H: f32 = 34.0;
-const TILE_RADIUS: f32 = 7.0;
-const ROW_PAD: f32 = 5.0; // .dock-row padding
+const ROW_PAD: f32 = 5.0; // styles.css .dock-row padding: 0 5px
 const ZONE_GAP: f32 = 5.0; // .zone gap
 const ROW_GAP: f32 = 6.0; // .dock-row gap between zones
 
 // Colors from styles.css, 0xRRGGBBAA.
-const BAR_TOP: u32 = 0x2C2E_3838; // linear-gradient(180deg, rgba(44,46,56,.22), rgba(16,17,22,.34))
-const BAR_BOTTOM: u32 = 0x1011_1657;
-const BAR_BORDER: u32 = 0xFFFF_FF24; // rgba(255,255,255,.14)
-const TILE_FILL: u32 = 0x1C1C_20BD; // rgba(28,28,32,.74)
-const TILE_BORDER: u32 = 0xFFFF_FF13; // rgba(255,255,255,.075)
-const TILE_HOVER_FILL: u32 = 0x3030_36D1; // rgba(48,48,54,.82)
-const TILE_HOVER_BORDER: u32 = 0xFFFF_FF24; // rgba(255,255,255,.14)
+const BAR_BORDER: u32 = 0xFFFF_FF42; // liquid rim top, rgba(255,255,255,.26)
 const TEXT: u32 = 0xF1F1_F4FF;
-const MUTED: u32 = 0xFFFF_FF8C; // rgba(255,255,255,.55)
-const RING_TRACK: u32 = 0xFFFF_FF1F; // rgba(255,255,255,.12)
-const BTN_FILL: u32 = 0xFFFF_FF12; // .cc-btn background, rgba(255,255,255,.07)
-const BTN_BORDER: u32 = 0xFFFF_FF14; // rgba(255,255,255,.08)
+const MUTED: u32 = 0xFFFF_FFC0; // rgba(255,255,255,.75) — brighter on clear glass
+const RING_TRACK: u32 = 0xFFFF_FF33; // rgba(255,255,255,.20) — visible grey track behind accent arc
+const NO_BACKDROP_TOP: u32 = 0x6E68_62FF;
+const NO_BACKDROP_BOTTOM: u32 = 0x5A55_50FF;
 const CLOCK_TOP: u32 = 0xFF5A_3CFF;
 const CLOCK_BOTTOM: u32 = 0xE832_1EFF;
 const HM_EMPTY: u32 = 0xFFFF_FF14; // .hm.l0
@@ -66,8 +64,14 @@ pub enum Style {
     Clock,
     /// Git card: numbers line above a 16x3 mini heatmap (`cells`).
     Git,
+    /// Now-playing tile: waveform plus ellipsized title/artist.
+    Media,
     /// Control Center button: value holds Segoe MDL2 glyphs drawn side by side.
     Button,
+    /// Windows logo button that opens Start.
+    Start,
+    /// Thin vertical divider in the centre cluster (Start | apps).
+    Separator,
     /// No background (the apps zone, the settings gear). `value` is the glyph or text.
     Bare,
 }
@@ -84,12 +88,29 @@ pub struct TileView {
     pub progress: Option<f32>,
     /// Gauge/bar color, 0xRRGGBBAA. 0 means the default.
     pub accent: u32,
+    /// Live endpoint peak for the media visualizer, 0..1.
+    pub audio_peak: f32,
     /// Icon square background for AI tiles, 0xRRGGBBAA. 0 means no square.
     pub bg: u32,
     /// Git heatmap levels 0..=4, column-major (16 columns of 3 rows). Empty when unused.
     pub cells: Vec<u8>,
     /// Vector glyph drawn inside `bg`: SVG path data and an optional stroke width (None = fill).
     pub glyph: Option<(&'static str, Option<f32>)>,
+    /// Extra small usage bars (0..1, color) drawn top-right on a card, e.g. Cursor's
+    /// "Auto + Composer" and "API models" limits next to the main $ bar.
+    pub mini: Vec<(f32, u32)>,
+    /// Control Center button: SF-style Wi-Fi + speaker icons (None draws `value` glyphs).
+    pub status: Option<StatusIcons>,
+    /// Tray-overflow chevron; `Some(open)` (points down while the flyout is open).
+    pub chevron: Option<bool>,
+}
+
+/// State for the dock's Wi-Fi / speaker status icons.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StatusIcons {
+    pub wifi: super::sficons::Wifi,
+    pub volume: f32,
+    pub muted: bool,
 }
 
 impl TileView {
@@ -103,9 +124,13 @@ impl TileView {
             icon: None,
             progress: None,
             accent: 0,
+            audio_peak: 0.0,
             bg: 0,
             cells: Vec::new(),
             glyph: None,
+            mini: Vec::new(),
+            status: None,
+            chevron: None,
         }
     }
 
@@ -115,33 +140,85 @@ impl TileView {
     }
 }
 
-/// Places tiles in three zones. Center group is centered on the bar; left and right hug the edges.
-/// Returns one rect per tile, in the order: left, center, right.
+/// Fixed left-tile widths (Dock-Rc: .ai-tile 100px, .music-tile 142px, scaled up a little so
+/// "$52.59/$20.00" and Vietnamese titles fit). Every usage tile shares one width.
+pub const GIT_W: f32 = 118.0;
+pub const USAGE_W: f32 = 112.0;
+pub const MEDIA_W: f32 = 200.0;
+
+/// Minimum clear space between a side zone and the centre cluster.
+pub const CENTER_GAP: f32 = 12.0;
+/// Media keeps at least this width before other left tiles are squeezed.
+const MEDIA_MIN_W: f32 = 150.0;
+
+/// Places tiles in three zones. Returns one rect per tile, in the order: left, center, right.
+///
+/// The centre cluster (Start + app icons) is centred on `screen_w / 2` exactly and never moves
+/// for the side zones. Side tiles keep their fixed widths; only if a zone would come closer
+/// than `CENTER_GAP` to the cluster (small monitor, many apps) does `media` shrink first
+/// (down to `MEDIA_MIN_W`), then every tile scales down. Spare room is left as glass.
 pub fn layout(left: &[Tile], center: &[Tile], right: &[Tile], screen_w: f32) -> Vec<RectF> {
     let mut out = Vec::with_capacity(left.len() + center.len() + right.len());
-    let place = |tiles: &[Tile], x: f32, out: &mut Vec<RectF>| -> f32 {
+    let gaps = |n: usize| ZONE_GAP * n.saturating_sub(1) as f32;
+    let zone_w = |tiles: &[Tile]| -> f32 { tiles.iter().map(|t| t.width).sum::<f32>() + gaps(tiles.len()) };
+    let place = |tiles: &[Tile], widths: &[f32], x: f32, out: &mut Vec<RectF>| {
         let mut x = x;
-        for t in tiles {
+        for (t, &w) in tiles.iter().zip(widths) {
             let h = if t.height > 0.0 { t.height } else { TILE_H };
-            out.push(RectF { x, y: (DOCK_H - h) / 2.0, w: t.width, h });
-            x += t.width + ZONE_GAP;
+            out.push(RectF { x, y: (DOCK_H - h) / 2.0, w, h });
+            x += w + ZONE_GAP;
         }
-        x
     };
-    let zone_w = |tiles: &[Tile]| -> f32 {
-        tiles.iter().map(|t| t.width).sum::<f32>() + ZONE_GAP * tiles.len().saturating_sub(1) as f32
-    };
-
-    place(left, ROW_PAD, &mut out);
 
     let center_w = zone_w(center);
     let center_x = (screen_w - center_w) / 2.0;
-    place(center, center_x, &mut out);
+    let center_right = center_x + center_w;
+    let (left_max, right_max) = if center.is_empty() {
+        let half = (screen_w / 2.0 - ROW_PAD - CENTER_GAP / 2.0).max(0.0);
+        (half, half)
+    } else {
+        (
+            (center_x - CENTER_GAP - ROW_PAD).max(0.0),
+            (screen_w - ROW_PAD - CENTER_GAP - center_right).max(0.0),
+        )
+    };
 
-    let right_w = zone_w(right);
-    let right_x = (screen_w - ROW_PAD - right_w).max(center_x + center_w + ROW_GAP);
-    place(right, right_x, &mut out);
+    let left_widths = side_widths(left, left_max);
+    place(left, &left_widths, ROW_PAD, &mut out);
+    place(center, &center.iter().map(|t| t.width).collect::<Vec<_>>(), center_x, &mut out);
+    // Right packs to the trailing edge (clock / rings stay put).
+    let right_widths = side_widths(right, right_max);
+    let fitted_right_w: f32 = right_widths.iter().sum::<f32>() + gaps(right.len());
+    place(right, &right_widths, screen_w - ROW_PAD - fitted_right_w, &mut out);
     out
+}
+
+/// Tile widths for one side zone: the fixed widths, squeezed only when they exceed `max_w`.
+fn side_widths(tiles: &[Tile], max_w: f32) -> Vec<f32> {
+    let mut widths: Vec<f32> = tiles.iter().map(|t| t.width).collect();
+    if tiles.is_empty() {
+        return widths;
+    }
+    let gaps = ZONE_GAP * tiles.len().saturating_sub(1) as f32;
+    let natural = widths.iter().sum::<f32>() + gaps;
+    let media = tiles.iter().position(|t| t.id == "media");
+    if natural <= max_w {
+        return widths;
+    }
+    let mut over = natural - max_w;
+    if let Some(i) = media {
+        let give = (widths[i] - MEDIA_MIN_W).max(0.0).min(over);
+        widths[i] -= give;
+        over -= give;
+    }
+    if over > 0.0 {
+        let total: f32 = widths.iter().sum();
+        let scale = ((total - over).max(0.0) / total.max(1.0)).clamp(0.0, 1.0);
+        for w in &mut widths {
+            *w *= scale;
+        }
+    }
+    widths
 }
 
 /// Index of the rect containing (x, y), if any.
@@ -160,16 +237,37 @@ pub fn draw_dock(
     rects: &[RectF],
     hover: Option<usize>,
     backdrop: Option<&LiquidBitmap>,
+    opacity_pct: u8,
 ) -> Result<()> {
-    let (w, h) = r.size();
-    let bar = RectF { x: 0.0, y: 0.0, w, h };
-    r.fill_rounded_rect_gradient(bar, BAR_RADIUS, BAR_TOP, BAR_BOTTOM)?;
-    // Liquid Glass canvas sits over the tint, as `.liquid-canvas` does over `.dock`.
-    if let Some(b) = backdrop {
-        r.draw_bitmap(b.w, b.h, &b.rgba, bar)?;
+    let (w, _) = r.size();
+    let bar = RectF { x: 0.0, y: 0.0, w, h: DOCK_H };
+    // The wallpaper blur is the backdrop. The readable smoky tint must sit above it, not below
+    // an opaque bitmap where it would disappear.
+    match backdrop {
+        Some(b) => r.draw_bitmap(b.w, b.h, &b.rgba, bar)?,
+        // No wallpaper crop yet: the HWND target has no real alpha, so a transparent clear
+        // shows as black. Paint a neutral mid-tone glass base instead of a near-black bar.
+        None => r.fill_top_rounded_rect_gradient(bar, BAR_RADIUS, NO_BACKDROP_TOP, NO_BACKDROP_BOTTOM)?,
     }
-    r.stroke_rounded_rect(bar, BAR_RADIUS, BAR_BORDER, 1.0)?;
+    // Liquid Glass bar: the refracted wallpaper stays visible. Only a light neutral dim (scaled
+    // from the Glass opacity setting) for legibility, never a dark slab. Flush to the monitor
+    // edge: round only the top corners.
+    let dim_alpha = (opacity_pct.min(95) as u32 * 45 / 100).min(60);
+    r.fill_top_rounded_rect(bar, BAR_RADIUS, 0x1416_1C00 | dim_alpha)?;
+    // Soft inner highlight across the top of the bar.
+    r.fill_top_rounded_rect_gradient(
+        RectF { h: DOCK_H * 0.45, ..bar },
+        BAR_RADIUS,
+        0xFFFF_FF2A,
+        0xFFFF_FF00,
+    )?;
+    // Specular rim: brightest at the top-left, fading to the right.
+    r.stroke_top_rounded_rect_linear(bar, BAR_RADIUS, (0.0, 0.0), 0xFFFF_FFA0, (w * 0.6, DOCK_H), 0xFFFF_FF2E, 1.0)?;
+    let _ = (glass_fill_color(opacity_pct), GLASS_SHEEN_TOP, BAR_BORDER);
 
+    if let Some(shelf) = SHELF.with(Cell::get) {
+        draw_shelf(r, shelf)?;
+    }
     for (i, (t, rc)) in tiles.iter().zip(rects).enumerate() {
         let hovered = hover == Some(i);
         match t.style {
@@ -178,17 +276,19 @@ pub fn draw_dock(
             Style::Ring => draw_ring(r, t, *rc, hovered)?,
             Style::Clock => draw_clock(r, t, *rc, hovered)?,
             Style::Git => draw_git(r, t, *rc, hovered)?,
+            Style::Media => draw_media(r, t, *rc, hovered)?,
             Style::Button => draw_button(r, t, *rc, hovered)?,
+            Style::Start => draw_start(r, *rc, hovered)?,
+            Style::Separator => draw_separator(r, *rc)?,
         }
     }
     Ok(())
 }
 
-/// Card background shared by every boxed tile, with the hover state of `.tile:hover`.
+/// Card background shared by every boxed tile: a Liquid Glass piece sampled from the bar's
+/// backdrop at the tile's own position. Hover glows brighter; geometry never changes.
 fn card_frame(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
-    let (fill, border) = if hovered { (TILE_HOVER_FILL, TILE_HOVER_BORDER) } else { (TILE_FILL, TILE_BORDER) };
-    r.fill_rounded_rect(rc, TILE_RADIUS, fill)?;
-    r.stroke_rounded_rect(rc, TILE_RADIUS, border, 1.0)
+    super::glass::draw_glass(r, rc, super::glass::GLASS_RADIUS, super::glass::Layer::Tile, hovered)
 }
 
 fn draw_bare(r: &mut Renderer, t: &TileView, rc: RectF) -> Result<()> {
@@ -214,7 +314,12 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
         }
         if let Some((d, stroke)) = t.glyph {
             // Provider logos are 24-unit SVG paths in white.
-            svgpath::draw_path(r, d, RectF { x: sq.x + 4.0, y: sq.y + 4.0, w: 14.0, h: 14.0 }, 24.0, 0xFFFF_FFFF, stroke)?;
+            let area = RectF { x: sq.x + 4.0, y: sq.y + 4.0, w: 14.0, h: 14.0 };
+            svgpath::draw_path(r, d, area, 24.0, 0xFFFF_FFFF, stroke)?;
+            if t.title == "Cursor" {
+                svgpath::draw_path(r, svgpath::CURSOR_CUBE_INNER, area, 24.0, 0xE8E8_E8FF, Some(1.2))?;
+                svgpath::draw_path(r, svgpath::CURSOR_CUBE_TOP, area, 24.0, 0xE8E8_E8D9, None)?;
+            }
         }
         text_x = sq.x + 22.0 + 6.0;
     }
@@ -227,10 +332,21 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
     r.draw_text(&t.title, title, 8.5, MUTED, Align::Left)?;
     let value_w = if t.sub.is_empty() { text_w } else { text_w * 0.55 };
     let value = RectF { x: text_x, y: rc.y + 14.0, w: value_w, h: 14.0 };
-    r.draw_text_styled(&t.value, value, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    // Fixed tile width: long values ("$52.59/$20.00") step down a size before ellipsizing.
+    let value_px = if t.value.chars().count() as f32 * 11.5 * 0.56 > value_w { 10.0 } else { 11.5 };
+    r.draw_text_styled(&t.value, value, value_px, TEXT, Align::Left, TextStyle::Bold)?;
     if !t.sub.is_empty() {
         let sub = RectF { x: text_x + value_w, y: rc.y + 14.0, w: text_w - value_w, h: 14.0 };
         r.draw_text(&t.sub, sub, 8.0, MUTED, Align::Right)?;
+    }
+    // Extra limits: short stacked bars in the free top-right corner beside the title.
+    for (i, (p, c)) in t.mini.iter().enumerate().take(2) {
+        let track = RectF { x: rc.x + rc.w - 7.0 - 28.0, y: rc.y + 5.0 + i as f32 * 4.0, w: 28.0, h: 2.0 };
+        r.fill_rounded_rect(track, 1.0, RING_TRACK)?;
+        let fill_w = track.w * p.clamp(0.0, 1.0);
+        if fill_w > 0.0 {
+            r.fill_rounded_rect(RectF { w: fill_w.max(2.0), ..track }, 1.0, *c)?;
+        }
     }
     if let Some(p) = t.progress {
         // .pbar: 2.5 px track along the bottom, colored fill.
@@ -247,16 +363,41 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
 
 fn draw_ring(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
-    // SVG ring: 28 px box, radius 11.5, stroke 2.4, starts at 12 o'clock.
+    // Dock-Rc Ring: 28 px box, r=11.5, stroke 2.4, track + accent; tiny label above the percent.
     let (cx, cy) = (rc.x + rc.w / 2.0, rc.y + rc.h / 2.0);
     let radius = 11.5;
     let width = 2.4;
     r.stroke_arc(cx, cy, radius, 0.0, 360.0, RING_TRACK, width)?;
     if let Some(p) = t.progress {
         let accent = if t.accent != 0 { t.accent } else { 0x4AA8_FFFF };
-        r.stroke_arc(cx, cy, radius, -90.0, 360.0 * p.clamp(0.0, 1.0), accent, width)?;
+        let sweep = 360.0 * p.clamp(0.0, 1.0);
+        if sweep >= 0.5 {
+            r.stroke_arc(cx, cy, radius, -90.0, sweep, accent, width)?;
+        }
     }
-    r.draw_text_styled(&t.value, rc, 9.5, TEXT, Align::Center, TextStyle::Bold)
+    let inset = radius - width;
+    let inner = RectF { x: cx - inset, y: cy - inset, w: inset * 2.0, h: inset * 2.0 };
+    if !t.title.is_empty() {
+        // Label above the number so "CPU"/"RAM" never collides with the percent.
+        r.draw_text(
+            &t.title,
+            RectF { x: inner.x, y: inner.y + 0.5, w: inner.w, h: 7.5 },
+            6.0,
+            MUTED,
+            Align::Center,
+        )?;
+        r.draw_text_styled(
+            &t.value,
+            RectF { x: inner.x, y: cy - 3.0, w: inner.w, h: inset },
+            8.5,
+            TEXT,
+            Align::Center,
+            TextStyle::Bold,
+        )?;
+    } else {
+        r.draw_text_styled(&t.value, inner, 9.0, TEXT, Align::Center, TextStyle::Bold)?;
+    }
+    Ok(())
 }
 
 fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
@@ -266,8 +407,15 @@ fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
     r.draw_text_styled(&t.value, time, 11.0, 0xFFFF_FFFF, Align::Center, TextStyle::Bold)?;
 
     let row = RectF { x: rc.x + 4.0, y: time.y + time.h + 1.0, w: rc.w - 8.0, h: 12.0 };
-    r.draw_text(&t.title, row, 8.0, MUTED, Align::Left)?;
-    r.draw_text(&t.sub, row, 8.0, 0xFFFF_FFCC, Align::Right)
+    let date_w = 26.0_f32.min(row.w);
+    r.draw_text(&t.title, RectF { w: date_w, ..row }, 8.0, MUTED, Align::Left)?;
+    r.draw_text(
+        &t.sub,
+        RectF { x: row.x + date_w + 1.0, w: (row.w - date_w - 1.0).max(0.0), ..row },
+        8.5,
+        0xFFFF_FFCC,
+        Align::Right,
+    )
 }
 
 fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
@@ -294,17 +442,201 @@ fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<
     Ok(())
 }
 
+fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    let elapsed = {
+        static START: OnceLock<Instant> = OnceLock::new();
+        START.get_or_init(Instant::now).elapsed().as_secs_f32()
+    };
+    let peak = t.audio_peak.sqrt();
+    let has_peak = peak > 0.04;
+    let playing = t.progress.is_some();
+    for i in 0..14 {
+        let pulse = ((elapsed * 10.0 + i as f32 * 1.73).sin() * 0.5 + 0.5).powf(0.7);
+        let shape = 0.45 + 0.55 * ((i as f32 - 6.5).abs() / 6.5 * std::f32::consts::PI).cos().abs();
+        // Peak drives the bars when audio is audible; otherwise a soft idle pulse while "playing".
+        let h = if playing && has_peak {
+            3.0 + peak * (5.0 + 18.0 * pulse * shape)
+        } else if playing {
+            3.0 + (0.2 + 0.35 * pulse * shape) * 10.0
+        } else {
+            4.0
+        };
+        r.fill_rounded_rect(
+            RectF { x: rc.x + 7.0 + i as f32 * 4.0, y: rc.y + (rc.h - h) / 2.0, w: 2.0, h },
+            1.0,
+            if playing { 0xC7A6_FFFF } else { 0xC7A6_FF8C },
+        )?;
+    }
+    let x = rc.x + 65.0;
+    let w = (rc.x + rc.w - 7.0 - x).max(0.0);
+    // Full strings (Vietnamese diacritics intact); DirectWrite ellipsizes only when they overflow.
+    r.draw_text_styled(&t.title, RectF { x, y: rc.y + 4.0, w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(&t.sub, RectF { x, y: rc.y + 18.0, w, h: 11.0 }, 8.5, MUTED, Align::Left)
+}
+
 fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     // .cc-btn: 34 px, radius 8, faint fill; hover brightens it.
-    let fill = if hovered { 0xFFFF_FF26 } else { BTN_FILL };
-    r.fill_rounded_rect(rc, 8.0, fill)?;
-    r.stroke_rounded_rect(rc, 8.0, BTN_BORDER, 1.0)?;
+    if let Some(open) = t.chevron {
+        // Square liquid-glass key; while the flyout is open it stays lit (pressed look)
+        // and the SF-style chevron flips from up to down.
+        card_frame(r, rc, hovered || open)?;
+        if open {
+            r.fill_rounded_rect(rc, super::glass::GLASS_RADIUS, 0xFFFF_FF26)?;
+        }
+        let g = RectF { x: rc.x + (rc.w - 12.0) / 2.0, y: rc.y + (rc.h - 12.0) / 2.0, w: 12.0, h: 12.0 };
+        let color = if hovered || open { 0xFFFF_FFFF } else { 0xFFFF_FFD9 };
+        return super::sficons::draw_chevron(r, g, !open, color);
+    }
+    card_frame(r, rc, hovered)?;
+    if let Some(st) = t.status {
+        // macOS menu-bar look: Wi-Fi fan (15 px) then speaker (17x15), white, vector.
+        let cy = rc.y + rc.h / 2.0;
+        let wifi = RectF { x: rc.x + 7.0, y: cy - 7.5, w: 15.0, h: 15.0 };
+        let spk = RectF { x: wifi.x + wifi.w + 6.0, y: cy - 7.5, w: 17.0, h: 15.0 };
+        super::sficons::draw_wifi(r, wifi, st.wifi, 0xFFFF_FFFF)?;
+        return super::sficons::draw_speaker(r, spk, st.volume, st.muted, 0xFFFF_FFF0);
+    }
     // Glyphs sit side by side, 14 px each with a 7 px gap.
     let mut x = rc.x + 9.0;
-    for glyph in t.value.chars() {
+    for (index, glyph) in t.value.chars().enumerate() {
         let g = RectF { x, y: rc.y, w: 14.0, h: rc.h };
-        r.draw_text_styled(&glyph.to_string(), g, 13.0, 0xFFFF_FFE0, Align::Center, TextStyle::Icon)?;
+        let color = if index == 0 {
+            match t.progress {
+                Some(p) if p > 0.5 => 0xFFFF_FFFF,
+                Some(_) => 0xFFFF_FF73,
+                None => 0xFFFF_FFC4,
+            }
+        } else {
+            0xFFFF_FFE8
+        };
+        r.draw_text_styled(&glyph.to_string(), g, 13.0, color, Align::Center, TextStyle::Icon)?;
         x += 14.0 + 7.0;
     }
     Ok(())
+}
+
+fn draw_start(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
+    // macOS-style: white Windows logo on a blue squircle, same size and shadow as app icons.
+    super::apps::draw_start_icon(r, rc, hovered)
+}
+
+fn draw_separator(r: &mut Renderer, rc: RectF) -> Result<()> {
+    let line = RectF { x: rc.x + (rc.w - 1.0) / 2.0, y: rc.y, w: 1.0, h: rc.h };
+    r.fill_rect(line, 0xFFFF_FF4D)
+}
+
+thread_local! {
+    /// Glass shelf behind the centre cluster (Start + apps), set by the caller each frame.
+    static SHELF: Cell<Option<RectF>> = const { Cell::new(None) };
+}
+
+/// Sets (or clears) the shelf drawn behind the centre cluster on the next `draw_dock`.
+pub fn set_shelf(rect: Option<RectF>) {
+    SHELF.with(|s| s.set(rect));
+}
+
+/// Shelf geometry for a centre cluster spanning `first..last` (dock-local DIPs): symmetric
+/// horizontal padding keeps it centred with the cluster; vertically it is exactly the
+/// cluster's 42-DIP band, which the layout centres in the bar (3 DIP clear above and below),
+/// so icons and running dots sit inside it.
+pub fn shelf_for(first: RectF, last: RectF) -> RectF {
+    let pad = SHELF_PAD;
+    RectF { x: first.x - pad, y: first.y, w: last.x + last.w - first.x + 2.0 * pad, h: first.h }
+}
+
+const SHELF_PAD: f32 = 5.0;
+const SHELF_RADIUS: f32 = 12.0;
+
+/// One continuous, very light liquid-glass capsule behind the icon group (macOS Tahoe dock).
+fn draw_shelf(r: &mut Renderer, rc: RectF) -> Result<()> {
+    let scale = r.dpi() as f32 / 96.0;
+    let rc = snap_to_pixels(rc, scale);
+    r.fill_rounded_rect(rc, SHELF_RADIUS, 0xFFFF_FF12)?;
+    // 1 px rims are stroked half a device pixel inside the edge so each rim lands on
+    // exactly one pixel row/column (crisp, and nothing bleeds into the bar margin).
+    let half = 0.5 / scale;
+    let rim = RectF { x: rc.x + half, y: rc.y + half, w: rc.w - 2.0 * half, h: rc.h - 2.0 * half };
+    super::glass::draw_highlights(r, rim, SHELF_RADIUS - half, 0.75)
+}
+
+/// Rounds a DIP rect's edges to whole device pixels at `scale` (DPI / 96).
+pub fn snap_to_pixels(rc: RectF, scale: f32) -> RectF {
+    let s = scale.max(0.01);
+    let (x0, y0) = ((rc.x * s).round(), (rc.y * s).round());
+    let (x1, y1) = (((rc.x + rc.w) * s).round(), ((rc.y + rc.h) * s).round());
+    RectF { x: x0 / s, y: y0 / s, w: (x1 - x0) / s, h: (y1 - y0) / s }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(id: &'static str, width: f32) -> Tile {
+        Tile { id, width, height: 0.0 }
+    }
+
+    fn home_zones(apps: usize) -> (Vec<Tile>, Vec<Tile>, Vec<Tile>) {
+        let left = vec![t("git", GIT_W), t("claude", USAGE_W), t("codex", USAGE_W), t("cursor", USAGE_W), t("grok", USAGE_W), t("media", MEDIA_W)];
+        let center = vec![
+            Tile { id: "start", width: super::super::apps::ICON, height: super::super::apps::CLUSTER_H },
+            Tile { id: "sep", width: 1.0, height: 24.0 },
+            Tile { id: "apps", width: super::super::apps::cluster_width(apps), height: super::super::apps::CLUSTER_H },
+        ];
+        let right = vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
+        (left, center, right)
+    }
+
+    #[test]
+    fn dock_layout_shelf_snaps_to_device_pixels_with_equal_margins() {
+        let shelf = RectF { x: 650.0, y: 3.0, w: 600.0, h: super::super::apps::CLUSTER_H };
+        for &scale in &[1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let s = snap_to_pixels(shelf, scale);
+            let (top, bottom) = (s.y * scale, (s.y + s.h) * scale);
+            assert!((top - top.round()).abs() < 1e-3 && (bottom - bottom.round()).abs() < 1e-3);
+            // Margins inside the visible bar (rounded to whole pixels) differ by at most 1 px
+            // and are equal when the bar height in px is even-split.
+            let bar = (DOCK_H * scale).round();
+            let (mt, mb) = (top, bar - bottom);
+            assert!((mt - mb).abs() <= 1.0, "scale {scale}: {mt} vs {mb}");
+        }
+        assert_eq!(snap_to_pixels(shelf, 1.0).y, 3.0);
+    }
+
+    #[test]
+    fn dock_layout_center_cluster_is_screen_centred() {
+        for &(w, apps) in &[(1920.0, 5), (1920.0, 1), (1536.0, 9), (2560.0, 12), (1280.0, 30)] {
+            let (l, c, r) = home_zones(apps);
+            let rects = layout(&l, &c, &r, w);
+            let first = rects[l.len()];
+            let last = rects[l.len() + c.len() - 1];
+            let mid = (first.x + last.x + last.w) / 2.0;
+            assert!((mid - w / 2.0).abs() < 0.01, "w={w} apps={apps} mid={mid}");
+        }
+    }
+
+    #[test]
+    fn dock_layout_sides_never_overlap_cluster() {
+        for &(w, apps) in &[(1920.0, 5), (1280.0, 12), (1024.0, 8)] {
+            let (l, c, r) = home_zones(apps);
+            let rects = layout(&l, &c, &r, w);
+            let left_end = rects[l.len() - 1].x + rects[l.len() - 1].w;
+            let c0 = rects[l.len()].x;
+            let c1 = rects[l.len() + c.len() - 1].x + rects[l.len() + c.len() - 1].w;
+            let right_start = rects[l.len() + c.len()].x;
+            assert!(c0 - left_end >= CENTER_GAP - 0.01, "w={w} left_end={left_end} c0={c0}");
+            assert!(right_start - c1 >= CENTER_GAP - 0.01, "w={w} c1={c1} right={right_start}");
+        }
+    }
+
+    #[test]
+    fn dock_layout_left_tiles_keep_fixed_widths_on_1080p() {
+        for apps in [1, 5, 6] {
+            let (l, c, r) = home_zones(apps);
+            let rects = layout(&l, &c, &r, 1920.0);
+            for (tile, rc) in l.iter().zip(&rects) {
+                assert_eq!(rc.w, tile.width, "{} apps={apps}", tile.id);
+            }
+        }
+    }
 }

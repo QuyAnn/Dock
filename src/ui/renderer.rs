@@ -18,15 +18,16 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory1, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
     ID2D1StrokeStyle, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE,
-    D2D1_ARC_SIZE_SMALL, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA, D2D1_GAMMA_2_2,
+    D2D1_ARC_SIZE_SMALL, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2,
     D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_SWEEP_DIRECTION_CLOCKWISE, ID2D1Geometry,
     ID2D1PathGeometry,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
     DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
@@ -34,6 +35,10 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_ROUND,
+};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 use super::dock::RectF;
@@ -120,6 +125,13 @@ fn text_format(size: f32, align: Align, style: TextStyle) -> Result<IDWriteTextF
         f.SetTextAlignment(text_align)?;
         f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
         f.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
+        let sign = dw.CreateEllipsisTrimmingSign(&f)?;
+        let trimming = DWRITE_TRIMMING {
+            granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+            delimiter: 0,
+            delimiterCount: 0,
+        };
+        f.SetTrimming(&trimming, &sign)?;
     }
     FORMATS.with(|c| c.borrow_mut().push((key, f.clone())));
     Ok(f)
@@ -140,36 +152,60 @@ fn rounded(r: RectF, radius: f32) -> D2D1_ROUNDED_RECT {
 
 pub struct Renderer {
     hwnd: HWND,
-    w: u32,
-    h: u32,
+    pixel_w: u32,
+    pixel_h: u32,
+    dpi: u32,
     target: Option<ID2D1HwndRenderTarget>,
     brush: Option<ID2D1SolidColorBrush>,
+    /// GPU bitmaps reused across frames (liquid backdrop, app icons). Keyed by the source
+    /// buffer address/size plus a content fingerprint; dropped with the render target.
+    bitmaps: std::collections::HashMap<(usize, usize, u32, u32, u64), (ID2D1Bitmap, u64)>,
+    frame: u64,
 }
 
 impl Renderer {
     /// Lightweight: no Direct2D resources are created until the first draw.
-    pub fn new(hwnd: HWND, w: i32, h: i32) -> Self {
-        Self { hwnd, w: w.max(1) as u32, h: h.max(1) as u32, target: None, brush: None }
+    pub fn new(hwnd: HWND, pixel_w: i32, pixel_h: i32, dpi: u32) -> Self {
+        Self {
+            hwnd,
+            pixel_w: pixel_w.max(1) as u32,
+            pixel_h: pixel_h.max(1) as u32,
+            dpi: dpi.max(96),
+            target: None,
+            brush: None,
+            bitmaps: std::collections::HashMap::new(),
+            frame: 0,
+        }
     }
 
+    /// Client size in device-independent pixels, matching all drawing coordinates.
     pub fn size(&self) -> (f32, f32) {
-        (self.w as f32, self.h as f32)
+        let scale = self.dpi as f32 / 96.0;
+        (self.pixel_w as f32 / scale, self.pixel_h as f32 / scale)
     }
 
-    pub fn resize(&mut self, w: i32, h: i32) {
-        self.w = w.max(1) as u32;
-        self.h = h.max(1) as u32;
+    pub fn dpi(&self) -> u32 {
+        self.dpi
+    }
+
+    pub fn resize(&mut self, pixel_w: i32, pixel_h: i32, dpi: u32) {
+        self.pixel_w = pixel_w.max(1) as u32;
+        self.pixel_h = pixel_h.max(1) as u32;
+        self.dpi = dpi.max(96);
         if let Some(rt) = &self.target {
-            let size = D2D_SIZE_U { width: self.w, height: self.h };
+            let size = D2D_SIZE_U { width: self.pixel_w, height: self.pixel_h };
             // SAFETY: `size` lives for the call.
             if unsafe { rt.Resize(&size) }.is_err() {
                 self.release();
+            } else {
+                unsafe { rt.SetDpi(self.dpi as f32, self.dpi as f32) };
             }
         }
     }
 
     /// Drops the render target and brush. Call when the window is hidden.
     pub fn release(&mut self) {
+        self.bitmaps.clear();
         self.brush = None;
         self.target = None;
     }
@@ -186,7 +222,7 @@ impl Renderer {
             };
             let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                 hwnd: self.hwnd,
-                pixelSize: D2D_SIZE_U { width: self.w, height: self.h },
+                pixelSize: D2D_SIZE_U { width: self.pixel_w, height: self.pixel_h },
                 presentOptions: D2D1_PRESENT_OPTIONS_NONE,
             };
             let rt = unsafe {
@@ -195,6 +231,7 @@ impl Renderer {
             };
             let brush = unsafe {
                 // SAFETY: null brush properties are the documented default.
+                rt.SetDpi(self.dpi as f32, self.dpi as f32);
                 rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
                 rt.CreateSolidColorBrush(&color(0), None)?
             };
@@ -221,6 +258,12 @@ impl Renderer {
         unsafe {
             rt.BeginDraw();
             rt.Clear(Some(&clear as *const D2D1_COLOR_F));
+        }
+        self.frame += 1;
+        // Forget bitmaps not drawn in the last 120 frames (closed apps, old wallpaper, temp buffers).
+        if self.frame % 32 == 0 || self.bitmaps.len() > 256 {
+            let f = self.frame;
+            self.bitmaps.retain(|_, (_, used)| f.saturating_sub(*used) < 120);
         }
         Ok(())
     }
@@ -289,7 +332,14 @@ impl Renderer {
         let r = d2d_rect(rect);
         // SAFETY: slices and rect live for the call.
         unsafe {
-            rt.DrawText(&wide, &format, &r, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL)
+            rt.DrawText(
+                &wide,
+                &format,
+                &r,
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
+                DWRITE_MEASURING_MODE_NATURAL,
+            )
         };
         Ok(())
     }
@@ -317,9 +367,16 @@ impl Renderer {
     }
 
     /// Arc stroke centered at (cx, cy), angles in degrees clockwise from 3 o'clock.
+    /// A full 360° sweep is drawn as two semicircles — a single 360° arc is degenerate in D2D
+    /// (start == end) and draws nothing, which made CPU/RAM track rings invisible.
     pub fn stroke_arc(&mut self, cx: f32, cy: f32, radius: f32, start_deg: f32, sweep_deg: f32, rgba: u32, width: f32) -> Result<()> {
         if sweep_deg.abs() < 0.5 {
             return Ok(());
+        }
+        // Split near-full circles so each AddArc has distinct endpoints.
+        if sweep_deg.abs() >= 359.5 {
+            self.stroke_arc(cx, cy, radius, start_deg, 180.0, rgba, width)?;
+            return self.stroke_arc(cx, cy, radius, start_deg + 180.0, 180.0, rgba, width);
         }
         let factory = d2d_factory()?;
         let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
@@ -349,12 +406,178 @@ impl Renderer {
         Ok(())
     }
 
+    /// Fills a rect with only the top two corners rounded (bottom edge flush / square).
+    /// Used for the dock bar when it sits on the monitor edge so wallpaper cannot peek
+    /// through lower rounded corners.
+    pub fn fill_top_rounded_rect(&mut self, rect: RectF, radius: f32, rgba: u32) -> Result<()> {
+        self.with_top_rounded_path(rect, radius, |rt, brush, geo| {
+            // SAFETY: geo and brush live for the call.
+            unsafe { rt.FillGeometry(geo, brush, None::<&windows::Win32::Graphics::Direct2D::ID2D1Brush>) };
+            Ok(())
+        }, rgba)
+    }
+
+    /// Stroke for a top-rounded / square-bottom rect (inset by half the stroke width).
+    pub fn stroke_top_rounded_rect(&mut self, rect: RectF, radius: f32, rgba: u32, width: f32) -> Result<()> {
+        let half = width / 2.0;
+        let inset = RectF { x: rect.x + half, y: rect.y + half, w: rect.w - width, h: rect.h - width };
+        let r = radius.max(0.0).min(inset.w / 2.0).min(inset.h);
+        self.with_top_rounded_path(inset, r, move |rt, brush, geo| {
+            // SAFETY: geo and brush live for the call.
+            unsafe { rt.DrawGeometry(geo, brush, width, None::<&ID2D1StrokeStyle>) };
+            Ok(())
+        }, rgba)
+    }
+
+    fn with_top_rounded_path(
+        &mut self,
+        rect: RectF,
+        radius: f32,
+        draw: impl FnOnce(&ID2D1HwndRenderTarget, &ID2D1SolidColorBrush, &ID2D1Geometry) -> Result<()>,
+        rgba: u32,
+    ) -> Result<()> {
+        let r = radius.max(0.0).min(rect.w / 2.0).min(rect.h);
+        let factory = d2d_factory()?;
+        let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
+        let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
+        // SAFETY: sink closed before draw.
+        unsafe {
+            let sink = geo.Open()?;
+            use windows::Win32::Graphics::Direct2D::Common::{
+                D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
+            };
+            // Top-left after the corner arc start, going clockwise: top edge → top-right arc →
+            // right edge → bottom-right (square) → bottom edge → bottom-left (square) → left → TL arc.
+            sink.BeginFigure(
+                D2D_POINT_2F { x: x + r, y },
+                D2D1_FIGURE_BEGIN_FILLED,
+            );
+            sink.AddLine(D2D_POINT_2F { x: x + w - r, y });
+            if r > 0.0 {
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F { x: x + w, y: y + r },
+                    size: D2D_SIZE_F { width: r, height: r },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+            }
+            sink.AddLine(D2D_POINT_2F { x: x + w, y: y + h });
+            sink.AddLine(D2D_POINT_2F { x, y: y + h });
+            sink.AddLine(D2D_POINT_2F { x, y: y + r });
+            if r > 0.0 {
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F { x: x + r, y },
+                    size: D2D_SIZE_F { width: r, height: r },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+            }
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+        }
+        let (rt, brush) = self.parts()?;
+        Self::set_color(brush, rgba);
+        let g: &ID2D1Geometry = &geo;
+        draw(rt, brush, g)
+    }
+
+    /// Vertical gradient fill clipped to a top-rounded / square-bottom path.
+    pub fn fill_top_rounded_rect_gradient(&mut self, rect: RectF, radius: f32, top: u32, bottom: u32) -> Result<()> {
+        let r = radius.max(0.0).min(rect.w / 2.0).min(rect.h);
+        let factory = d2d_factory()?;
+        let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
+        let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
+        unsafe {
+            let sink = geo.Open()?;
+            use windows::Win32::Graphics::Direct2D::Common::{
+                D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
+            };
+            sink.BeginFigure(D2D_POINT_2F { x: x + r, y }, D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(D2D_POINT_2F { x: x + w - r, y });
+            if r > 0.0 {
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F { x: x + w, y: y + r },
+                    size: D2D_SIZE_F { width: r, height: r },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+            }
+            sink.AddLine(D2D_POINT_2F { x: x + w, y: y + h });
+            sink.AddLine(D2D_POINT_2F { x, y: y + h });
+            sink.AddLine(D2D_POINT_2F { x, y: y + r });
+            if r > 0.0 {
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F { x: x + r, y },
+                    size: D2D_SIZE_F { width: r, height: r },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+            }
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+        }
+        let (rt, _) = self.parts()?;
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: color(top) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: color(bottom) },
+        ];
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+            startPoint: D2D_POINT_2F { x: rect.x, y: rect.y },
+            endPoint: D2D_POINT_2F { x: rect.x, y: rect.y + rect.h },
+        };
+        // SAFETY: stops live for CreateGradientStopCollection / CreateLinearGradientBrush.
+        let brush = unsafe {
+            let collection = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            rt.CreateLinearGradientBrush(&props, None, &collection)?
+        };
+        let g: &ID2D1Geometry = &geo;
+        unsafe { rt.FillGeometry(g, &brush, None::<&windows::Win32::Graphics::Direct2D::ID2D1Brush>) };
+        Ok(())
+    }
+
     /// Draws straight (non-premultiplied) RGBA pixels scaled into `rect`.
-    /// The bitmap is created per call and released right after drawing.
+    /// The GPU bitmap is cached per source buffer, so redraws (hover, magnify) do not
+    /// re-convert and re-upload the 1920x46 backdrop on every mouse move.
     pub fn draw_bitmap(&mut self, w: u32, h: u32, rgba: &[u8], rect: RectF) -> Result<()> {
         if rgba.len() != w as usize * h as usize * 4 {
             return Err(E_INVALIDARG.into());
         }
+        let key = (rgba.as_ptr() as usize, rgba.len(), w, h, fingerprint(rgba));
+        let frame = self.frame;
+        let cached = self.bitmaps.get_mut(&key).map(|(b, used)| {
+            *used = frame;
+            b.clone()
+        });
+        let bitmap = match cached {
+            Some(b) => b,
+            None => {
+                let b = self.create_bitmap(w, h, rgba)?;
+                self.bitmaps.insert(key, (b.clone(), frame));
+                b
+            }
+        };
+        let (rt, _) = self.parts()?;
+        let r = d2d_rect(rect);
+        // SAFETY: `r` lives for the call.
+        unsafe {
+            rt.DrawBitmap(
+                &bitmap,
+                Some(&r as *const D2D_RECT_F),
+                1.0,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                None,
+            )
+        };
+        Ok(())
+    }
+}
+
+impl Renderer {
+    fn create_bitmap(&mut self, w: u32, h: u32, rgba: &[u8]) -> Result<ID2D1Bitmap> {
         // D2D wants premultiplied BGRA.
         let mut bgra = Vec::with_capacity(rgba.len());
         for px in rgba.chunks_exact(4) {
@@ -373,21 +596,56 @@ impl Renderer {
         };
         let size = D2D_SIZE_U { width: w, height: h };
         // SAFETY: `bgra` holds w*h*4 bytes and lives for the call; `props` likewise.
-        let bitmap: ID2D1Bitmap =
-            unsafe { rt.CreateBitmap(size, Some(bgra.as_ptr().cast::<c_void>()), w * 4, &props)? };
-        let r = d2d_rect(rect);
-        // SAFETY: `r` lives for the call.
-        unsafe {
-            rt.DrawBitmap(
-                &bitmap,
-                Some(&r as *const D2D_RECT_F),
-                1.0,
-                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                None,
-            )
-        };
-        Ok(())
+        unsafe { rt.CreateBitmap(size, Some(bgra.as_ptr().cast::<c_void>()), w * 4, &props) }
     }
+}
+
+/// Cheap content hash over ~256 evenly spaced bytes: a freed buffer reused at the same
+/// address with other pixels gets a new cache entry instead of a stale image.
+fn fingerprint(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let step = (data.len() / 256).max(1);
+    let mut i = 0;
+    while i < data.len() {
+        h = (h ^ data[i] as u64).wrapping_mul(0x0100_0000_01b3);
+        i += step;
+    }
+    h
+}
+
+/// Asks the Windows 11 compositor for anti-aliased rounded corners.
+pub fn apply_dwm_rounding(hwnd: HWND) -> bool {
+    unsafe {
+        let preference: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND;
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&preference as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        )
+        .is_ok()
+    }
+}
+
+/// Corner radius (DIPs) of a DWMWCP_ROUND window on Windows 11. Popup panels draw their D2D
+/// shape with exactly this radius so the DWM clip and the drawn rims coincide.
+pub const POPUP_CORNER_RADIUS: f32 = 8.0;
+
+/// Rounded DWM corners for floating panels, with the 1 px DWM border turned off
+/// (DWMWA_COLOR_NONE) so no dark/square outline shows outside the curve.
+pub fn apply_popup_corners(hwnd: HWND) -> bool {
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    let rounded = apply_dwm_rounding(hwnd);
+    // SAFETY: documented attribute with a u32 COLORREF payload.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&DWMWA_COLOR_NONE as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+    rounded
 }
 
 /// Applies the undocumented acrylic accent (same as the old Electron build).
@@ -436,8 +694,148 @@ pub fn apply_acrylic(hwnd: HWND, tint_argb: u32) -> bool {
     }
 }
 
+/// Arbitrary-direction gradients for Liquid Glass rims and highlights.
+impl Renderer {
+    fn linear_brush(
+        &mut self,
+        p0: (f32, f32),
+        c0: u32,
+        p1: (f32, f32),
+        c1: u32,
+    ) -> Result<windows::Win32::Graphics::Direct2D::ID2D1LinearGradientBrush> {
+        let (rt, _) = self.parts()?;
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: color(c0) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: color(c1) },
+        ];
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+            startPoint: D2D_POINT_2F { x: p0.0, y: p0.1 },
+            endPoint: D2D_POINT_2F { x: p1.0, y: p1.1 },
+        };
+        // SAFETY: stops and props live for the calls.
+        unsafe {
+            let coll = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            rt.CreateLinearGradientBrush(&props, None, &coll)
+        }
+    }
+
+    /// Fills a rounded rect with a gradient from `p0` (`c0`) to `p1` (`c1`).
+    pub fn fill_rounded_rect_linear(
+        &mut self,
+        rect: RectF,
+        radius: f32,
+        p0: (f32, f32),
+        c0: u32,
+        p1: (f32, f32),
+        c1: u32,
+    ) -> Result<()> {
+        let brush = self.linear_brush(p0, c0, p1, c1)?;
+        let (rt, _) = self.parts()?;
+        let rr = rounded(rect, radius);
+        // SAFETY: `rr` and the brush live for the call.
+        unsafe { rt.FillRoundedRectangle(&rr, &brush) };
+        Ok(())
+    }
+
+    /// Strokes a rounded rect (centred on `rect` inset by half the width) with a gradient.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stroke_rounded_rect_linear(
+        &mut self,
+        rect: RectF,
+        radius: f32,
+        p0: (f32, f32),
+        c0: u32,
+        p1: (f32, f32),
+        c1: u32,
+        width: f32,
+    ) -> Result<()> {
+        let brush = self.linear_brush(p0, c0, p1, c1)?;
+        let (rt, _) = self.parts()?;
+        let h = width / 2.0;
+        let inset = RectF { x: rect.x + h, y: rect.y + h, w: (rect.w - width).max(0.0), h: (rect.h - width).max(0.0) };
+        let rr = rounded(inset, (radius - h).max(0.0));
+        // SAFETY: `rr` and the brush live for the call.
+        unsafe { rt.DrawRoundedRectangle(&rr, &brush, width, None::<&ID2D1StrokeStyle>) };
+        Ok(())
+    }
+
+    /// Strokes the dock bar outline (top corners rounded) with a gradient.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stroke_top_rounded_rect_linear(
+        &mut self,
+        rect: RectF,
+        radius: f32,
+        p0: (f32, f32),
+        c0: u32,
+        p1: (f32, f32),
+        c1: u32,
+        width: f32,
+    ) -> Result<()> {
+        let brush = self.linear_brush(p0, c0, p1, c1)?;
+        let half = width / 2.0;
+        let inset = RectF { x: rect.x + half, y: rect.y + half, w: rect.w - width, h: rect.h - width };
+        let r = radius.max(0.0).min(inset.w / 2.0).min(inset.h);
+        self.with_top_rounded_path(
+            inset,
+            r,
+            move |rt, _, geo| {
+                // SAFETY: geo and brush live for the call.
+                unsafe { rt.DrawGeometry(geo, &brush, width, None::<&ID2D1StrokeStyle>) };
+                Ok(())
+            },
+            0,
+        )
+    }
+}
+
 /// Path-geometry drawing used by `svgpath`. Kept in its own block so it does not touch the core API.
 impl Renderer {
+    /// Like `draw_geometry_with`, but strokes use round caps and joins (SF Symbols look).
+    pub fn draw_geometry_round(
+        &mut self,
+        build: impl FnOnce(&windows::Win32::Graphics::Direct2D::ID2D1GeometrySink) -> Result<()>,
+        rgba: u32,
+        stroke: Option<f32>,
+    ) -> Result<()> {
+        use windows::Win32::Graphics::Direct2D::{
+            D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_SOLID, D2D1_LINE_JOIN_ROUND, D2D1_STROKE_STYLE_PROPERTIES1,
+            D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+        };
+        let factory = d2d_factory()?;
+        let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
+        // SAFETY: the sink is closed before the geometry is used, even when `build` fails.
+        unsafe {
+            let sink = geo.Open()?;
+            let built = build(&sink);
+            let closed = sink.Close();
+            built?;
+            closed?;
+        }
+        let props = D2D1_STROKE_STYLE_PROPERTIES1 {
+            startCap: D2D1_CAP_STYLE_ROUND,
+            endCap: D2D1_CAP_STYLE_ROUND,
+            dashCap: D2D1_CAP_STYLE_ROUND,
+            lineJoin: D2D1_LINE_JOIN_ROUND,
+            miterLimit: 10.0,
+            dashStyle: D2D1_DASH_STYLE_SOLID,
+            dashOffset: 0.0,
+            transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+        };
+        // SAFETY: plain factory call with a valid properties struct.
+        let style: ID2D1StrokeStyle = unsafe { factory.CreateStrokeStyle(&props, None)?.into() };
+        let (rt, brush) = self.parts()?;
+        Self::set_color(brush, rgba);
+        let g: &ID2D1Geometry = &geo;
+        // SAFETY: `g` and `style` live for the call.
+        unsafe {
+            match stroke {
+                Some(width) => rt.DrawGeometry(g, brush, width, &style),
+                None => rt.FillGeometry(g, brush, None::<&windows::Win32::Graphics::Direct2D::ID2D1Brush>),
+            }
+        };
+        Ok(())
+    }
+
     /// Builds a path geometry through `build` (which drives an open sink), then fills it
     /// (`stroke` is None) or strokes it with the given width in DIPs.
     pub fn draw_geometry_with(

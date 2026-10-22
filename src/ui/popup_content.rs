@@ -2,7 +2,7 @@
 //! ClockTile, MusicTile, SystemTiles, styles.css `.popup*`). Pure drawing: the caller supplies data and the rect.
 //! Layout runs through `Ctx`, either drawing (`Some(renderer)`) or dry (`None`, used by `content_height`),
 //! so the window height and the drawn content always agree.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use chrono::{Datelike, Local, NaiveDate};
 use windows::core::Result;
@@ -71,12 +71,16 @@ const AI_NOTE: &str = "Đọc từ đăng nhập cục bộ của bạn trên m�
 const OPEN_METEO: &str = "Thời tiết: Open-Meteo (không cần key).";
 const LOCAL_NOTE: &str = "Đo cục bộ mỗi 2 giây.";
 
-/// Settings placeholder rows: (label, on).
-const SETTINGS: [(&str, bool); 4] = [
-    ("Start with Windows", true),
-    ("Full-width dock", false),
-    ("Dark mode", true),
-    ("Show attention dots", true),
+const SETTING_TILES: [(&str, &str); 9] = [
+    ("git", "Git"),
+    ("claude", "Claude"),
+    ("codex", "ChatGPT"),
+    ("cursor", "Cursor"),
+    ("grok", "Grok Bot"),
+    ("music", "Media"),
+    ("cpu", "CPU"),
+    ("ram", "RAM"),
+    ("weather", "Thời tiết"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,11 +102,29 @@ pub enum MediaAction {
     Next,
 }
 
+#[derive(Clone, Debug)]
+pub enum SettingsAction {
+    GlassOpacity(u8),
+    HiddenTaskbar(bool),
+    ToggleWidget(&'static str),
+    ToggleWeatherPosition,
+    ToggleStartup,
+    OpenConfig,
+    ToggleAutoPin,
+    CycleAutoPinCount,
+}
+
 
 thread_local! {
     static CONTENT: RefCell<Option<(PopupKind, DataState)>> = const { RefCell::new(None) };
+    static AI_PROVIDER: RefCell<Option<&'static str>> = const { RefCell::new(None) };
     /// Sample history per kind (Cpu, Ram), percent 0..=100, oldest first.
     static HISTORY: RefCell<Vec<(PopupKind, Vec<f32>)>> = const { RefCell::new(Vec::new()) };
+    static SETTINGS_STATE: RefCell<crate::settings::Settings> = RefCell::new(crate::settings::Settings::default());
+}
+
+pub fn set_ai_provider(provider: Option<&'static str>) {
+    AI_PROVIDER.with(|p| *p.borrow_mut() = provider);
 }
 
 /// Stores the samples for a sparkline (Cpu or Ram). Call `popup::invalidate` after updating while open.
@@ -119,6 +141,10 @@ pub fn set_history(kind: PopupKind, samples: Vec<f32>) {
 /// Stores what `paint_content` draws. Call before `popup::show` and after each data refresh.
 pub fn set_content(kind: PopupKind, data: DataState) {
     CONTENT.with(|c| *c.borrow_mut() = Some((kind, data)));
+}
+
+pub fn set_settings(settings: crate::settings::Settings) {
+    SETTINGS_STATE.with(|state| *state.borrow_mut() = settings);
 }
 
 /// Painter with the signature `popup::set_painter` expects. Draws the content stored by `set_content`.
@@ -139,8 +165,61 @@ pub fn draw_popup(r: &mut Renderer, kind: PopupKind, rect: RectF, data: &DataSta
 
 /// Total popup height for this content, in DIPs. Use it as the window height (and in the click hit test).
 pub fn content_height(kind: PopupKind, data: &DataState) -> f32 {
-    let mut c = Ctx { r: None, rect: RectF { x: 0.0, y: 0.0, w: WIDTH, h: 0.0 } };
+    let width = if kind == PopupKind::Settings { 459.0 } else { WIDTH };
+    let mut c = Ctx { r: None, rect: RectF { x: 0.0, y: 0.0, w: width, h: 0.0 } };
     draw_all(&mut c, kind, data).unwrap_or(0.0)
+}
+
+pub fn hit_settings(x: f32, y: f32, rect: RectF) -> Option<SettingsAction> {
+    let top = rect.y + HEAD_H;
+    let inner_x = rect.x + PAD_X;
+    let inner_w = rect.w - PAD_X * 2.0;
+    let slider = rect_at(inner_x, top + 33.0, inner_w, 18.0);
+    if contains(slider, x, y) {
+        let pct = ((x - slider.x) / slider.w * 95.0).round().clamp(0.0, 95.0) as u8;
+        return Some(SettingsAction::GlassOpacity(pct));
+    }
+    let taskbar = rect_at(inner_x, top + 76.0, inner_w, 30.0);
+    if contains(taskbar, x, y) {
+        return Some(SettingsAction::HiddenTaskbar(x >= taskbar.x + taskbar.w / 2.0));
+    }
+    let grid_y = top + 137.0;
+    let cell_w = (inner_w - 8.0) / 3.0;
+    for (index, (id, _)) in SETTING_TILES.iter().enumerate() {
+        let cell = rect_at(
+            inner_x + (index % 3) as f32 * (cell_w + 4.0),
+            grid_y + (index / 3) as f32 * 31.0,
+            cell_w,
+            27.0,
+        );
+        if contains(cell, x, y) {
+            return Some(SettingsAction::ToggleWidget(id));
+        }
+    }
+    if contains(rect_at(inner_x, top + 257.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::ToggleWeatherPosition);
+    }
+    if contains(rect_at(inner_x, top + 295.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::OpenConfig);
+    }
+    if contains(rect_at(inner_x, top + 333.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::OpenConfig);
+    }
+    if contains(rect_at(inner_x, top + 371.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::ToggleStartup);
+    }
+    let auto = rect_at(inner_x, top + 447.0, inner_w, 30.0);
+    if contains(auto, x, y) {
+        // The count chip (left of the switch) cycles the count; anywhere else toggles on/off.
+        let chip = autopin_chip(auto);
+        let on = SETTINGS_AUTO_ON.with(Cell::get);
+        return Some(if on && contains(chip, x, y) { SettingsAction::CycleAutoPinCount } else { SettingsAction::ToggleAutoPin });
+    }
+    None
+}
+
+fn contains(rect: RectF, x: f32, y: f32) -> bool {
+    x >= rect.x && x < rect.x + rect.w && y >= rect.y && y < rect.y + rect.h
 }
 
 /// Hit test for the media buttons. `rect` must match the one passed to `draw_popup`.
@@ -245,7 +324,7 @@ fn meta(kind: PopupKind) -> Meta {
             color: 0x2EA0_43FF,
             title: "Git activity",
             badge: None,
-            note: "Đếm commit của bạn từ git log trong các thư mục đã cấu hình.",
+            note: "Đếm commit theo git user.email (hoặc Git / email trong Cài đặt); tự tìm repo nếu chưa cấu hình thư mục.",
         },
         PopupKind::Ai => Meta { glyph: "✦", color: 0xD977_57FF, title: "AI usage", badge: None, note: AI_NOTE },
         PopupKind::Weather => Meta { glyph: "☀", color: 0xF5A5_24FF, title: "Thời tiết", badge: None, note: "Open-Meteo." },
@@ -268,7 +347,7 @@ fn meta(kind: PopupKind) -> Meta {
         }
         PopupKind::Cpu => Meta { glyph: "◔", color: 0x30A4_6CFF, title: "CPU", badge: None, note: LOCAL_NOTE },
         PopupKind::Ram => Meta { glyph: "◔", color: 0x3E63_DDFF, title: "RAM", badge: None, note: LOCAL_NOTE },
-        PopupKind::Settings => Meta { glyph: "⚙", color: 0x6B6B_75FF, title: "Settings", badge: None, note: "" },
+        PopupKind::Settings => Meta { glyph: "⚙", color: 0x6B6B_75FF, title: "Cài đặt SmartDock", badge: None, note: "" },
     }
 }
 
@@ -357,13 +436,13 @@ fn row(
         c.fill(rect_at(c.rect.x, y, c.rect.w, h), STRIPE)?;
     }
     let (x, w) = (c.inner_x(), c.inner_w());
-    c.text(label, rect_at(x, y + 7.0, w * 0.5, 15.0), font(11.0, TEXT))?;
+    c.text(label, rect_at(x, y + 7.0, w * 0.5, 15.0), font(12.5, TEXT))?;
     if let Some(hint) = hint {
         let hint_w = if value.is_some() { w - VALUE_W } else { w };
-        c.text(hint, rect_at(x, y + 7.0, hint_w, 15.0), font(9.5, MUTED).right())?;
+        c.text(hint, rect_at(x, y + 7.0, hint_w, 15.0), font(10.5, MUTED).right())?;
     }
     if let Some(v) = value {
-        c.text(v, rect_at(x + w - VALUE_W, y + 7.0, VALUE_W, 15.0), font(11.0, TEXT).bold().right())?;
+        c.text(v, rect_at(x + w - VALUE_W, y + 7.0, VALUE_W, 15.0), font(12.5, TEXT).bold().right())?;
     }
     if let Some((frac, color)) = bar {
         let track = rect_at(x, y + 28.0, w * BAR_FRAC, 4.0);
@@ -415,7 +494,7 @@ fn draw_all(c: &mut Ctx<'_>, kind: PopupKind, data: &DataState) -> Result<f32> {
             draw_weather(c, y, data.weather.as_ref())?
         }
         PopupKind::Cpu | PopupKind::Ram => draw_system(c, top, kind, &hist)?,
-        PopupKind::Settings => draw_settings(c, top)?,
+        PopupKind::Settings => draw_settings(c, top, data)?,
     };
     footer(c, y, m.note)
 }
@@ -487,16 +566,29 @@ fn draw_ai(c: &mut Ctx<'_>, y: f32, ai: &[AiUsage]) -> Result<f32> {
         return empty(c, y, "Đang tải…");
     }
     let mut y = section(c, y, "USAGE")?;
-    for (i, u) in ai.iter().enumerate() {
-        y = if u.session_pct.is_nan() {
-            // No data: reset_text holds the status (sign-in needed, error, ...).
-            row(c, y, i, &u.name, Some(u.reset_text.as_str()), None, None)?
-        } else {
-            let pct = u.session_pct;
-            let value = format!("{pct:.0}%");
-            let hint = (!u.reset_text.is_empty()).then_some(u.reset_text.as_str());
-            row(c, y, i, &u.name, hint, Some(value.as_str()), Some(((pct / 100.0).clamp(0.0, 1.0), ai_color(pct))))?
-        };
+    let selected = AI_PROVIDER.with(|p| *p.borrow());
+    let providers = ai.iter().filter(|u| selected.is_none_or(|name| u.name == name));
+    let mut row_index = 0usize;
+    for u in providers {
+        if u.windows.is_empty() {
+            y = row(c, y, row_index, &u.name, Some(u.reset_text.as_str()), None, None)?;
+            row_index += 1;
+            continue;
+        }
+        for window in &u.windows {
+            let value = format!("{:.0}%", window.used_pct);
+            let hint = (!window.reset_text.is_empty()).then_some(window.reset_text.as_str());
+            y = row(
+                c,
+                y,
+                row_index,
+                &window.label,
+                hint,
+                Some(value.as_str()),
+                Some(((window.used_pct / 100.0).clamp(0.0, 1.0), ai_color(window.used_pct))),
+            )?;
+            row_index += 1;
+        }
     }
     // No SUBSCRIPTION section: AiUsage carries no plan info yet.
     section_end(c, y)
@@ -650,12 +742,135 @@ fn spark(c: &mut Ctx<'_>, area: RectF, data: &[f32], color: u32) -> Result<()> {
     Ok(())
 }
 
-fn draw_settings(c: &mut Ctx<'_>, y: f32) -> Result<f32> {
-    let mut y = y;
-    for (i, (label, on)) in SETTINGS.iter().enumerate() {
-        y = row(c, y, i, label, None, Some(if *on { "On" } else { "Off" }), None)?;
+fn draw_settings(c: &mut Ctx<'_>, y: f32, data: &DataState) -> Result<f32> {
+    let settings = SETTINGS_STATE.with(|state| state.borrow().clone());
+    let x = c.inner_x();
+    let w = c.inner_w();
+
+    c.text(
+        &format!("ĐỘ ĐỤC KÍNH  ·  {}%", settings.glass_opacity),
+        rect_at(x, y + 10.0, w, 15.0),
+        font(9.5, MUTED).bold(),
+    )?;
+    let track = rect_at(x, y + 38.0, w, 5.0);
+    c.round(track, 2.5, 0xFFFF_FF1F)?;
+    c.round(RectF { w: track.w * settings.glass_opacity as f32 / 95.0, ..track }, 2.5, BLUE)?;
+    let knob_x = track.x + track.w * settings.glass_opacity as f32 / 95.0;
+    c.round(rect_at(knob_x - 7.0, track.y - 5.0, 14.0, 14.0), 7.0, WHITE)?;
+
+    c.text("TASKBAR WINDOWS", rect_at(x, y + 57.0, w, 15.0), font(9.5, MUTED).bold())?;
+    let taskbar = rect_at(x, y + 76.0, w, 30.0);
+    c.round(taskbar, 8.0, 0xFFFF_FF0F)?;
+    let half = taskbar.w / 2.0;
+    let hidden = settings.taskbar_mode == "hidden";
+    c.round(
+        rect_at(taskbar.x + if hidden { half } else { 0.0 }, taskbar.y, half, taskbar.h),
+        8.0,
+        0x4AA8_FF45,
+    )?;
+    c.text("Tự ẩn", rect_at(taskbar.x, taskbar.y, half, taskbar.h), font(10.5, if hidden { MUTED } else { WHITE }).center())?;
+    c.text("Ẩn hoàn toàn", rect_at(taskbar.x + half, taskbar.y, half, taskbar.h), font(10.5, if hidden { WHITE } else { MUTED }).center())?;
+
+    c.text("WIDGET HIỂN THỊ", rect_at(x, y + 118.0, w, 15.0), font(9.5, MUTED).bold())?;
+    let cell_w = (w - 8.0) / 3.0;
+    for (index, (id, label)) in SETTING_TILES.iter().enumerate() {
+        let on = match *id {
+            "git" => settings.tiles.git,
+            "claude" => settings.tiles.claude,
+            "codex" => settings.tiles.codex,
+            "cursor" => settings.tiles.cursor,
+            "grok" => settings.tiles.grok,
+            "music" => settings.tiles.music,
+            "cpu" => settings.tiles.cpu,
+            "ram" => settings.tiles.ram,
+            _ => settings.tiles.weather,
+        };
+        let cell = rect_at(
+            x + (index % 3) as f32 * (cell_w + 4.0),
+            y + 137.0 + (index / 3) as f32 * 31.0,
+            cell_w,
+            27.0,
+        );
+        c.round(cell, 7.0, if on { 0x4AA8_FF35 } else { 0xFFFF_FF0B })?;
+        c.text(if on { "✓" } else { "○" }, rect_at(cell.x + 8.0, cell.y, 16.0, cell.h), font(10.5, if on { BLUE } else { MUTED }).center())?;
+        c.text(label, rect_at(cell.x + 27.0, cell.y, cell.w - 32.0, cell.h), font(10.0, if on { TEXT } else { MUTED }))?;
     }
-    Ok(y)
+
+    setting_value(
+        c,
+        rect_at(x, y + 257.0, w, 30.0),
+        "Vị trí thời tiết",
+        if settings.weather_position == "tile" { "Widget riêng" } else { "Trong đồng hồ" },
+    )?;
+    setting_value(c, rect_at(x, y + 295.0, w, 30.0), "Địa điểm", &settings.weather_location)?;
+    let repo = if settings.git_folders.is_empty() {
+        if settings.git_author.is_empty() {
+            "Tự tìm repo · user.email".to_owned()
+        } else {
+            format!("Tự tìm repo · {}", settings.git_author)
+        }
+    } else {
+        format!("{} thư mục · {}", settings.git_folders.len(), if settings.git_author.is_empty() { "email Git" } else { &settings.git_author })
+    };
+    setting_value(c, rect_at(x, y + 333.0, w, 30.0), "Git / email", &repo)?;
+    setting_value(
+        c,
+        rect_at(x, y + 371.0, w, 30.0),
+        "Khởi động cùng Windows",
+        if settings.launch_at_startup { "Bật" } else { "Tắt" },
+    )?;
+    setting_value(c, rect_at(x, y + 409.0, w, 30.0), "Phím tắt ẩn / hiện", &settings.shortcut)?;
+    autopin_row(c, rect_at(x, y + 447.0, w, 30.0), settings.auto_pin, settings.auto_pin_count)?;
+    let git_hint = data
+        .git
+        .as_ref()
+        .and_then(|g| g.error.as_deref())
+        .unwrap_or("Bấm Địa điểm hoặc Git / email để sửa settings.json.");
+    c.text(git_hint, rect_at(x, y + 485.0, w, 28.0), font(9.0, MUTED))?;
+    Ok(y + 522.0)
+}
+
+thread_local! {
+    /// Auto-pin state as last drawn (the hit test needs to know whether the chip is shown).
+    static SETTINGS_AUTO_ON: Cell<bool> = const { Cell::new(true) };
+}
+
+/// Switch geometry inside the auto-pin row (right side, iOS-style pill).
+fn autopin_switch(area: RectF) -> RectF {
+    rect_at(area.x + area.w - 10.0 - 34.0, area.y + (area.h - 18.0) / 2.0, 34.0, 18.0)
+}
+
+/// "N app" chip left of the switch; click cycles 4/6/8/10/12.
+fn autopin_chip(area: RectF) -> RectF {
+    let sw = autopin_switch(area);
+    rect_at(sw.x - 8.0 - 54.0, area.y + (area.h - 20.0) / 2.0, 54.0, 20.0)
+}
+
+/// "Tự động ghim app" with a clear on/off switch and the count chip.
+fn autopin_row(c: &mut Ctx<'_>, area: RectF, on: bool, count: u32) -> Result<()> {
+    SETTINGS_AUTO_ON.with(|s| s.set(on));
+    c.round(area, 8.0, 0xFFFF_FF0B)?;
+    c.text("Tự động ghim app", rect_at(area.x + 10.0, area.y, area.w * 0.5, area.h), font(10.0, TEXT))?;
+    let sw = autopin_switch(area);
+    c.round(sw, sw.h / 2.0, if on { 0x34C7_59FF } else { 0xFFFF_FF2E })?;
+    let knob = 14.0;
+    let kx = if on { sw.x + sw.w - 2.0 - knob } else { sw.x + 2.0 };
+    c.round(rect_at(kx, sw.y + 2.0, knob, knob), knob / 2.0, 0xFFFF_FFFF)?;
+    if on {
+        let chip = autopin_chip(area);
+        c.round(chip, 6.0, 0xFFFF_FF14)?;
+        c.text(&format!("{count} app ▾"), chip, font(9.5, TEXT).center())?;
+    } else {
+        let label = rect_at(sw.x - 8.0 - 54.0, area.y, 54.0, area.h);
+        c.text("Tắt", label, font(9.5, MUTED).right())?;
+    }
+    Ok(())
+}
+
+fn setting_value(c: &mut Ctx<'_>, area: RectF, label: &str, value: &str) -> Result<()> {
+    c.round(area, 8.0, 0xFFFF_FF0B)?;
+    c.text(label, rect_at(area.x + 10.0, area.y, area.w * 0.48, area.h), font(10.0, TEXT))?;
+    c.text(value, rect_at(area.x + area.w * 0.46, area.y, area.w * 0.50 - 10.0, area.h), font(9.5, MUTED).right())
 }
 
 // ---------------------------------------------------------------- labels
