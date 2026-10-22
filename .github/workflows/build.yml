@@ -35,8 +35,15 @@ jobs:
           Write-Host "TLS wiring OK: native-tls feature + tls_connector in http.rs"
 
       - name: Unit tests (TLS + monitor selection)
-        # cargo test accepts a single TESTNAME (substring / regex), not a list.
-        run: cargo test --locked "native_tls_backend_is_configured|secondary_selection|dock_appbar_strip" -- --nocapture
+        # cargo test accepts only one TESTNAME filter per invocation.
+        shell: pwsh
+        run: |
+          cargo test --locked native_tls_backend_is_configured -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked secondary_selection -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked dock_appbar_strip -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify static CRT dependencies
         shell: pwsh
