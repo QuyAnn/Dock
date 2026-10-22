@@ -416,17 +416,34 @@ fn cursor() -> AiUsage {
     let reset = end_ms
         .and_then(DateTime::<Utc>::from_timestamp_millis)
         .map(|date| date.format("%d/%m").to_string());
-    let reset_text = reset.map_or(money.clone(), |date| format!("{money} · {date}"));
+    let reset_text = reset.clone().map_or(money.clone(), |date| format!("{money} · {date}"));
     let Some(total_pct) = total_pct else {
         return no_data(NAME, &reset_text);
     };
-    usage(
-        NAME,
-        vec![AiWindow {
-            label: "Plan (chu kỳ)".to_owned(),
-            used_pct: total_pct as f32,
-            reset_text,
-        }],
-    )
+    let mut windows = vec![AiWindow {
+        label: "Plan (chu kỳ)".to_owned(),
+        used_pct: total_pct as f32,
+        reset_text,
+    }];
+    // Same two extra limits as Dock-Rc ai.ts: planUsage.autoPercentUsed ("Auto + Composer") and
+    // planUsage.apiPercentUsed ("API models"), both resetting at billingCycleEnd. Only shown when
+    // the API returns them; no invented numbers.
+    let cycle_reset = reset.as_ref().map_or_else(String::new, |date| format!("reset {date}"));
+    for (field, label) in [("autoPercentUsed", "Auto + Composer"), ("apiPercentUsed", "API models")] {
+        if let Some(pct) = plan_usage.get(field).and_then(Value::as_f64) {
+            windows.push(AiWindow { label: label.to_owned(), used_pct: pct as f32, reset_text: cycle_reset.clone() });
+        }
+    }
+    log_provider(NAME, &format!(
+        "usage plan={:.1}% extra_limits=[{}]",
+        total_pct,
+        windows
+            .iter()
+            .skip(1)
+            .map(|w| format!("{}={:.1}%", w.label, w.used_pct))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    usage(NAME, windows)
 }
 

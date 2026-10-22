@@ -91,6 +91,9 @@ pub struct TileView {
     pub cells: Vec<u8>,
     /// Vector glyph drawn inside `bg`: SVG path data and an optional stroke width (None = fill).
     pub glyph: Option<(&'static str, Option<f32>)>,
+    /// Extra small usage bars (0..1, color) drawn top-right on a card, e.g. Cursor's
+    /// "Auto + Composer" and "API models" limits next to the main $ bar.
+    pub mini: Vec<(f32, u32)>,
 }
 
 impl TileView {
@@ -108,6 +111,7 @@ impl TileView {
             bg: 0,
             cells: Vec::new(),
             glyph: None,
+            mini: Vec::new(),
         }
     }
 
@@ -311,6 +315,15 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
     if !t.sub.is_empty() {
         let sub = RectF { x: text_x + value_w, y: rc.y + 14.0, w: text_w - value_w, h: 14.0 };
         r.draw_text(&t.sub, sub, 8.0, MUTED, Align::Right)?;
+    }
+    // Extra limits: short stacked bars in the free top-right corner beside the title.
+    for (i, (p, c)) in t.mini.iter().enumerate().take(2) {
+        let track = RectF { x: rc.x + rc.w - 7.0 - 28.0, y: rc.y + 5.0 + i as f32 * 4.0, w: 28.0, h: 2.0 };
+        r.fill_rounded_rect(track, 1.0, RING_TRACK)?;
+        let fill_w = track.w * p.clamp(0.0, 1.0);
+        if fill_w > 0.0 {
+            r.fill_rounded_rect(RectF { w: fill_w.max(2.0), ..track }, 1.0, *c)?;
+        }
     }
     if let Some(p) = t.progress {
         // .pbar: 2.5 px track along the bottom, colored fill.

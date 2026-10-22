@@ -781,7 +781,17 @@ fn ai_view(data: &DataState, name: &str) -> TileView {
         Some(a) => (short_ai_status(&a.reset_text).into(), String::new(), None, 0),
         None => ("…".into(), String::new(), None, 0),
     };
-    TileView { progress, accent, bg, sub, glyph: Some(glyph), ..TileView::card(label, value) }
+    // Cursor: keep the $ value + bar; the two extra Dock-Rc limits become small bars.
+    let mini = match usage {
+        Some(a) if name == "Cursor" => a
+            .windows
+            .iter()
+            .skip(1)
+            .map(|w| ((w.used_pct / 100.0).clamp(0.0, 1.0), usage_color(w.used_pct)))
+            .collect(),
+        _ => Vec::new(),
+    };
+    TileView { progress, accent, bg, sub, mini, glyph: Some(glyph), ..TileView::card(label, value) }
 }
 
 fn short_ai_status(status: &str) -> &'static str {
