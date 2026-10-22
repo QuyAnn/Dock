@@ -477,11 +477,18 @@ fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
 
 fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     // .cc-btn: 34 px, radius 8, faint fill; hover brightens it.
-    card_frame(r, rc, hovered)?;
     if let Some(open) = t.chevron {
+        // Square liquid-glass key; while the flyout is open it stays lit (pressed look)
+        // and the SF-style chevron flips from up to down.
+        card_frame(r, rc, hovered || open)?;
+        if open {
+            r.fill_rounded_rect(rc, super::glass::GLASS_RADIUS, 0xFFFF_FF26)?;
+        }
         let g = RectF { x: rc.x + (rc.w - 12.0) / 2.0, y: rc.y + (rc.h - 12.0) / 2.0, w: 12.0, h: 12.0 };
-        return super::sficons::draw_chevron(r, g, !open, 0xFFFF_FFF0);
+        let color = if hovered || open { 0xFFFF_FFFF } else { 0xFFFF_FFD9 };
+        return super::sficons::draw_chevron(r, g, !open, color);
     }
+    card_frame(r, rc, hovered)?;
     if let Some(st) = t.status {
         // macOS menu-bar look: Wi-Fi fan (15 px) then speaker (17x15), white, vector.
         let cy = rc.y + rc.h / 2.0;

@@ -224,6 +224,32 @@ unsafe extern "system" fn on_tray_show(
     }
 }
 
+/// Set while the tray-overflow flyout is opening/open (see `win::overflow`).
+static TRAY_PEEK: AtomicBool = AtomicBool::new(false);
+
+/// Temporarily shows the hidden primary taskbar without activating it, so UI Automation can
+/// reach its XAML tray (a hidden window's XAML content is not in the UIA tree) and the
+/// overflow flyout it owns can stay open. Returns the tray hwnd and whether it was hidden.
+pub fn peek_primary_tray() -> Option<(HWND, bool)> {
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA;
+    let tray = primary_tray()?;
+    TRAY_PEEK.store(true, Ordering::SeqCst);
+    // SAFETY: live shell window; SW_SHOWNA never activates it.
+    let was_hidden = unsafe { !IsWindowVisible(tray).as_bool() };
+    if was_hidden {
+        unsafe {
+            let _ = ShowWindow(tray, SW_SHOWNA);
+        }
+    }
+    Some((tray, was_hidden))
+}
+
+/// Ends `peek_primary_tray`: re-hides the taskbar if hidden mode is on.
+pub fn end_tray_peek() {
+    TRAY_PEEK.store(false, Ordering::SeqCst);
+    enforce_taskbar_hidden();
+}
+
 /// Win11 ignores ABM_GETSTATE/ABM_SETSTATE unless hWnd is the taskbar itself.
 fn taskbar_state(tray: HWND) -> u32 {
     let mut data = abd(tray, ABE_TOP, RECT::default());
@@ -323,6 +349,12 @@ pub fn ensure_restored_on_exit() {
 /// Re-hides the primary tray (and the secondary trays while our secondary docks exist) if
 /// Explorer re-showed them. Call about every 500 ms and from the show hook.
 pub fn enforce_taskbar_hidden() {
+    if TRAY_PEEK.load(Ordering::SeqCst) {
+        // The tray-overflow flyout is open: its owner taskbar must stay shown (it sits
+        // behind the topmost dock) until the flyout closes.
+        sync_secondary_trays();
+        return;
+    }
     if APPLIED.load(Ordering::SeqCst) && HIDE_WINDOW.load(Ordering::SeqCst) {
         if let Some(h) = primary_tray() {
             // SAFETY: live tray window.

@@ -112,23 +112,24 @@ fn line(sink: &ID2D1GeometrySink, m: &Map, a: (f32, f32), b: (f32, f32)) {
     }
 }
 
-/// SF `chevron.up` / `chevron.down` in a 12x12 design box (tray overflow button).
+/// SF `chevron.up` / `chevron.down` (regular weight) in a 12x12 design box: a shallow
+/// 10x5 caret with round caps/join, optically centred.
 pub fn draw_chevron(r: &mut Renderer, rect: RectF, up: bool, rgba: u32) -> Result<()> {
     let m = Map::new(rect, 12.0, 12.0);
-    let (tip, base) = if up { (3.6, 8.2) } else { (8.4, 3.8) };
+    let (tip, base) = if up { (3.6, 8.6) } else { (8.4, 3.4) };
     r.draw_geometry_round(
         |s| {
             // SAFETY: the sink is open for the duration of this closure.
             unsafe {
-                s.BeginFigure(m.p(1.8, base), D2D1_FIGURE_BEGIN_HOLLOW);
+                s.BeginFigure(m.p(1.0, base), D2D1_FIGURE_BEGIN_HOLLOW);
                 s.AddLine(m.p(6.0, tip));
-                s.AddLine(m.p(10.2, base));
+                s.AddLine(m.p(11.0, base));
                 s.EndFigure(D2D1_FIGURE_END_OPEN);
             }
             Ok(())
         },
         rgba,
-        Some(STROKE * m.s),
+        Some(1.5 * m.s),
     )
 }
 

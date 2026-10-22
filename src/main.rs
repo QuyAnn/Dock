@@ -731,7 +731,7 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     if enabled.grok { left.push(t("grok", dock::USAGE_W)); }
     if enabled.music { left.push(t("media", dock::MEDIA_W)); }
     if enabled.weather && settings.weather_position == "tile" { left.push(t("weather", 100.0)); }
-    let mut right = vec![t("chevron", 26.0), t("cc", 56.0), t("gear", 22.0)];
+    let mut right = vec![t("chevron", 30.0), t("cc", 56.0), t("gear", 22.0)];
     // Wide enough for a tiny CPU/RAM label above the percent inside the ring.
     if enabled.cpu { right.push(t("cpu", 42.0)); }
     if enabled.ram { right.push(t("ram", 42.0)); }
@@ -1790,7 +1790,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::GrokBot => grokbot::open_or_focus(),
                 Click::Open(which, anchor) => open_popup(which, anchor),
                 Click::TrayOverflow(a) => {
-                    win::overflow::toggle(a.x.round() as i32, (a.x + a.w).round() as i32, a.y.round() as i32)
+                    win::overflow::toggle(hwnd.0 as isize, a.x.round() as i32, (a.x + a.w).round() as i32, a.y.round() as i32)
                 }
             }
             LRESULT(0)
