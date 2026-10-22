@@ -706,13 +706,13 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     let t = |id, width| Tile { id, width, height: 0.0 };
     let mut left = Vec::new();
     let enabled = &settings.tiles;
-    if enabled.git { left.push(t("git", 118.0)); }
-    if enabled.claude { left.push(t("claude", 100.0)); }
-    if enabled.codex { left.push(t("codex", 100.0)); }
-    if enabled.cursor { left.push(t("cursor", 155.0)); }
-    if enabled.grok { left.push(t("grok", 100.0)); }
-    // Base width; layout() expands `media` into leftover side space toward the center cluster.
-    if enabled.music { left.push(t("media", 200.0)); }
+    // Fixed widths: tiles never resize with their text (long values ellipsize inside).
+    if enabled.git { left.push(t("git", dock::GIT_W)); }
+    if enabled.claude { left.push(t("claude", dock::USAGE_W)); }
+    if enabled.codex { left.push(t("codex", dock::USAGE_W)); }
+    if enabled.cursor { left.push(t("cursor", dock::USAGE_W)); }
+    if enabled.grok { left.push(t("grok", dock::USAGE_W)); }
+    if enabled.music { left.push(t("media", dock::MEDIA_W)); }
     if enabled.weather && settings.weather_position == "tile" { left.push(t("weather", 100.0)); }
     let mut right = vec![t("cc", 56.0), t("gear", 22.0)];
     // Wide enough for a tiny CPU/RAM label above the percent inside the ring.
