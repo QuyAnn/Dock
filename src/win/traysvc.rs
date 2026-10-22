@@ -37,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, DrawIconEx, FindWindowExW, FindWindowW, GetMessageW, GetSystemMetrics, GetWindowLongW,
     GetWindowThreadProcessId, IsWindow, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW,
     SendMessageTimeoutW, SendNotifyMessageW, SetTimer, SetWindowLongW, SetWindowPos, TranslateMessage, DI_NORMAL,
-    GWL_STYLE, HICON, HWND_BROADCAST, HWND_TOPMOST, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SM_CXSCREEN, SM_CYSCREEN,
+    GWL_STYLE, HICON, HWND_BROADCAST, HWND_MESSAGE, HWND_TOPMOST, MSG, MSGFLT_ALLOW, SMTO_ABORTIFHUNG, SM_CXSCREEN, SM_CYSCREEN,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WINDOWPOS, WM_ACTIVATEAPP, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU,
     WM_COPYDATA, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_TIMER, WM_USER,
     WM_WINDOWPOSCHANGED, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
@@ -116,6 +116,11 @@ pub fn start() {
     });
 }
 
+/// The listener window exists.
+pub fn running() -> bool {
+    OUR_TRAY.load(Ordering::SeqCst) != 0 && !STOPPED.load(Ordering::SeqCst)
+}
+
 /// Snapshot of the known icons plus the generation it belongs to.
 pub fn icons() -> (u64, Vec<TrayIcon>) {
     let list = ICONS.lock().map(|l| l.clone()).unwrap_or_default();
@@ -188,7 +193,23 @@ fn broadcast_taskbar_created(why: &str) {
         let msg = RegisterWindowMessageW(w!("TaskbarCreated"));
         if msg != 0 {
             let ok = SendNotifyMessageW(HWND_BROADCAST, msg, WPARAM(0), LPARAM(0)).is_ok();
-            crate::log(&format!("{} tray: TaskbarCreated broadcast ({why}) ok={ok}", ts()));
+            // Broadcasts skip message-only windows, which some apps use for their icon
+            // (e.g. NVIDIA's NotificationIconWindowClass): post to those directly.
+            let me = std::process::id();
+            let mut posted = 0;
+            let mut after = HWND::default();
+            while let Ok(h) = FindWindowExW(HWND_MESSAGE, after, PCWSTR::null(), PCWSTR::null()) {
+                if h.0.is_null() || posted > 4000 {
+                    break;
+                }
+                after = h;
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(h, Some(&mut pid));
+                if pid != me && PostMessageW(h, msg, WPARAM(0), LPARAM(0)).is_ok() {
+                    posted += 1;
+                }
+            }
+            crate::log(&format!("{} tray: TaskbarCreated broadcast ({why}) ok={ok}, +{posted} message-only windows", ts()));
         }
     }
 }
@@ -284,7 +305,8 @@ fn run() {
 /// Logs how many icons we know, with their tooltips' first words (no other data).
 pub fn log_summary(when: &str) {
     let (_, list) = icons();
-    let names: Vec<String> = list.iter().map(|i| short_name(i)).collect();
+    let names: Vec<String> =
+        list.iter().map(|i| format!("{}{}", short_name(i), if i.callback == 0 { " [no callback yet]" } else { "" })).collect();
     crate::log(&format!("{} tray: {} icon(s) known {when}: {}", ts(), list.len(), names.join(" | ")));
 }
 

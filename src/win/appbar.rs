@@ -354,6 +354,7 @@ pub fn restore_taskbar() {
 pub fn ensure_restored_on_exit() {
     // Hand the tray back first so apps re-register their icons with Explorer.
     crate::win::traysvc::shutdown();
+    release_forced_work_areas();
     restore_taskbar();
 }
 
@@ -410,4 +411,65 @@ pub fn recover_from_previous_crash() {
         }
     }
     let _ = std::fs::remove_file(&path);
+}
+
+
+/// Set once we wrote a work area ourselves (SPI_SETWORKAREA); undone on exit.
+static WORK_AREA_FORCED: AtomicBool = AtomicBool::new(false);
+static WORK_AREA_LOGS: AtomicU32 = AtomicU32::new(0);
+
+/// If the work area of `dock`'s monitor extends below the dock's top edge (maximized windows
+/// would slide under the dock), set it explicitly to end at the dock top. Returns true when
+/// it had to fix something.
+pub fn ensure_work_area(dock: HWND) -> bool {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, IsWindow, SystemParametersInfoW, SPIF_SENDCHANGE, SPI_SETWORKAREA,
+    };
+    // SAFETY: plain queries on our own dock window; the rect outlives the SPI call.
+    unsafe {
+        if !IsWindow(dock).as_bool() {
+            return false;
+        }
+        let mut wr = RECT::default();
+        if GetWindowRect(dock, &mut wr).is_err() {
+            return false;
+        }
+        let mon = MonitorFromWindow(dock, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return false;
+        }
+        let (m, work) = (mi.rcMonitor, mi.rcWork);
+        let top = wr.top;
+        // Sanity: the dock must sit in the lower part of this monitor.
+        if top <= m.top + (m.bottom - m.top) / 2 || top >= m.bottom || work.bottom <= top {
+            return false;
+        }
+        let mut want = RECT { left: work.left, top: work.top, right: work.right, bottom: top };
+        let ok = SystemParametersInfoW(SPI_SETWORKAREA, 0, Some(&mut want as *mut RECT as *mut _), SPIF_SENDCHANGE).is_ok();
+        WORK_AREA_FORCED.store(true, Ordering::SeqCst);
+        let n = WORK_AREA_LOGS.fetch_add(1, Ordering::SeqCst);
+        if n < 20 || n % 100 == 0 {
+            crate::log(&format!(
+                "workarea: monitor ({},{}..{},{}) work bottom {} was below dock top {}; set ({},{}..{},{}) ok={ok}",
+                m.left, m.top, m.right, m.bottom, work.bottom, top, want.left, want.top, want.right, want.bottom
+            ));
+        }
+        true
+    }
+}
+
+/// On exit: give every monitor its full area back if we ever forced one, so nothing stays
+/// reserved for a dock that is gone (Explorer re-adds its taskbar when it is shown again).
+fn release_forced_work_areas() {
+    use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPIF_SENDCHANGE, SPI_SETWORKAREA};
+    if !WORK_AREA_FORCED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    for mut m in enum_monitor_rects() {
+        // SAFETY: m is a valid RECT for the call.
+        let ok = unsafe { SystemParametersInfoW(SPI_SETWORKAREA, 0, Some(&mut m as *mut RECT as *mut _), SPIF_SENDCHANGE) }.is_ok();
+        crate::log(&format!("workarea: released ({},{}..{},{}) ok={ok}", m.left, m.top, m.right, m.bottom));
+    }
 }

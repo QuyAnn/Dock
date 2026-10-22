@@ -590,11 +590,6 @@ fn run() -> windows::core::Result<()> {
     // ABM_QUERYPOS can return a rect one taskbar-height above rcMonitor.bottom.
     appbar::hide_taskbar(initial_settings.taskbar_mode == "hidden");
     appbar::install_tray_show_hook();
-    if initial_settings.tray_service {
-        win::traysvc::start();
-    } else {
-        log("tray: listener disabled by settings (trayService=false)");
-    }
     tasks::install_foreground_hook(Some(data::usage::on_foreground));
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
@@ -698,6 +693,14 @@ fn run() -> windows::core::Result<()> {
         }
     });
     appbar::ensure_secondary_trays_visible();
+
+    // The tray listener starts only after every AppBar is registered with Explorer; the
+    // work-area guard (TIMER_GUARD) turns it off again if the reservation does not hold.
+    if initial_settings.tray_service {
+        win::traysvc::start();
+    } else {
+        log("tray: listener disabled by settings (trayService=false)");
+    }
 
     unsafe {
         // SAFETY: hwnd is live; timers drive refresh and the taskbar guard.
@@ -1744,7 +1747,46 @@ fn on_popup_tick() {
     }
 }
 
+thread_local! {
+    /// Times the work-area guard had to re-apply a reservation (for fight detection).
+    static WORK_AREA_FIXES: RefCell<Vec<std::time::Instant>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Keeps maximized windows above every dock: if a monitor's work area does not end at its
+/// dock's top, set it explicitly. If that keeps being undone while our tray listener runs,
+/// turn the listener off and re-register the AppBars the normal way.
+fn guard_work_area(primary: HWND) {
+    let docks: Vec<HWND> = APP.with(|a| {
+        a.try_borrow()
+            .ok()
+            .and_then(|b| b.as_ref().map(|app| std::iter::once(app.hwnd).chain(app.secondaries.iter().map(|s| s.hwnd)).collect()))
+            .unwrap_or_default()
+    });
+    let fixed = docks.iter().filter(|&&h| appbar::ensure_work_area(h)).count();
+    if fixed == 0 {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let recent = WORK_AREA_FIXES.with(|f| {
+        let mut f = f.borrow_mut();
+        f.push(now);
+        f.retain(|t| now.duration_since(*t).as_secs() < 30);
+        f.len()
+    });
+    if recent >= 4 && win::traysvc::running() {
+        log("tray: work area keeps losing the dock reservation while the listener runs; turning the listener off and re-registering the AppBars");
+        win::traysvc::shutdown();
+        WORK_AREA_FIXES.with(|f| f.borrow_mut().clear());
+        // Same path as a topology change: re-registers the primary and secondary AppBars.
+        unsafe {
+            let _ = PostMessageW(primary, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 fn shutdown() {
+    // Hand the tray back to Explorer before the AppBars are removed.
+    win::traysvc::shutdown();
     data::usage::flush();
     popup::hide();
     OPEN.with(|o| o.set(None));
@@ -1846,7 +1888,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     refresh_open_popup();
                     repaint();
                 }
-                TIMER_GUARD => appbar::enforce_taskbar_hidden(),
+                TIMER_GUARD => {
+                    appbar::enforce_taskbar_hidden();
+                    guard_work_area(hwnd);
+                }
                 TIMER_VISUALIZER => repaint(),
                 id if id == thumbnails::TIMER_THUMB_DELAY || id == thumbnails::TIMER_THUMB_POLL => {
                     thumbnails::on_dock_timer(hwnd, id);
