@@ -13,3 +13,4 @@ pub mod control_center; // Control Center panel: toggles, volume/brightness slid
 pub mod svgpath; // SVG path subset (M L H V C A Z) drawn as D2D geometry, plus AI logo paths
 pub mod sficons; // macOS SF-Symbols-style Wi-Fi / speaker status icons (D2D geometry)
 pub mod liquid; // Liquid Glass dock background: blur, saturate, lens refraction (CPU, cached)
+pub mod trayview; // SmartDock's own tray overflow popup (hidden notification icons)

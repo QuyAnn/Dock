@@ -40,6 +40,7 @@ use ui::dock::{self, RectF, Style, Tile, TileView};
 use ui::glass;
 use ui::liquid::{self, LiquidBitmap};
 use ui::popup;
+use ui::trayview;
 use ui::popup_content::{self, MediaAction as PopupMedia, PopupKind};
 use ui::renderer::{apply_dwm_rounding, Renderer};
 use ui::svgpath;
@@ -118,6 +119,10 @@ enum OpenPopup {
     Data(&'static str),
     Control,
     AppMenu,
+    /// Right-click on empty dock area ("Cài đặt SmartDock").
+    DockMenu,
+    /// SmartDock's own tray overflow (hidden notification icons).
+    Tray,
 }
 
 /// Click resolved on the UI thread; side effects run after the APP borrow is released.
@@ -585,6 +590,11 @@ fn run() -> windows::core::Result<()> {
     // ABM_QUERYPOS can return a rect one taskbar-height above rcMonitor.bottom.
     appbar::hide_taskbar(initial_settings.taskbar_mode == "hidden");
     appbar::install_tray_show_hook();
+    if initial_settings.tray_service {
+        win::traysvc::start();
+    } else {
+        log("tray: listener disabled by settings (trayService=false)");
+    }
     tasks::install_foreground_hook(Some(data::usage::on_foreground));
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
@@ -615,6 +625,7 @@ fn run() -> windows::core::Result<()> {
     popup::set_on_hide(on_popup_hidden);
     popup::set_drag_handler(on_popup_drag);
     popup::set_tick_handler(on_popup_tick);
+    popup::set_rclick_handler(on_popup_rclick);
     win::system::watch_volume();
 
     let shared = Arc::new(Shared {
@@ -731,7 +742,8 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     if enabled.grok { left.push(t("grok", dock::USAGE_W)); }
     if enabled.music { left.push(t("media", dock::MEDIA_W)); }
     if enabled.weather && settings.weather_position == "tile" { left.push(t("weather", 100.0)); }
-    let mut right = vec![t("chevron", 30.0), t("cc", 56.0), t("gear", 22.0)];
+    // No standalone gear: Settings opens from the Control Center gear and the dock menu.
+    let mut right = vec![t("chevron", 30.0), t("cc", 56.0)];
     // Wide enough for a tiny CPU/RAM label above the percent inside the ring.
     if enabled.cpu { right.push(t("cpu", 42.0)); }
     if enabled.ram { right.push(t("ram", 42.0)); }
@@ -900,12 +912,11 @@ fn tile_view(
         // macOS-style "^" that opens Windows' hidden tray icons; points down while open.
         "chevron" => TileView {
             style: Style::Button,
-            chevron: Some(win::overflow::is_open()),
+            chevron: Some(OPEN.with(Cell::get) == Some(OpenPopup::Tray)),
             ..TileView::card("", "")
         },
         "start" => TileView { style: Style::Start, ..TileView::card("", "") },
         "sep" => TileView { style: Style::Separator, ..TileView::card("", "") },
-        "gear" => TileView::bare("\u{E713}"),
         // Ring: short label above the percent (no "CPU 65" single-line overlap).
         "cpu" => TileView {
             style: Style::Ring,
@@ -1156,6 +1167,29 @@ fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
         thumbnails::set_suppressed(true);
         open_popup(OpenPopup::AppMenu, anchor);
         thumbnails::set_suppressed(OPEN.with(Cell::get) == Some(OpenPopup::AppMenu));
+        return;
+    }
+    // Not on an app icon: the dock's own menu ("Cài đặt SmartDock"), anchored at the pointer.
+    let anchor = APP.with(|a| {
+        let Ok(slot) = a.try_borrow() else { return None };
+        let app = slot.as_ref()?;
+        let (tiles, origin, dpi_value) = if app.hwnd == hwnd {
+            (&app.tiles, app.origin, app.dpi)
+        } else {
+            let sec = app.secondaries.iter().find(|s| s.hwnd == hwnd)?;
+            (&sec.tiles, sec.origin, sec.dpi)
+        };
+        if tiles.iter().any(|(_, r)| dock::hit_test(x, y, &[*r]).is_some()) {
+            return None; // on a tile: no menu
+        }
+        let scale = dpi::scale(dpi_value);
+        Some(RectF { x: origin.0 + (x - 1.0) * scale, y: origin.1, w: 2.0 * scale, h: DOCK_HEIGHT * scale })
+    });
+    if let Some(anchor) = anchor {
+        log("dockmenu: opened on empty dock area");
+        thumbnails::set_suppressed(true);
+        open_popup(OpenPopup::DockMenu, anchor);
+        thumbnails::set_suppressed(false);
     }
 }
 
@@ -1241,7 +1275,6 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
             "ram" => Click::Open(OpenPopup::Data("ram"), anchor),
             "cc" => Click::Open(OpenPopup::Control, anchor),
             "chevron" => Click::TrayOverflow(anchor),
-            "gear" => Click::Open(OpenPopup::Data("settings"), anchor),
             _ => Click::None,
         }
     })
@@ -1274,7 +1307,8 @@ fn feed_popup(kind: PopupKind, data: &DataState, history: &History) {
 }
 
 fn open_popup(which: OpenPopup, anchor: RectF) {
-    if which != OpenPopup::AppMenu {
+    LAST_ANCHOR.with(|a| a.set(anchor));
+    if which != OpenPopup::AppMenu && which != OpenPopup::DockMenu {
         thumbnails::set_suppressed(false);
     }
     if OPEN.with(Cell::get) == Some(which) {
@@ -1317,6 +1351,25 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
                 OPEN.with(|o| o.set(Some(which)));
             }
         }
+        OpenPopup::DockMenu => {
+            CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+            let height = appmenu::DOCK_MENU_H;
+            POPUP_H_CUR.with(|h| h.set(height));
+            POPUP_W_CUR.with(|w| w.set(appmenu::DOCK_MENU_W));
+            if popup::show(anchor, appmenu::DOCK_MENU_W, height as i32).is_ok() {
+                OPEN.with(|o| o.set(Some(which)));
+            }
+        }
+        OpenPopup::Tray => {
+            CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+            let (w, h) = trayview::open(anchor);
+            POPUP_H_CUR.with(|c| c.set(h));
+            POPUP_W_CUR.with(|c| c.set(w));
+            if popup::show(anchor, w, h as i32).is_ok() {
+                OPEN.with(|o| o.set(Some(which)));
+            }
+            repaint();
+        }
         OpenPopup::AppMenu => {
             CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
             let height = appmenu::current()
@@ -1329,6 +1382,23 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             }
         }
     }
+}
+
+thread_local! {
+    /// Anchor of the most recently opened popup (screen px), reused when one popup swaps to another.
+    static LAST_ANCHOR: Cell<RectF> = const { Cell::new(RectF { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }) };
+}
+
+/// Shows SmartDock Settings in the popup, anchored where the current popup was opened.
+fn open_settings_popup() {
+    let anchor = LAST_ANCHOR.with(Cell::get);
+    if OPEN.with(Cell::get) == Some(OpenPopup::Data("settings")) {
+        return;
+    }
+    // Swap in place: clear the open kind so open_popup does not treat it as a toggle.
+    OPEN.with(|o| o.set(None));
+    appmenu::clear();
+    open_popup(OpenPopup::Data("settings"), anchor);
 }
 
 /// Keeps an open data popup live: fresh data and history each second, then a repaint of the popup.
@@ -1352,6 +1422,14 @@ fn paint_popup(r: &mut Renderer, rect: RectF) {
         let _ = appmenu::paint(r, rect);
         return;
     }
+    if OPEN.with(Cell::get) == Some(OpenPopup::DockMenu) {
+        let _ = appmenu::paint_dock_menu(r, rect);
+        return;
+    }
+    if OPEN.with(Cell::get) == Some(OpenPopup::Tray) {
+        let _ = trayview::paint(r, rect);
+        return;
+    }
     let control = CONTROL_VIEW.with(|c| c.borrow().clone());
     match control {
         Some(state) => {
@@ -1373,6 +1451,19 @@ fn popup_rect() -> RectF {
 
 fn on_popup_click(x: f32, y: f32) {
     let rect = popup_rect();
+    if OPEN.with(Cell::get) == Some(OpenPopup::DockMenu) {
+        if appmenu::dock_menu_hit(x, y) {
+            log("settings: opened from the dock menu (Cài đặt SmartDock)");
+            open_settings_popup();
+        }
+        return;
+    }
+    if OPEN.with(Cell::get) == Some(OpenPopup::Tray) {
+        if trayview::on_click(x, y, trayview::Button::Left) {
+            close_tray_popup();
+        }
+        return;
+    }
     if OPEN.with(Cell::get) == Some(OpenPopup::AppMenu) {
         let hit = appmenu::hit_test(x, y);
         log(&format!("appmenu: click at ({x:.0},{y:.0}) -> {hit:?}"));
@@ -1394,6 +1485,11 @@ fn on_popup_click(x: f32, y: f32) {
     let control = CONTROL_VIEW.with(|c| c.borrow().clone());
     if let Some(state) = control {
         if let Some(action) = control_center::hit_test(x, y, rect, &state) {
+            if action == control_center::ControlAction::OpenSmartDockSettings {
+                log("settings: opened from the Control Center gear");
+                open_settings_popup();
+                return;
+            }
             // Control actions can block (WinRT, COM); run them off the UI thread.
             thread::spawn(move || {
                 let _ = control_center::apply(action);
@@ -1481,7 +1577,23 @@ fn on_popup_click(x: f32, y: f32) {
     }
 }
 
+/// Right-click inside the popup (only the tray overflow uses it).
+fn on_popup_rclick(x: f32, y: f32) {
+    if OPEN.with(Cell::get) == Some(OpenPopup::Tray) && trayview::on_click(x, y, trayview::Button::Right) {
+        close_tray_popup();
+    }
+}
+
+fn close_tray_popup() {
+    popup::hide();
+    repaint();
+}
+
 fn on_popup_hidden() {
+    if OPEN.with(Cell::get) == Some(OpenPopup::Tray) {
+        trayview::closed();
+        repaint();
+    }
     OPEN.with(|o| o.set(None));
     thumbnails::set_suppressed(false);
     CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
@@ -1582,6 +1694,14 @@ fn live_apply(action: control_center::ControlAction) {
 /// Popup tick (~100 ms): reflect external volume/mute changes (IAudioEndpointVolumeCallback)
 /// and fresh radio/brightness state while the Control Center stays open.
 fn on_popup_tick() {
+    if OPEN.with(Cell::get) == Some(OpenPopup::Tray) {
+        match trayview::tick() {
+            trayview::Tick::Close => close_tray_popup(),
+            trayview::Tick::Repaint => popup::invalidate(),
+            trayview::Tick::Idle => {}
+        }
+        return;
+    }
     if CONTROL_VIEW.with(|c| c.borrow().is_none()) {
         let _ = win::system::take_volume_change();
         return;
@@ -1768,7 +1888,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_LBUTTONDOWN => {
             // Snapshot foreground + Start state before the click can change them.
             tasks::capture_click_state();
-            win::overflow::capture_click();
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONUP => {
@@ -1791,7 +1910,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::GrokBot => grokbot::open_or_focus(),
                 Click::Open(which, anchor) => open_popup(which, anchor),
                 Click::TrayOverflow(a) => {
-                    win::overflow::toggle(hwnd.0 as isize, a.x.round() as i32, (a.x + a.w).round() as i32, a.y.round() as i32)
+                    let was_open = OPEN.with(Cell::get) == Some(OpenPopup::Tray);
+                    log(&format!("overflow: ^ clicked -> {}", if was_open { "close" } else { "open own popup" }));
+                    open_popup(OpenPopup::Tray, a);
+                    repaint();
                 }
             }
             LRESULT(0)

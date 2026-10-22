@@ -55,6 +55,8 @@ pub enum ControlAction {
     MediaPrevious,
     MediaPlayPause,
     MediaNext,
+    /// Gear in the Control Center: opens SmartDock's own Settings popup (UI thread).
+    OpenSmartDockSettings,
 }
 
 /// Runs the system call for `action`. Blocking. Toggles re-read the live radio/mute state
@@ -83,6 +85,8 @@ pub fn apply(action: ControlAction) -> Result<()> {
         ControlAction::MediaPrevious => system::media_control(MediaAction::Previous),
         ControlAction::MediaPlayPause => system::media_control(MediaAction::PlayPause),
         ControlAction::MediaNext => system::media_control(MediaAction::Next),
+        // Handled on the UI thread by the caller (it swaps the popup to Settings).
+        ControlAction::OpenSmartDockSettings => Ok(()),
     }
 }
 
@@ -120,6 +124,7 @@ const GLYPH_BT: &str = "\u{E702}";
 const GLYPH_BRIGHTNESS: &str = "\u{E706}";
 const GLYPH_NETWORK: &str = "\u{E968}";
 const GLYPH_MOON: &str = "\u{E708}";
+const GLYPH_GEAR: &str = "\u{E713}";
 
 struct Layout {
     conn: RectF,
@@ -160,6 +165,11 @@ fn layout(rect: RectF) -> Layout {
         volume: RectF { x: x0, y: cap2, w, h: CAP_H },
         media: RectF { x: x0, y: media, w, h: MEDIA_H },
     }
+}
+
+/// Gear button (SmartDock Settings) at the right end of the dark-mode module.
+fn gear_of(dark: RectF) -> RectF {
+    RectF { x: dark.x + dark.w - 7.0 - 28.0, y: dark.y + 6.0, w: 28.0, h: 28.0 }
 }
 
 /// Slider capsule inside a `.cc-cap` card (top offset: border + padding + head + margin).
@@ -350,7 +360,9 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     draw_module(r, l.dark)?;
     let moon = RectF { x: l.dark.x + 7.0, y: l.dark.y + 6.0, w: 28.0, h: 28.0 };
     draw_round(r, moon, Glyph::Text(GLYPH_MOON), 14.0, state.dark, 1.0, 1.0)?;
-    r.draw_text("Chế độ tối", RectF { x: moon.x + 36.0, y: l.dark.y, w: l.dark.w - 45.0, h: l.dark.h }, 10.5, TEXT, Align::Left)?;
+    r.draw_text("Chế độ tối", RectF { x: moon.x + 36.0, y: l.dark.y, w: l.dark.w - 85.0, h: l.dark.h }, 10.5, TEXT, Align::Left)?;
+    // SmartDock Settings: small liquid-glass gear in the module's right corner.
+    draw_round(r, gear_of(l.dark), Glyph::Text(GLYPH_GEAR), 13.0, false, 1.0, 1.0)?;
 
     // Brightness: unsupported shows the note and a disabled, empty capsule.
     let (br_frac, br_text) = match state.brightness {
@@ -445,6 +457,9 @@ pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Con
     }
     if contains(l.bluetooth, x, y) {
         return Some(ControlAction::OpenBluetoothSettings);
+    }
+    if contains(gear_of(l.dark), x, y) {
+        return Some(ControlAction::OpenSmartDockSettings);
     }
     if contains(l.dark, x, y) {
         return Some(ControlAction::ToggleDark);

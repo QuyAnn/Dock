@@ -244,3 +244,27 @@ pub fn apply(action: AppMenuAction, settings: &mut Settings) {
         }
     }
 }
+
+// ---------- dock menu (right-click on empty dock area) ----------
+
+pub const DOCK_MENU_W: f32 = 200.0;
+pub const DOCK_MENU_H: f32 = 6.0 + ROW_H + 6.0;
+
+fn dock_menu_row() -> RectF {
+    RectF { x: 6.0, y: 6.0, w: DOCK_MENU_W - 12.0, h: ROW_H }
+}
+
+/// One item: "Cài đặt SmartDock" with a gear glyph.
+pub fn paint_dock_menu(r: &mut Renderer, _rect: RectF) -> Result<()> {
+    let row = dock_menu_row();
+    let glyph = RectF { x: row.x + 8.0, y: row.y, w: 18.0, h: row.h };
+    r.draw_text_styled("\u{E713}", glyph, 13.0, TEXT, Align::Center, TextStyle::Icon)?;
+    let label = RectF { x: row.x + 32.0, y: row.y, w: row.w - 40.0, h: row.h };
+    r.draw_text("Cài đặt SmartDock", label, 11.5, TEXT, Align::Left)
+}
+
+/// True when (x, y) hits the "Cài đặt SmartDock" row.
+pub fn dock_menu_hit(x: f32, y: f32) -> bool {
+    let r = dock_menu_row();
+    x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}

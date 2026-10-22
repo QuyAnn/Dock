@@ -19,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect,
     KillTimer, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -60,6 +60,7 @@ thread_local! {
     static ON_HIDE: Cell<Option<fn()>> = const { Cell::new(None) };
     static DRAG: Cell<Option<fn(DragPhase, f32, f32) -> bool>> = const { Cell::new(None) };
     static TICK: Cell<Option<fn()>> = const { Cell::new(None) };
+    static RCLICK: Cell<Option<fn(f32, f32)>> = const { Cell::new(None) };
     /// True between a captured mouse-down and its mouse-up.
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
     static LAST_POS: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
@@ -77,6 +78,34 @@ pub enum DragPhase {
 /// every WM_MOUSEMOVE (`Move`) and the release (`Up`) go to it instead of the click handler.
 pub fn set_drag_handler(f: fn(DragPhase, f32, f32) -> bool) {
     DRAG.with(|c| c.set(Some(f)));
+}
+
+/// Receives right clicks (button up) inside the popup, in client DIPs.
+pub fn set_rclick_handler(f: fn(f32, f32)) {
+    RCLICK.with(|c| c.set(Some(f)));
+}
+
+/// Pointer position in popup client DIPs while it is over the visible popup.
+pub fn cursor_in_popup() -> Option<(f32, f32)> {
+    POPUP.with(|p| {
+        let g = p.try_borrow().ok()?;
+        let pw = g.as_ref()?;
+        let mut pt = POINT::default();
+        let mut rc = RECT::default();
+        // SAFETY: out-params are valid locals; hwnd is our live popup.
+        unsafe {
+            if !windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(pw.hwnd).as_bool() {
+                return None;
+            }
+            GetCursorPos(&mut pt).ok()?;
+            GetWindowRect(pw.hwnd, &mut rc).ok()?;
+        }
+        if pt.x < rc.left || pt.x >= rc.right || pt.y < rc.top || pt.y >= rc.bottom {
+            return None;
+        }
+        let dpi = pw.renderer.dpi();
+        Some((dpi::px_to_dip(pt.x - rc.left, dpi), dpi::px_to_dip(pt.y - rc.top, dpi)))
+    })
 }
 
 /// Called every poll tick (~100 ms) while the popup is visible.
@@ -350,6 +379,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 return LRESULT(0);
             }
             if let Some(f) = CLICK.with(Cell::get) {
+                f(x, y);
+            }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let (x, y) = client_dip(lp);
+            if let Some(f) = RCLICK.with(Cell::get) {
                 f(x, y);
             }
             LRESULT(0)

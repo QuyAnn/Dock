@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, PostMessageW, RegisterShellHookWindow, RegisterWindowMessageW,
     SetForegroundWindow, DeregisterShellHookWindow, GWL_EXSTYLE, GW_OWNER, SW_MINIMIZE,
     SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    AllowSetForegroundWindow, FindWindowW, ShowWindowAsync, SwitchToThisWindow, ASFW_ANY, SC_TASKLIST,
+    AllowSetForegroundWindow, ShowWindowAsync, SwitchToThisWindow, ASFW_ANY, SC_TASKLIST,
     WM_SYSCOMMAND, SC_CLOSE, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, SC_MINIMIZE,
     ShowWindow, IsWindow, GetDesktopWindow, GetShellWindow,
 };
@@ -786,7 +786,8 @@ pub fn open_start_menu() {
     // SAFETY: FindWindowW/PostMessageW with static strings; the tray HWND may be absent.
     let posted = unsafe {
         let _ = AllowSetForegroundWindow(ASFW_ANY);
-        match FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) {
+        // Explorer's tray specifically (FindWindow would return SmartDock's own Shell_TrayWnd).
+        match crate::win::appbar::primary_tray().ok_or(()) {
             Ok(tray) if !tray.is_invalid() => {
                 PostMessageW(tray, WM_SYSCOMMAND, WPARAM(SC_TASKLIST as usize), LPARAM(0)).is_ok()
             }
