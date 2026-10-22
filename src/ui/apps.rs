@@ -4,6 +4,7 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -65,6 +66,10 @@ impl AppIcon {
         let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
         let shadow = drop_shadow(b.w, b.h, &alpha);
         Self { w: b.w, h: b.h, rgba, shadow }
+    }
+
+    fn bitmap(&self) -> IconBitmap {
+        IconBitmap { w: self.w, h: self.h, rgba: self.rgba.clone() }
     }
 }
 
@@ -145,8 +150,52 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
 
 /// HWND of the window whose slot contains (x, y), if any.
 pub fn hit_app(x: f32, y: f32, rect: RectF, state: &AppsState) -> Option<isize> {
+    hit_app_index(x, y, rect, state).map(|i| state.windows[i].hwnd)
+}
+
+/// Index into `state.windows` for the slot under (x, y).
+pub fn hit_app_index(x: f32, y: f32, rect: RectF, state: &AppsState) -> Option<usize> {
     let slots = slots(rect, state.windows.len());
-    hit_test(x, y, &slots).map(|i| state.windows[i].hwnd)
+    hit_test(x, y, &slots)
+}
+
+/// Slot rect for window index `i`, if it fits.
+pub fn slot_rect(rect: RectF, state: &AppsState, i: usize) -> Option<RectF> {
+    slots(rect, state.windows.len()).get(i).copied()
+}
+
+/// Display name for an app icon (exe stem, else window title).
+pub fn app_name(w: &WindowEntry) -> String {
+    Path::new(&w.exe)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| {
+            let mut c = s.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => w.title.clone(),
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| w.title.clone())
+}
+
+/// All listed windows that share the same exe (case-insensitive) as `w`.
+pub fn group_windows<'a>(state: &'a AppsState, w: &WindowEntry) -> Vec<&'a WindowEntry> {
+    if w.exe.is_empty() {
+        return state.windows.iter().filter(|o| o.hwnd == w.hwnd).collect();
+    }
+    state
+        .windows
+        .iter()
+        .filter(|o| o.exe.eq_ignore_ascii_case(&w.exe))
+        .collect()
+}
+
+/// Icon bitmap pixels for a window's cache key, if loaded.
+pub fn icon_pixels(state: &AppsState, w: &WindowEntry) -> Option<IconBitmap> {
+    let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
+    state.icons.get(key).map(AppIcon::bitmap)
 }
 
 /// Slot rects for the first `n` windows that fit in `rect`, horizontally centered.

@@ -13,6 +13,7 @@ pub struct WindowEntry {
     pub aumid: String,
     pub package_path: String,
     pub attention: bool,
+    pub minimized: bool,
 }
 
 #[derive(Clone, Debug, Default)]

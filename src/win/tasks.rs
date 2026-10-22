@@ -1,11 +1,13 @@
 //! Window list, activation, shell hook messages and attention flags.
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::System::ProcessStatus::EnumProcesses;
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
     QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -16,16 +18,20 @@ use windows::Win32::Storage::Packaging::Appx::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_LWIN,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow,
     GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindowVisible, RegisterShellHookWindow, RegisterWindowMessageW, SetForegroundWindow,
-    ShowWindow, DeregisterShellHookWindow, GWL_EXSTYLE, GW_OWNER, SW_RESTORE, WS_EX_APPWINDOW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    IsWindowVisible, PostMessageW, RegisterShellHookWindow, RegisterWindowMessageW,
+    SetForegroundWindow, ShowWindow, DeregisterShellHookWindow, GWL_EXSTYLE, GW_OWNER, SW_MINIMIZE,
+    SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use crate::model::WindowEntry;
 use crate::win::icons::{aumid_from_hwnd, SETTINGS_AUMID};
+
+/// Last foreground window that wasn't SmartDock (dock is non-activating).
+static LAST_FOREIGN: Mutex<isize> = Mutex::new(0);
 
 /// Shell window classes that are never listed.
 const SKIP_CLASSES: [&str; 4] = [
@@ -204,9 +210,33 @@ unsafe fn task_entry(hwnd: HWND, core_by_title: &HashMap<String, u32>) -> Option
         aumid,
         package_path,
         attention: false,
+        minimized: IsIconic(hwnd).as_bool(),
     };
     fill_aumid(&mut entry);
     Some(entry)
+}
+
+/// Full image paths of running processes (best-effort). Used by Grok Bot discovery only.
+pub fn snapshot_process_exes() -> Vec<PathBuf> {
+    let mut pids = vec![0u32; 1024];
+    let mut needed = 0u32;
+    // SAFETY: EnumProcesses writes PID dwords into `pids`.
+    let ok = unsafe { EnumProcesses(pids.as_mut_ptr(), (pids.len() * 4) as u32, &mut needed).is_ok() };
+    if !ok {
+        return Vec::new();
+    }
+    let count = (needed as usize / 4).min(pids.len());
+    let mut out = Vec::new();
+    for &pid in &pids[..count] {
+        if pid == 0 {
+            continue;
+        }
+        let identity = process_identity(pid);
+        if !identity.0.is_empty() {
+            out.push(PathBuf::from(identity.0));
+        }
+    }
+    out
 }
 
 /// Prefer SHGetPropertyStoreForWindow, then known Settings AUMID for SystemSettings.exe.
@@ -326,8 +356,37 @@ unsafe fn package_path(full_name: &str) -> Option<String> {
     Some(String::from_utf16_lossy(&path[..len.saturating_sub(1) as usize]))
 }
 
-/// Brings a window to the front (restoring it if minimized). Never activates SmartDock.
+/// Foreground HWND, or 0 when unavailable.
+pub fn foreground_hwnd() -> isize {
+    unsafe { GetForegroundWindow().0 as isize }
+}
+
+/// Remembers the last non-dock foreground window (call when listing / on shell activate).
+pub fn note_foreign_foreground(hwnd: isize) {
+    if hwnd == 0 {
+        return;
+    }
+    if let Ok(mut g) = LAST_FOREIGN.lock() {
+        *g = hwnd;
+    }
+}
+
+fn last_foreign() -> isize {
+    LAST_FOREIGN.lock().map(|g| *g).unwrap_or(0)
+}
+
+/// Taskbar-style click: focused (or last-foreign when fg is 0) → minimize; otherwise restore+focus.
 pub fn activate_window(hwnd: isize) {
+    let fg = foreground_hwnd();
+    if fg == hwnd || (fg == 0 && last_foreign() == hwnd) {
+        minimize_window(hwnd);
+        return;
+    }
+    focus_window(hwnd);
+}
+
+/// Brings a window to the front (restoring it if minimized). Never activates SmartDock.
+pub fn focus_window(hwnd: isize) {
     let target = HWND(hwnd as _);
     // SAFETY: plain Win32 calls on a handle that may be stale; failures are ignored.
     unsafe {
@@ -341,7 +400,8 @@ pub fn activate_window(hwnd: isize) {
         }
         // Attaching to the foreground thread lets SetForegroundWindow succeed from a background process.
         // Always detach below, even if the calls fail, so input state is never left shared.
-        let fg_tid = GetWindowThreadProcessId(GetForegroundWindow(), None);
+        let fg = GetForegroundWindow();
+        let fg_tid = GetWindowThreadProcessId(fg, None);
         let cur_tid = GetCurrentThreadId();
         let attach = fg_tid != 0 && fg_tid != cur_tid;
         if attach {
@@ -352,6 +412,51 @@ pub fn activate_window(hwnd: isize) {
         if attach {
             let _ = AttachThreadInput(cur_tid, fg_tid, BOOL::from(false));
         }
+        note_foreign_foreground(hwnd);
+    }
+}
+
+/// Minimizes a user window without activating SmartDock.
+pub fn minimize_window(hwnd: isize) {
+    let target = HWND(hwnd as _);
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(target, Some(&mut pid as *mut u32));
+        if pid == 0 || pid == GetCurrentProcessId() {
+            return;
+        }
+        let _ = ShowWindow(target, SW_MINIMIZE);
+    }
+}
+
+/// Graceful close via WM_CLOSE (never TerminateProcess / taskkill).
+pub fn close_window(hwnd: isize) {
+    let target = HWND(hwnd as _);
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(target, Some(&mut pid as *mut u32));
+        if pid == 0 || pid == GetCurrentProcessId() {
+            return;
+        }
+        let _ = PostMessageW(target, WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Starts a new instance of an exe (or .lnk). Packaged apps go through the shell.
+pub fn launch_exe(exe: &str) {
+    if exe.is_empty() || !PathBuf::from(exe).exists() {
+        return;
+    }
+    let wide: Vec<u16> = std::ffi::OsStr::new(exe).encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let _ = ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        );
     }
 }
 

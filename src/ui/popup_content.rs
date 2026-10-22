@@ -76,7 +76,7 @@ const SETTING_TILES: [(&str, &str); 9] = [
     ("claude", "Claude"),
     ("codex", "ChatGPT"),
     ("cursor", "Cursor"),
-    ("grok", "Grok"),
+    ("grok", "Grok Bot"),
     ("music", "Media"),
     ("cpu", "CPU"),
     ("ram", "RAM"),

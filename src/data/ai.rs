@@ -1,5 +1,6 @@
-//! AI usage for Claude and Codex (plus a Grok placeholder), read from the user's own local sign-ins.
+//! AI usage for Claude, Codex and Cursor, read from the user's own local sign-ins.
 //! Credentials are read at request time only, never logged, cached to disk, or sent anywhere but the provider.
+//! Grok Bot is a desktop app tile (see win::grokbot) — not an AI usage provider.
 use std::path::{Path, PathBuf};
 use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
 use std::ptr;
@@ -22,7 +23,7 @@ static CLAUDE_CACHE: Mutex<Option<(Instant, AiUsage)>> = Mutex::new(None);
 /// Usage for each provider. A provider with no data gets `session_pct = NaN`
 /// and a short status (sign-in needed, error, ...) in `reset_text`.
 pub fn refresh_ai() -> Vec<AiUsage> {
-    vec![claude(), codex(), cursor(), grok()]
+    vec![claude(), codex(), cursor()]
 }
 
 fn no_data(name: &str, status: &str) -> AiUsage {
@@ -340,7 +341,7 @@ fn collect_jsonl(dir: &Path, depth: u32, out: &mut Vec<(PathBuf, i64)>) {
     }
 }
 
-// ---------------------------------------------------------------- Cursor / Grok
+// ---------------------------------------------------------------- Cursor
 
 fn cursor() -> AiUsage {
     const NAME: &str = "Cursor";
@@ -429,7 +430,3 @@ fn cursor() -> AiUsage {
     )
 }
 
-/// xAI exposes no local sign-in or usage API that a desktop app can read.
-fn grok() -> AiUsage {
-    no_data("Grok", "no usage source")
-}

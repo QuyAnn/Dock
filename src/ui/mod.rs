@@ -5,6 +5,8 @@ pub mod popup;    // popup window per tile, created on open, destroyed on close
 pub mod popup_content; // popup body drawing per tile kind
 pub mod glass; // dock glass: acrylic tint and tile fill/rim
 pub mod apps; // apps tile: window icons, running dots, attention badge, hit testing
+pub mod appmenu; // right-click context menu for centre app icons (NOACTIVATE)
+pub mod thumbnails; // DWM live peeks above dock on app-icon hover
 pub mod squircle; // macOS squircle icon composition and drop shadow (CPU)
 pub mod tiles; // data tiles: DataState, TileView builders, git heatmap
 pub mod control_center; // Control Center panel: toggles, volume/brightness sliders, hit testing

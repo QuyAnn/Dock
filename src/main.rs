@@ -33,6 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use data::history::History;
 use model::Stats;
+use ui::appmenu;
 use ui::apps::{self, AppsState};
 use ui::control_center::{self, ControlState};
 use ui::dock::{self, RectF, Style, Tile, TileView};
@@ -42,9 +43,11 @@ use ui::popup;
 use ui::popup_content::{self, MediaAction as PopupMedia, PopupKind};
 use ui::renderer::{apply_dwm_rounding, Renderer};
 use ui::svgpath;
+use ui::thumbnails;
 use ui::tiles::{self, DataState};
 use win::appbar::{self, AbEdge};
 use win::dpi;
+use win::grokbot;
 use win::system::{self, MediaAction};
 use win::tasks::{self, Attention, ShellEvent};
 use win::{monitors, wallpaper};
@@ -114,6 +117,7 @@ struct App {
 enum OpenPopup {
     Data(&'static str),
     Control,
+    AppMenu,
 }
 
 /// Click resolved on the UI thread; side effects run after the APP borrow is released.
@@ -121,6 +125,7 @@ enum Click {
     None,
     Activate(isize),
     Start,
+    GrokBot,
     Open(OpenPopup, RectF),
 }
 
@@ -796,6 +801,22 @@ fn weather_icon(code: u32) -> &'static str {
     }
 }
 
+fn grok_bot_view() -> TileView {
+    let running = grokbot::is_running();
+    let mut view = TileView {
+        progress: None,
+        accent: 0,
+        bg: 0x0000_00FF,
+        glyph: Some((svgpath::GROK_SLASH, Some(2.0))),
+        ..TileView::card(grokbot::DISPLAY_NAME, if running { "Đang chạy" } else { "Mở" })
+    };
+    if let Some(icon) = grokbot::icon() {
+        view.icon = Some(dock::Icon { w: icon.w, h: icon.h, rgba: icon.rgba });
+        view.glyph = None;
+    }
+    view
+}
+
 fn tile_view(
     id: &str,
     data: &DataState,
@@ -810,7 +831,7 @@ fn tile_view(
         "claude" => ai_view(data, "Claude"),
         "codex" => ai_view(data, "Codex"),
         "cursor" => ai_view(data, "Cursor"),
-        "grok" => ai_view(data, "Grok"),
+        "grok" => grok_bot_view(),
         "media" => {
             let mut view = tiles::media_tile(data);
             view.audio_peak = audio_peak;
@@ -997,6 +1018,76 @@ fn set_hover_on(hwnd: HWND, hover_at: Option<(f32, f32)>) -> bool {
     })
 }
 
+fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
+    thumbnails::hide();
+    let anchor = APP.with(|a| {
+        let Ok(slot) = a.try_borrow() else { return None };
+        let app = slot.as_ref()?;
+        let (tiles, origin, dpi_value) = if app.hwnd == hwnd {
+            (&app.tiles, app.origin, app.dpi)
+        } else {
+            let sec = app.secondaries.iter().find(|s| s.hwnd == hwnd)?;
+            (&sec.tiles, sec.origin, sec.dpi)
+        };
+        let (_, rect) = tiles.iter().find(|(id, r)| *id == "apps" && dock::hit_test(x, y, &[*r]).is_some())?;
+        let idx = apps::hit_app_index(x, y, *rect, &app.apps)?;
+        let w = &app.apps.windows[idx];
+        let group: Vec<_> = apps::group_windows(&app.apps, w).into_iter().cloned().collect();
+        let settings = app.shared.settings.lock().unwrap().clone();
+        appmenu::set_menu(appmenu::from_group(
+            &apps::app_name(w),
+            &w.exe,
+            &group,
+            apps::icon_pixels(&app.apps, w),
+            &settings,
+        ));
+        let scale = dpi::scale(dpi_value);
+        let slot = apps::slot_rect(*rect, &app.apps, idx)?;
+        Some(RectF {
+            x: origin.0 + slot.x * scale,
+            y: origin.1,
+            w: slot.w * scale,
+            h: DOCK_HEIGHT * scale,
+        })
+    });
+    if let Some(anchor) = anchor {
+        open_popup(OpenPopup::AppMenu, anchor);
+    }
+}
+
+fn update_app_thumbnails(hwnd: HWND, x: f32, y: f32) {
+    let info = APP.with(|a| {
+        let Ok(slot) = a.try_borrow() else { return None };
+        let app = slot.as_ref()?;
+        let (tiles, origin, dpi_value) = if app.hwnd == hwnd {
+            (&app.tiles, app.origin, app.dpi)
+        } else {
+            let sec = app.secondaries.iter().find(|s| s.hwnd == hwnd)?;
+            (&sec.tiles, sec.origin, sec.dpi)
+        };
+        let (_, rect) = tiles.iter().find(|(id, _)| *id == "apps")?;
+        let idx = apps::hit_app_index(x, y, *rect, &app.apps)?;
+        let w = &app.apps.windows[idx];
+        let wins: Vec<(isize, String)> = apps::group_windows(&app.apps, w)
+            .into_iter()
+            .map(|e| (e.hwnd, e.title.clone()))
+            .collect();
+        let scale = dpi::scale(dpi_value);
+        let slot = apps::slot_rect(*rect, &app.apps, idx)?;
+        let anchor = RECT {
+            left: (origin.0 + slot.x * scale).round() as i32,
+            top: origin.1.round() as i32,
+            right: (origin.0 + (slot.x + slot.w) * scale).round() as i32,
+            bottom: (origin.1 + DOCK_HEIGHT * scale).round() as i32,
+        };
+        Some((wins, anchor))
+    });
+    match info {
+        Some((wins, anchor)) => thumbnails::schedule(hwnd, anchor, wins),
+        None => thumbnails::cancel_pending(hwnd),
+    }
+}
+
 fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
     APP.with(|a| {
         let Ok(slot) = a.try_borrow() else { return Click::None };
@@ -1022,7 +1113,8 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
             "apps" => apps::hit_app(x, y, rect, &app.apps).map_or(Click::None, Click::Activate),
             "start" => Click::Start,
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
-            "claude" | "codex" | "cursor" | "grok" => Click::Open(OpenPopup::Data(id), anchor),
+            "claude" | "codex" | "cursor" => Click::Open(OpenPopup::Data(id), anchor),
+            "grok" => Click::GrokBot,
             "media" => Click::Open(OpenPopup::Data("media"), anchor),
             "weather" => Click::Open(OpenPopup::Data("weather"), anchor),
             "clock" => Click::Open(OpenPopup::Data("clock"), anchor),
@@ -1038,7 +1130,7 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
 fn popup_kind(id: &str) -> PopupKind {
     match id {
         "git" => PopupKind::Git,
-        "claude" | "codex" | "cursor" | "grok" | "ai" => PopupKind::Ai,
+        "claude" | "codex" | "cursor" | "ai" => PopupKind::Ai,
         "weather" => PopupKind::Weather,
         "clock" => PopupKind::Clock,
         "cpu" => PopupKind::Cpu,
@@ -1074,7 +1166,6 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
                 "claude" => Some("Claude"),
                 "codex" => Some("Codex"),
                 "cursor" => Some("Cursor"),
-                "grok" => Some("Grok"),
                 _ => None,
             });
             let height = APP
@@ -1103,6 +1194,17 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
                 OPEN.with(|o| o.set(Some(which)));
             }
         }
+        OpenPopup::AppMenu => {
+            CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+            let height = appmenu::current()
+                .map(|m| appmenu::content_height(&m))
+                .unwrap_or(180.0);
+            POPUP_H_CUR.with(|h| h.set(height));
+            POPUP_W_CUR.with(|w| w.set(260.0));
+            if popup::show(anchor, 260.0, height as i32).is_ok() {
+                OPEN.with(|o| o.set(Some(which)));
+            }
+        }
     }
 }
 
@@ -1123,6 +1225,10 @@ fn refresh_open_popup() {
 }
 
 fn paint_popup(r: &mut Renderer, rect: RectF) {
+    if OPEN.with(Cell::get) == Some(OpenPopup::AppMenu) {
+        let _ = appmenu::paint(r, rect);
+        return;
+    }
     let control = CONTROL_VIEW.with(|c| c.borrow().clone());
     match control {
         Some(state) => {
@@ -1144,6 +1250,22 @@ fn popup_rect() -> RectF {
 
 fn on_popup_click(x: f32, y: f32) {
     let rect = popup_rect();
+    if OPEN.with(Cell::get) == Some(OpenPopup::AppMenu) {
+        if let Some(action) = appmenu::hit_test(x, y) {
+            APP.with(|a| {
+                let slot = a.borrow();
+                let Some(app) = slot.as_ref() else { return };
+                let mut settings = app.shared.settings.lock().unwrap();
+                appmenu::apply(action, &mut settings);
+                let _ = settings::save(&settings);
+            });
+            popup::hide();
+            OPEN.with(|o| o.set(None));
+            appmenu::clear();
+            repaint();
+        }
+        return;
+    }
     let control = CONTROL_VIEW.with(|c| c.borrow().clone());
     if let Some(state) = control {
         if let Some(action) = control_center::hit_test(x, y, rect, &state) {
@@ -1222,6 +1344,7 @@ fn on_popup_click(x: f32, y: f32) {
 fn on_popup_hidden() {
     OPEN.with(|o| o.set(None));
     CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+    appmenu::clear();
 }
 
 fn shutdown() {
@@ -1254,7 +1377,10 @@ fn on_shell_event(event: ShellEvent) {
         match event {
             ShellEvent::Created(_) | ShellEvent::Destroyed(_) => app.apps.refresh(&app.attention),
             ShellEvent::Flash(h) => app.attention.mark(h),
-            ShellEvent::Activated(h) => app.attention.clear(h),
+            ShellEvent::Activated(h) => {
+                app.attention.clear(h);
+                tasks::note_foreign_foreground(h);
+            }
             ShellEvent::Other => {}
         }
     });
@@ -1322,6 +1448,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 }
                 TIMER_GUARD => appbar::enforce_taskbar_hidden(),
                 TIMER_VISUALIZER => repaint(),
+                id if id == thumbnails::TIMER_THUMB_DELAY || id == thumbnails::TIMER_THUMB_POLL => {
+                    thumbnails::on_dock_timer(hwnd, id);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -1363,14 +1492,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::None => "none",
                 Click::Activate(_) => "activate",
                 Click::Start => "open Start",
+                Click::GrokBot => "grok bot",
                 Click::Open(..) => "open popup",
             }));
             match click {
                 Click::None => {}
                 Click::Activate(h) => tasks::activate_window(h),
                 Click::Start => tasks::open_start_menu(),
+                Click::GrokBot => grokbot::open_or_focus(),
                 Click::Open(which, anchor) => open_popup(which, anchor),
             }
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            let (x, y) = client_point(lparam);
+            open_app_context_menu(hwnd, x, y);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -1387,6 +1523,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // The app icons magnify under the pointer, so every move repaints.
             apps::set_pointer(Some(x));
             set_hover_on(hwnd, Some((x, y)));
+            update_app_thumbnails(hwnd, x, y);
             repaint();
             LRESULT(0)
         }
@@ -1398,6 +1535,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_MOUSELEAVE => {
             apps::set_pointer(None);
             set_hover_on(hwnd, None);
+            thumbnails::cancel_pending(hwnd);
+            // Keep peeks if the pointer moved onto the peek host; poll handles leave.
             repaint();
             LRESULT(0)
         }

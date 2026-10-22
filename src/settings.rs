@@ -38,6 +38,19 @@ impl Default for TileSettings {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
+pub struct DockPin {
+    pub exe: String,
+    pub name: String,
+}
+
+impl Default for DockPin {
+    fn default() -> Self {
+        Self { exe: String::new(), name: String::new() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub glass_opacity: u8,
     /// "hidden" or "autohide".
@@ -50,6 +63,8 @@ pub struct Settings {
     pub git_folders: Vec<PathBuf>,
     pub git_author: String,
     pub shortcut: String,
+    /// SmartDock-owned pins (never written to the Windows taskbar pins folder).
+    pub dock_pins: Vec<DockPin>,
 }
 
 impl Default for Settings {
@@ -64,6 +79,7 @@ impl Default for Settings {
             git_folders: Vec::new(),
             git_author: String::new(),
             shortcut: "Ctrl+Alt+D".to_owned(),
+            dock_pins: Vec::new(),
         }
     }
 }
