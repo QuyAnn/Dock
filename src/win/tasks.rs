@@ -1,12 +1,15 @@
 //! Window list, activation, shell hook messages and attention flags.
 use std::collections::HashSet;
 
-use windows::core::{w, PWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
     QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::Storage::Packaging::Appx::{
+    GetApplicationUserModelId, GetPackageFullName, GetPackagePathByFullName,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_LWIN,
@@ -90,20 +93,24 @@ unsafe fn task_entry(hwnd: HWND) -> Option<WindowEntry> {
     if pid == 0 || pid == GetCurrentProcessId() {
         return None;
     }
+    let (exe, aumid, package_path) = process_identity(pid);
     Some(WindowEntry {
         hwnd: hwnd.0 as isize,
         title,
-        exe: process_image(pid).unwrap_or_default(),
+        exe,
+        aumid,
+        package_path,
         attention: false,
     })
 }
 
-/// Full image path of a process, or None if it cannot be opened.
-fn process_image(pid: u32) -> Option<String> {
+/// Full image path plus packaged app identity while the process handle is open.
+fn process_identity(pid: u32) -> (String, String, String) {
     // SAFETY: the handle is closed before returning; buf and size describe the same buffer.
     unsafe {
-        let process =
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, BOOL::from(false), pid).ok()?;
+        let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, BOOL::from(false), pid) else {
+            return Default::default();
+        };
         let mut buf = [0u16; 1024];
         let mut size = buf.len() as u32;
         let ok = QueryFullProcessImageNameW(
@@ -113,9 +120,46 @@ fn process_image(pid: u32) -> Option<String> {
             &mut size,
         )
         .is_ok();
+        let exe = ok.then(|| String::from_utf16_lossy(&buf[..size as usize])).unwrap_or_default();
+        let aumid = process_string(process, GetApplicationUserModelId);
+        let package_name = process_string(process, GetPackageFullName);
+        let package_path = package_name
+            .as_ref()
+            .and_then(|name| package_path(name))
+            .unwrap_or_default();
         let _ = CloseHandle(process);
-        ok.then(|| String::from_utf16_lossy(&buf[..size as usize]))
+        (exe, aumid.unwrap_or_default(), package_path)
     }
+}
+
+unsafe fn process_string(
+    process: windows::Win32::Foundation::HANDLE,
+    getter: unsafe fn(windows::Win32::Foundation::HANDLE, *mut u32, PWSTR) -> windows::Win32::Foundation::WIN32_ERROR,
+) -> Option<String> {
+    let mut len = 0u32;
+    let _ = getter(process, &mut len, PWSTR::null());
+    if len == 0 {
+        return None;
+    }
+    let mut value = vec![0u16; len as usize];
+    if getter(process, &mut len, PWSTR(value.as_mut_ptr())).is_err() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&value[..len.saturating_sub(1) as usize]))
+}
+
+unsafe fn package_path(full_name: &str) -> Option<String> {
+    let wide: Vec<u16> = full_name.encode_utf16().chain(Some(0)).collect();
+    let mut len = 0u32;
+    let _ = GetPackagePathByFullName(PCWSTR(wide.as_ptr()), &mut len, PWSTR::null());
+    if len == 0 {
+        return None;
+    }
+    let mut path = vec![0u16; len as usize];
+    if GetPackagePathByFullName(PCWSTR(wide.as_ptr()), &mut len, PWSTR(path.as_mut_ptr())).is_err() {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&path[..len.saturating_sub(1) as usize]))
 }
 
 /// Brings a window to the front (restoring it if minimized). Never activates SmartDock.

@@ -37,36 +37,41 @@ pub struct IconBitmap {
 static CACHE: OnceLock<Mutex<HashMap<String, IconBitmap>>> = OnceLock::new();
 
 /// Shell icon of an exe as RGBA pixels. Successful results are cached (bounded to CACHE_LIMIT).
-pub fn icon_for_exe(exe_path: &str) -> Option<IconBitmap> {
+pub fn icon_for_exe(exe_path: &str, aumid: &str, package_path: &str) -> Option<IconBitmap> {
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache.lock().ok()?.get(exe_path).cloned() {
+    let key = if aumid.is_empty() { exe_path } else { aumid };
+    if let Some(hit) = cache.lock().ok()?.get(key).cloned() {
         return Some(hit);
     }
     // Packaged/UWP executables often expose only a generic shell icon. Prefer the manifest's
     // Square44x44Logo, but keep a valid shell icon whenever package discovery/decoding fails.
-    let icon = appx_icon(exe_path).or_else(|| extract(exe_path))?;
+    let icon = appx_icon(exe_path, package_path).or_else(|| extract(exe_path))?;
     let mut map = cache.lock().ok()?;
     if map.len() >= CACHE_LIMIT {
         map.clear();
     }
-    map.insert(exe_path.to_owned(), icon.clone());
+    map.insert(key.to_owned(), icon.clone());
     Some(icon)
 }
 
-fn appx_icon(exe_path: &str) -> Option<IconBitmap> {
+fn appx_icon(exe_path: &str, package_path: &str) -> Option<IconBitmap> {
     let exe = Path::new(exe_path);
     let packaged = exe_path.to_ascii_lowercase().contains("\\windowsapps\\")
         || exe.file_name().is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("SystemSettings.exe"));
     if !packaged {
         return None;
     }
-    let mut dir = exe.parent()?;
-    let manifest = loop {
-        let candidate = dir.join("AppxManifest.xml");
-        if candidate.is_file() {
-            break candidate;
+    let manifest = if !package_path.is_empty() && Path::new(package_path).join("AppxManifest.xml").is_file() {
+        Path::new(package_path).join("AppxManifest.xml")
+    } else {
+        let mut dir = exe.parent()?;
+        loop {
+            let candidate = dir.join("AppxManifest.xml");
+            if candidate.is_file() {
+                break candidate;
+            }
+            dir = dir.parent()?;
         }
-        dir = dir.parent()?;
     };
     let xml = std::fs::read_to_string(&manifest).ok()?;
     let logo = xml_value(&xml, "Square44x44Logo")?;

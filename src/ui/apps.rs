@@ -88,14 +88,19 @@ impl AppsState {
             w.attention = attention.contains(w.hwnd);
         }
         for w in &self.windows {
-            if w.exe.is_empty() || self.icons.contains_key(&w.exe) {
+            let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
+            if w.exe.is_empty() || self.icons.contains_key(key) {
                 continue;
             }
-            if let Some(b) = icon_for_exe(&w.exe) {
-                self.icons.insert(w.exe.clone(), AppIcon::new(b));
+            if let Some(b) = icon_for_exe(&w.exe, &w.aumid, &w.package_path) {
+                self.icons.insert(key.to_owned(), AppIcon::new(b));
             }
         }
-        let live: HashSet<&str> = self.windows.iter().map(|w| w.exe.as_str()).collect();
+        let live: HashSet<&str> = self
+            .windows
+            .iter()
+            .map(|w| if w.aumid.is_empty() { w.exe.as_str() } else { w.aumid.as_str() })
+            .collect();
         self.icons.retain(|k, _| live.contains(k.as_str()));
     }
 }
@@ -117,7 +122,8 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
             w: size,
             h: size,
         };
-        match state.icons.get(&w.exe) {
+        let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
+        match state.icons.get(key) {
             Some(icon) => draw_icon(r, icon, ico)?,
             None => draw_fallback(r, ico, &initial(w))?,
         }

@@ -68,6 +68,7 @@ struct Shared {
     liquid: Mutex<Option<Arc<LiquidBitmap>>>,
     /// Set by WM_DISPLAYCHANGE so monitor/virtual-screen geometry is sampled again.
     refresh_liquid: AtomicBool,
+    refresh_slow: AtomicBool,
     /// Peak of the default render endpoint as f32 bits.
     audio_peak: AtomicU32,
 }
@@ -240,7 +241,7 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
                 *shared.data.lock().unwrap() = local;
             }
             // Git, AI usage and weather every 10 min (first pass runs immediately).
-            if tick % 600 == 0 {
+            if tick % 600 == 0 || shared.refresh_slow.swap(false, Ordering::SeqCst) {
                 let current = shared.settings.lock().unwrap().clone();
                 let repos = if current.git_folders.is_empty() { default_repos() } else { current.git_folders };
                 let mut local = shared.data.lock().unwrap().clone();
@@ -439,6 +440,7 @@ fn run() -> windows::core::Result<()> {
         settings: Mutex::new(initial_settings),
         liquid: Mutex::new(None),
         refresh_liquid: AtomicBool::new(false),
+        refresh_slow: AtomicBool::new(false),
         audio_peak: AtomicU32::new(0.0f32.to_bits()),
     });
     start_background_refresh(shared.clone(), dock_height_px);
@@ -998,6 +1000,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     APP.with(|a| {
                         if let Ok(mut slot) = a.try_borrow_mut() {
                             if let Some(app) = slot.as_mut() {
+                                let disk_settings = settings::load();
+                                let mut current_settings = app.shared.settings.lock().unwrap();
+                                if *current_settings != disk_settings {
+                                    appbar::set_hidden_mode(disk_settings.taskbar_mode == "hidden");
+                                    *current_settings = disk_settings;
+                                    app.shared.refresh_slow.store(true, Ordering::SeqCst);
+                                }
+                                drop(current_settings);
                                 app.apps.refresh(&app.attention);
                                 app.stats = data::stats::read_stats();
                                 app.history.push(&app.stats);
