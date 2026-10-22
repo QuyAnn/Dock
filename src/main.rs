@@ -1101,7 +1101,10 @@ fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
         })
     });
     if let Some(anchor) = anchor {
+        // Peeks stay off while the menu is up (and the pending hover timer is cancelled).
+        thumbnails::set_suppressed(true);
         open_popup(OpenPopup::AppMenu, anchor);
+        thumbnails::set_suppressed(OPEN.with(Cell::get) == Some(OpenPopup::AppMenu));
     }
 }
 
@@ -1204,6 +1207,9 @@ fn feed_popup(kind: PopupKind, data: &DataState, history: &History) {
 }
 
 fn open_popup(which: OpenPopup, anchor: RectF) {
+    if which != OpenPopup::AppMenu {
+        thumbnails::set_suppressed(false);
+    }
     if OPEN.with(Cell::get) == Some(which) {
         popup::hide();
         OPEN.with(|o| o.set(None));
@@ -1393,6 +1399,7 @@ fn on_popup_click(x: f32, y: f32) {
 
 fn on_popup_hidden() {
     OPEN.with(|o| o.set(None));
+    thumbnails::set_suppressed(false);
     CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
     appmenu::clear();
 }

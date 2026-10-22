@@ -87,6 +87,8 @@ struct Pending {
 }
 
 thread_local! {
+    /// True while an app context menu is open: no peeks, no pending timers.
+    static SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static HOST: RefCell<Option<Host>> = const { RefCell::new(None) };
     static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
 }
@@ -96,9 +98,26 @@ fn same_windows(a: &[(isize, String)], b: impl Iterator<Item = isize>) -> bool {
     a.len() == b.len() && a.iter().zip(&b).all(|((x, _), y)| x == y)
 }
 
+/// Suppresses peeks (e.g. while the app context menu is open). Turning it on hides any visible
+/// peek and cancels a pending one immediately; hover is ignored until it is turned off.
+pub fn set_suppressed(on: bool) {
+    SUPPRESSED.with(|s| s.set(on));
+    if on {
+        if let Some(p) = PENDING.with(|p| p.borrow_mut().take()) {
+            unsafe {
+                let _ = KillTimer(p.dock, TIMER_THUMB_DELAY);
+            }
+        }
+        hide();
+    }
+}
+
 /// Requests peeks for one app's windows. Called on every pointer move over an icon, so it is
 /// idempotent: the same app neither restarts the delay nor re-registers DWM thumbnails.
 pub fn schedule(dock: HWND, anchor_screen: RECT, windows: Vec<(isize, String)>) {
+    if SUPPRESSED.with(|s| s.get()) {
+        return;
+    }
     if windows.is_empty() {
         cancel_pending(dock);
         return;
@@ -156,7 +175,9 @@ pub fn on_dock_timer(dock: HWND, id: usize) {
                 let _ = KillTimer(dock, TIMER_THUMB_DELAY);
             }
             if let Some(p) = PENDING.with(|p| p.borrow_mut().take()) {
-                show(p);
+                if !SUPPRESSED.with(|s| s.get()) {
+                    show(p);
+                }
             }
         }
         TIMER_THUMB_POLL => poll_leave(dock),
