@@ -688,7 +688,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_LBUTTONUP => {
             let x = (lparam.0 & 0xffff) as i16 as f32;
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
-            match dock_click(x, y) {
+            let click = dock_click(x, y);
+            log(&format!("click at ({x},{y}) -> {}", match &click {
+                Click::None => "none",
+                Click::Activate(_) => "activate",
+                Click::Open(..) => "open popup",
+            }));
+            match click {
                 Click::None => {}
                 Click::Activate(h) => tasks::activate_window(h),
                 Click::Open(which, anchor) => open_popup(which, anchor),
@@ -712,6 +718,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             set_hover(Some((x, y)));
             repaint();
             LRESULT(0)
+        }
+        WM_NCHITTEST => {
+            // Answer hit tests ourselves: DefWindowProc returned HTNOWHERE here, so the dock was
+            // skipped by mouse input and clicks reached the desktop instead.
+            LRESULT(HTCLIENT as isize)
         }
         WM_MOUSELEAVE => {
             apps::set_pointer(None);
