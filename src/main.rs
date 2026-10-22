@@ -507,7 +507,7 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     if enabled.git { left.push(t("git", 118.0)); }
     if enabled.claude { left.push(t("claude", 100.0)); }
     if enabled.codex { left.push(t("codex", 100.0)); }
-    if enabled.cursor { left.push(t("cursor", 115.0)); }
+    if enabled.cursor { left.push(t("cursor", 155.0)); }
     if enabled.grok { left.push(t("grok", 100.0)); }
     if enabled.music { left.push(t("media", 165.0)); }
     if enabled.weather && settings.weather_position == "tile" { left.push(t("weather", 100.0)); }
@@ -554,6 +554,12 @@ fn ai_view(data: &DataState, name: &str) -> TileView {
     };
     let usage = data.ai.iter().find(|a| a.name == name);
     let (value, sub, progress, accent) = match usage {
+        Some(a) if name == "Cursor" && !a.session_pct.is_nan() => (
+            a.reset_text.clone(),
+            String::new(),
+            Some((a.session_pct / 100.0).clamp(0.0, 1.0)),
+            usage_color(a.session_pct),
+        ),
         Some(a) if !a.session_pct.is_nan() => (
             format!("{:.0}%", a.session_pct),
             a.reset_text.clone(),
