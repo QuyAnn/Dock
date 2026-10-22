@@ -10,7 +10,7 @@ use super::liquid::{glass_fill_color, LiquidBitmap, GLASS_SHEEN_TOP};
 use super::renderer::{Align, Renderer, TextStyle};
 use super::svgpath;
 
-/// Bar height in DIPs. 48 leaves a 2-DIP clear margin above and below the 44-DIP centre
+/// Bar height in DIPs. 48 leaves a 3-DIP clear margin above and below the 42-DIP centre
 /// cluster (shelf + 38 px icons + running dots), so the shelf's top rim is never clipped.
 pub const DOCK_H: f32 = 48.0;
 const BAR_RADIUS: f32 = 18.0;
@@ -524,7 +524,7 @@ pub fn set_shelf(rect: Option<RectF>) {
 
 /// Shelf geometry for a centre cluster spanning `first..last` (dock-local DIPs): symmetric
 /// horizontal padding keeps it centred with the cluster; vertically it is exactly the
-/// cluster's 44-DIP band, which the layout centres in the bar (clear margin above the rim),
+/// cluster's 42-DIP band, which the layout centres in the bar (3 DIP clear above and below),
 /// so icons and running dots sit inside it.
 pub fn shelf_for(first: RectF, last: RectF) -> RectF {
     let pad = SHELF_PAD;
@@ -532,7 +532,7 @@ pub fn shelf_for(first: RectF, last: RectF) -> RectF {
 }
 
 const SHELF_PAD: f32 = 5.0;
-const SHELF_RADIUS: f32 = 13.0;
+const SHELF_RADIUS: f32 = 12.0;
 
 /// One continuous, very light liquid-glass capsule behind the icon group (macOS Tahoe dock).
 fn draw_shelf(r: &mut Renderer, rc: RectF) -> Result<()> {
@@ -551,9 +551,9 @@ mod tests {
     fn home_zones(apps: usize) -> (Vec<Tile>, Vec<Tile>, Vec<Tile>) {
         let left = vec![t("git", GIT_W), t("claude", USAGE_W), t("codex", USAGE_W), t("cursor", USAGE_W), t("grok", USAGE_W), t("media", MEDIA_W)];
         let center = vec![
-            Tile { id: "start", width: 38.0, height: 44.0 },
+            Tile { id: "start", width: super::super::apps::ICON, height: super::super::apps::CLUSTER_H },
             Tile { id: "sep", width: 1.0, height: 24.0 },
-            Tile { id: "apps", width: super::super::apps::cluster_width(apps), height: 44.0 },
+            Tile { id: "apps", width: super::super::apps::cluster_width(apps), height: super::super::apps::CLUSTER_H },
         ];
         let right = vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
         (left, center, right)

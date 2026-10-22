@@ -18,8 +18,11 @@ use crate::win::icons::{icon_for_window, IconBitmap};
 use crate::win::tasks::{list_windows, Attention};
 
 /// macOS-style icon size inside the 48-DIP bar (Variant A).
-pub const ICON: f32 = 38.0;
-/// Icon top inside the 44-DIP apps / Start tile (tile y = 1, so the icon spans y 2..40).
+pub const ICON: f32 = 36.0;
+/// Height of the centre cluster band (Start, separator zone, apps) = the glass shelf.
+/// Centred in the 48-DIP bar: 3 DIP clear above and below, all four shelf corners visible.
+pub const CLUSTER_H: f32 = 42.0;
+/// Icon top inside the cluster band: icon y 4..40, running dot 41..44, shelf rim at 45.
 pub const ICON_TOP: f32 = 1.0;
 const SLOT: f32 = ICON;
 const GAP: f32 = 5.0;
@@ -419,9 +422,9 @@ mod tests {
     fn centred(n: usize, screen_w: f32) -> (Vec<RectF>, usize, usize) {
         let left = vec![t("git", 118.0), t("cursor", 112.0), t("media", 200.0)];
         let center = vec![
-            Tile { id: "start", width: ICON, height: 44.0 },
+            Tile { id: "start", width: ICON, height: CLUSTER_H },
             Tile { id: "sep", width: 1.0, height: 24.0 },
-            Tile { id: "apps", width: cluster_width(n), height: 44.0 },
+            Tile { id: "apps", width: cluster_width(n), height: CLUSTER_H },
         ];
         let right = vec![t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
         (layout(&left, &center, &right, screen_w), left.len(), left.len() + 2)
@@ -437,7 +440,9 @@ mod tests {
         let (rects, start, apps) = centred(5, 1920.0);
         let shelf = shelf_for(rects[start], rects[apps]);
         // Clear margin above the shelf rim and below it; shelf centred in the bar.
-        assert!(shelf.y >= 2.0, "shelf top {}", shelf.y);
+        assert!(shelf.y >= 3.0, "shelf top {}", shelf.y);
+        // Rounded bottom corners stay inside the visible bar (the window extends below the screen).
+        assert!(shelf.y + shelf.h <= DOCK_H - 3.0, "shelf bottom {shelf:?}");
         assert!((shelf.y - (DOCK_H - shelf.y - shelf.h)).abs() < 0.01, "shelf not centred: {shelf:?}");
         let icon_top = rects[apps].y + ICON_TOP;
         let icon_bottom = icon_top + ICON;
@@ -445,7 +450,8 @@ mod tests {
         assert!(icon_bottom - ICON * (1.0 + MAG_MAX) >= 0.0);
         assert!(icon_top >= shelf.y && icon_bottom <= shelf.y + shelf.h);
         let dot_bottom = icon_bottom + 1.0 + DOT;
-        assert!(dot_bottom <= shelf.y + shelf.h, "dot {dot_bottom} outside shelf {shelf:?}");
+        // At least 1 DIP between the dot and the shelf's bottom rim.
+        assert!(dot_bottom <= shelf.y + shelf.h - 1.0, "dot {dot_bottom} touches shelf rim {shelf:?}");
         // Side tiles are vertically centred too.
         for (i, r) in rects.iter().enumerate() {
             if i == start + 1 {

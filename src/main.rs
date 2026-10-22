@@ -738,12 +738,12 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
         left,
         // Variant A: 38-DIP Start squircle, thin divider, then the 38-DIP app icons.
         center: if app_count == 0 {
-            vec![Tile { id: "start", width: apps::ICON, height: 44.0 }]
+            vec![Tile { id: "start", width: apps::ICON, height: apps::CLUSTER_H }]
         } else {
             vec![
-                Tile { id: "start", width: apps::ICON, height: 44.0 },
+                Tile { id: "start", width: apps::ICON, height: apps::CLUSTER_H },
                 Tile { id: "sep", width: 1.0, height: 24.0 },
-                Tile { id: "apps", width: apps_w, height: 44.0 },
+                Tile { id: "apps", width: apps_w, height: apps::CLUSTER_H },
             ]
         },
         right,
