@@ -5,18 +5,18 @@ use std::sync::Once;
 
 use windows::core::w;
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    BOOL, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC, InvalidateRect,
-    ReleaseDC, SetBkMode, SetTextColor, TextOutW, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, SetBkMode,
+    SetTextColor, TextOutW, HDC, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowRect,
-    KillTimer, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_LBUTTONUP, WM_PAINT, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, GetWindowRect, KillTimer,
+    RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, MA_NOACTIVATE, SW_HIDE,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_PAINT,
+    WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::win::dpi;
@@ -25,13 +25,20 @@ use crate::win::tasks::focus_window;
 pub const TIMER_THUMB_DELAY: usize = 40;
 pub const TIMER_THUMB_POLL: usize = 41;
 
-const HOVER_DELAY_MS: u32 = 350;
-const POLL_MS: u32 = 80;
+/// Rest time on an icon before the first peek appears.
+const HOVER_DELAY_MS: u32 = 250;
+/// Switching between icons while a peek is already open: near-instant, no flicker.
+const SWITCH_DELAY_MS: u32 = 60;
+/// Pointer must stay outside icon + peek this long before the peek hides (crossing the gap).
+const LEAVE_GRACE_MS: u32 = 150;
+const POLL_MS: u32 = 40;
 const THUMB_W: f32 = 200.0;
 const THUMB_H: f32 = 120.0;
 const TITLE_H: f32 = 22.0;
 const GAP: f32 = 8.0;
 const PAD: f32 = 10.0;
+/// Space between the peek and the dock top, DIP. The leave test bridges it.
+const LIFT: f32 = 8.0;
 
 #[repr(C)]
 struct DwmThumbnailProperties {
@@ -53,7 +60,6 @@ extern "system" {
     fn DwmRegisterThumbnail(dest: HWND, src: HWND, id: *mut isize) -> i32;
     fn DwmUnregisterThumbnail(id: isize) -> i32;
     fn DwmUpdateThumbnailProperties(id: isize, props: *const DwmThumbnailProperties) -> i32;
-    fn DwmQueryThumbnailSourceSize(id: isize, size: *mut SIZE) -> i32;
 }
 
 struct Thumb {
@@ -63,10 +69,15 @@ struct Thumb {
     dest: RECT,
 }
 
+/// The single peek window. Created once, then only shown/hidden/moved.
 struct Host {
     hwnd: HWND,
+    visible: bool,
     thumbs: Vec<Thumb>,
     anchor: RECT,
+    dock: HWND,
+    /// Poll ticks the pointer has been outside icon + peek.
+    outside_ms: u32,
 }
 
 struct Pending {
@@ -80,30 +91,60 @@ thread_local! {
     static PENDING: RefCell<Option<Pending>> = const { RefCell::new(None) };
 }
 
-/// Schedule peeks after a short delay. Replaces any pending request.
+fn same_windows(a: &[(isize, String)], b: impl Iterator<Item = isize>) -> bool {
+    let b: Vec<isize> = b.collect();
+    a.len() == b.len() && a.iter().zip(&b).all(|((x, _), y)| x == y)
+}
+
+/// Requests peeks for one app's windows. Called on every pointer move over an icon, so it is
+/// idempotent: the same app neither restarts the delay nor re-registers DWM thumbnails.
 pub fn schedule(dock: HWND, anchor_screen: RECT, windows: Vec<(isize, String)>) {
     if windows.is_empty() {
-        hide();
+        cancel_pending(dock);
         return;
     }
-    PENDING.with(|p| {
-        *p.borrow_mut() = Some(Pending {
-            dock,
-            anchor: anchor_screen,
-            windows,
-        });
+    // Already showing this app: keep it, just refresh the anchor (magnification moves slots).
+    let showing = HOST.with(|h| {
+        let mut g = h.borrow_mut();
+        match g.as_mut() {
+            Some(host) if host.visible && same_windows(&windows, host.thumbs.iter().map(|t| t.hwnd_src)) => {
+                host.anchor = anchor_screen;
+                host.outside_ms = 0;
+                Some(true)
+            }
+            Some(host) if host.visible => Some(false),
+            _ => None,
+        }
     });
+    if showing == Some(true) {
+        cancel_pending(dock);
+        return;
+    }
+    let already_pending = PENDING.with(|p| {
+        p.borrow()
+            .as_ref()
+            .is_some_and(|q| q.dock == dock && same_windows(&windows, q.windows.iter().map(|(h, _)| *h)))
+    });
+    PENDING.with(|p| {
+        *p.borrow_mut() = Some(Pending { dock, anchor: anchor_screen, windows });
+    });
+    if already_pending {
+        return; // keep the running timer; do not restart the delay on every move
+    }
+    let delay = if showing == Some(false) { SWITCH_DELAY_MS } else { HOVER_DELAY_MS };
     unsafe {
         let _ = KillTimer(dock, TIMER_THUMB_DELAY);
-        SetTimer(dock, TIMER_THUMB_DELAY, HOVER_DELAY_MS, None);
+        SetTimer(dock, TIMER_THUMB_DELAY, delay, None);
     }
 }
 
 /// Cancel a pending show (pointer left before delay elapsed).
 pub fn cancel_pending(dock: HWND) {
-    PENDING.with(|p| *p.borrow_mut() = None);
-    unsafe {
-        let _ = KillTimer(dock, TIMER_THUMB_DELAY);
+    let had = PENDING.with(|p| p.borrow_mut().take().is_some());
+    if had {
+        unsafe {
+            let _ = KillTimer(dock, TIMER_THUMB_DELAY);
+        }
     }
 }
 
@@ -111,6 +152,9 @@ pub fn cancel_pending(dock: HWND) {
 pub fn on_dock_timer(dock: HWND, id: usize) {
     match id {
         TIMER_THUMB_DELAY => {
+            unsafe {
+                let _ = KillTimer(dock, TIMER_THUMB_DELAY);
+            }
             if let Some(p) = PENDING.with(|p| p.borrow_mut().take()) {
                 show(p);
             }
@@ -120,10 +164,53 @@ pub fn on_dock_timer(dock: HWND, id: usize) {
     }
 }
 
-fn show(pending: Pending) {
-    hide();
+/// Creates the peek window once (hidden). Later calls return the same HWND.
+fn host_hwnd() -> Option<HWND> {
+    if let Some(h) = HOST.with(|h| h.borrow().as_ref().map(|host| host.hwnd)) {
+        return Some(h);
+    }
     register_class();
-    let dpi = dpi::system_dpi();
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            w!("SmartDockThumbs"),
+            w!(""),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            None,
+            None,
+            hinstance(),
+            None,
+        )
+    }
+    .ok()?;
+    HOST.with(|h| {
+        *h.borrow_mut() = Some(Host {
+            hwnd,
+            visible: false,
+            thumbs: Vec::new(),
+            anchor: RECT::default(),
+            dock: HWND::default(),
+            outside_ms: 0,
+        });
+    });
+    Some(hwnd)
+}
+
+fn unregister_all(thumbs: &mut Vec<Thumb>) {
+    for t in thumbs.drain(..) {
+        unsafe {
+            let _ = DwmUnregisterThumbnail(t.id);
+        }
+    }
+}
+
+fn show(pending: Pending) {
+    let Some(hwnd) = host_hwnd() else { return };
+    let dpi = dpi::window_dpi(pending.dock);
     let n = pending.windows.len().max(1) as f32;
     let width = dpi::dip_to_px(PAD * 2.0 + n * THUMB_W + (n - 1.0).max(0.0) * GAP, dpi);
     let height = dpi::dip_to_px(PAD * 2.0 + TITLE_H + THUMB_H, dpi);
@@ -135,50 +222,24 @@ fn show(pending: Pending) {
 
     let cx = (pending.anchor.left + pending.anchor.right) / 2;
     let x = cx - width / 2;
-    let y = pending.anchor.top - height - dpi::dip_to_px(8.0, dpi);
-
-    let Ok(hwnd) = (unsafe {
-        CreateWindowExW(
-            WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            w!("SmartDockThumbs"),
-            w!(""),
-            WS_POPUP,
-            x,
-            y,
-            width,
-            height,
-            None,
-            None,
-            hinstance(),
-            None,
-        )
-    }) else {
-        return;
-    };
+    let y = pending.anchor.top - height - dpi::dip_to_px(LIFT, dpi);
 
     let mut thumbs = Vec::new();
+    HOST.with(|h| {
+        if let Some(host) = h.borrow_mut().as_mut() {
+            unregister_all(&mut host.thumbs);
+        }
+    });
     for (i, (src, title)) in pending.windows.into_iter().enumerate() {
         let left = pad + i as i32 * (thumb_w + gap);
-        let dest = RECT {
-            left,
-            top: pad + title_h,
-            right: left + thumb_w,
-            bottom: pad + title_h + thumb_h,
-        };
+        let dest = RECT { left, top: pad + title_h, right: left + thumb_w, bottom: pad + title_h + thumb_h };
         let mut id = 0isize;
         let hr = unsafe { DwmRegisterThumbnail(hwnd, HWND(src as _), &mut id) };
         if hr < 0 || id == 0 {
             continue;
         }
-        let mut src_size = SIZE::default();
-        unsafe {
-            let _ = DwmQueryThumbnailSourceSize(id, &mut src_size);
-        }
         let props = DwmThumbnailProperties {
-            dw_flags: DWM_TNP_RECTDESTINATION
-                | DWM_TNP_VISIBLE
-                | DWM_TNP_OPACITY
-                | DWM_TNP_SOURCECLIENTAREAONLY,
+            dw_flags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
             rc_destination: dest,
             rc_source: RECT::default(),
             opacity: 255,
@@ -188,72 +249,82 @@ fn show(pending: Pending) {
         unsafe {
             let _ = DwmUpdateThumbnailProperties(id, &props);
         }
-        thumbs.push(Thumb {
-            hwnd_src: src,
-            title,
-            id,
-            dest,
-        });
+        thumbs.push(Thumb { hwnd_src: src, title, id, dest });
     }
-
     if thumbs.is_empty() {
-        unsafe {
-            let _ = DestroyWindow(hwnd);
-        }
+        hide();
         return;
     }
-
     HOST.with(|h| {
-        *h.borrow_mut() = Some(Host {
-            hwnd,
-            thumbs,
-            anchor: pending.anchor,
-        });
+        if let Some(host) = h.borrow_mut().as_mut() {
+            host.thumbs = thumbs;
+            host.anchor = pending.anchor;
+            host.dock = pending.dock;
+            host.visible = true;
+            host.outside_ms = 0;
+        }
     });
-
     unsafe {
-        let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        SetTimer(pending.dock, TIMER_THUMB_POLL, POLL_MS, None);
+        // One SetWindowPos moves, resizes and shows without activating; no destroy/recreate.
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         let _ = InvalidateRect(hwnd, None, false);
+        let _ = KillTimer(pending.dock, TIMER_THUMB_POLL);
+        SetTimer(pending.dock, TIMER_THUMB_POLL, POLL_MS, None);
     }
 }
 
-/// Hide peeks and unregister thumbnails.
+/// Hides peeks and releases the DWM thumbnails. The window itself is kept for reuse.
 pub fn hide() {
-    HOST.with(|h| {
-        if let Some(host) = h.borrow_mut().take() {
-            for t in &host.thumbs {
-                unsafe {
-                    let _ = DwmUnregisterThumbnail(t.id);
+    let hidden = HOST.with(|h| {
+        let Ok(mut g) = h.try_borrow_mut() else { return None };
+        let host = g.as_mut()?;
+        unregister_all(&mut host.thumbs);
+        let was = host.visible;
+        host.visible = false;
+        host.outside_ms = 0;
+        Some((host.hwnd, host.dock, was))
+    });
+    if let Some((hwnd, dock, was)) = hidden {
+        if was {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                if !dock.is_invalid() {
+                    let _ = KillTimer(dock, TIMER_THUMB_POLL);
                 }
             }
-            unsafe {
-                let _ = ShowWindow(host.hwnd, SW_HIDE);
-                let _ = DestroyWindow(host.hwnd);
-            }
         }
-    });
+    }
 }
 
 fn poll_leave(dock: HWND) {
     let leave = HOST.with(|h| {
-        let Ok(g) = h.try_borrow() else {
+        let Ok(mut g) = h.try_borrow_mut() else {
             return false;
         };
-        let Some(host) = g.as_ref() else {
-            return false;
+        let Some(host) = g.as_mut() else {
+            return true;
         };
+        if !host.visible {
+            return true;
+        }
         let mut pt = POINT::default();
         let mut rc = RECT::default();
         unsafe {
             let _ = GetCursorPos(&mut pt);
             let _ = GetWindowRect(host.hwnd, &mut rc);
         }
-        let in_host = pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
         let a = host.anchor;
+        // Bridge the gap between the icon and the peek so moving up never flickers it away.
+        let in_host = pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
+        let in_bridge = pt.x >= a.left && pt.x < a.right && pt.y >= rc.bottom && pt.y < a.top;
         let in_anchor = pt.x >= a.left && pt.x < a.right && pt.y >= a.top && pt.y < a.bottom;
-        !in_host && !in_anchor
+        if in_host || in_bridge || in_anchor {
+            host.outside_ms = 0;
+            false
+        } else {
+            host.outside_ms += POLL_MS;
+            host.outside_ms >= LEAVE_GRACE_MS
+        }
     });
     if leave {
         hide();
@@ -288,11 +359,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     match msg {
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
-            BeginPaint(hwnd, &mut ps);
-            paint(hwnd);
+            let hdc = BeginPaint(hwnd, &mut ps);
+            paint(hwnd, hdc);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        // Painted fully in WM_PAINT; skipping erase avoids a white/black flash on show.
+        WM_ERASEBKGND => LRESULT(1),
+        WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_LBUTTONUP => {
             let x = (lp.0 & 0xffff) as i16 as i32;
             let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
@@ -319,7 +393,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
-fn paint(hwnd: HWND) {
+fn paint(hwnd: HWND, hdc: HDC) {
     HOST.with(|h| {
         let Ok(g) = h.try_borrow() else {
             return;
@@ -333,7 +407,6 @@ fn paint(hwnd: HWND) {
         unsafe {
             let mut client = RECT::default();
             let _ = GetClientRect(hwnd, &mut client);
-            let hdc = GetDC(hwnd);
             let brush = CreateSolidBrush(COLORREF(0x0028_282C));
             FillRect(hdc, &client, brush);
             let _ = DeleteObject(brush);
@@ -347,7 +420,6 @@ fn paint(hwnd: HWND) {
                 }
                 let _ = TextOutW(hdc, t.dest.left, t.dest.top - 18, &wide);
             }
-            let _ = ReleaseDC(hwnd, hdc);
         }
     });
 }
