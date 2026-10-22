@@ -1,10 +1,8 @@
 //! Weather from Open-Meteo (free, no API key). Refresh every ~30 minutes from the caller.
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
 
 use serde_json::Value;
 
-const TIMEOUT: Duration = Duration::from_secs(15);
 /// Same default as the old app's settings.
 pub const DEFAULT_LOCATION: &str = "Hanoi";
 
@@ -121,7 +119,9 @@ fn resolve(location: &str) -> Option<Place> {
 }
 
 fn get_json(url: &str, query: &[(&str, &str)]) -> Option<Value> {
-    let mut req = ureq::get(url).timeout(TIMEOUT);
+    // Must use the shared TLS-backed agent; bare `ureq::get` has no TLS when
+    // default-features are off and only the `native-tls` feature is enabled.
+    let mut req = crate::data::http::agent().get(url);
     for (k, v) in query {
         req = req.query(k, v);
     }

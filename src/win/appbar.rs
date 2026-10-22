@@ -5,9 +5,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::core::{w, Error, Result};
-use windows::Win32::Foundation::{CloseHandle, E_FAIL, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, BOOL, E_FAIL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -38,6 +39,8 @@ static APPLIED: AtomicBool = AtomicBool::new(false);
 static HIDE_WINDOW: AtomicBool = AtomicBool::new(true);
 /// Taskbar AppBar state (ABS_*) from before we changed it.
 static ORIGINAL_STATE: AtomicU32 = AtomicU32::new(ABS_ALWAYSONTOP);
+/// True when this process owns a dock AppBar on every monitor (secondary trays may then be hidden).
+static SECONDARY_DOCKS: AtomicBool = AtomicBool::new(false);
 
 fn abd(hwnd: HWND, edge: u32, rc: RECT) -> APPBARDATA {
     APPBARDATA {
@@ -70,11 +73,48 @@ pub fn primary_monitor_rect() -> Result<RECT> {
     Ok(mi.rcMonitor)
 }
 
-/// Reserves a full-width strip of `height_px` physical pixels on the primary monitor's edge.
-/// Maximized windows then stop above it. Returns the reserved rect.
-pub fn register_appbar(hwnd: HWND, edge: AbEdge, height_px: i32) -> Result<RECT> {
-    let mon = primary_monitor_rect()?;
-    let (edge_raw, rc) = match edge {
+/// Every attached monitor's `rcMonitor`, primary first.
+pub fn enum_monitor_rects() -> Vec<RECT> {
+    unsafe extern "system" fn callback(
+        mon: HMONITOR,
+        _hdc: HDC,
+        _rc: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let out = &mut *(data.0 as *mut Vec<RECT>);
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(mon, &mut mi).as_bool() {
+            out.push(mi.rcMonitor);
+        }
+        BOOL(1)
+    }
+    let mut out: Vec<RECT> = Vec::new();
+    // SAFETY: callback only writes through the Vec pointer while EnumDisplayMonitors runs.
+    unsafe {
+        let _ = EnumDisplayMonitors(HDC::default(), None, Some(callback), LPARAM(&mut out as *mut _ as isize));
+    }
+    if out.is_empty() {
+        if let Ok(primary) = primary_monitor_rect() {
+            out.push(primary);
+        }
+    } else {
+        // Primary (contains 0,0 or matches primary_monitor_rect) first for stable ordering.
+        let primary = primary_monitor_rect().ok();
+        out.sort_by_key(|rc| {
+            let is_primary = primary
+                .map(|p| p.left == rc.left && p.top == rc.top && p.right == rc.right && p.bottom == rc.bottom)
+                .unwrap_or(rc.left == 0 && rc.top == 0);
+            !is_primary
+        });
+    }
+    out
+}
+
+fn edge_rect(mon: RECT, edge: AbEdge, height_px: i32) -> (u32, RECT) {
+    match edge {
         AbEdge::Top => (
             ABE_TOP,
             RECT { left: mon.left, top: mon.top, right: mon.right, bottom: mon.top + height_px },
@@ -83,7 +123,18 @@ pub fn register_appbar(hwnd: HWND, edge: AbEdge, height_px: i32) -> Result<RECT>
             ABE_BOTTOM,
             RECT { left: mon.left, top: mon.bottom - height_px, right: mon.right, bottom: mon.bottom },
         ),
-    };
+    }
+}
+
+/// Reserves a full-width strip of `height_px` physical pixels on the primary monitor's edge.
+/// Maximized windows then stop above it. Returns the reserved rect.
+pub fn register_appbar(hwnd: HWND, edge: AbEdge, height_px: i32) -> Result<RECT> {
+    register_appbar_on(hwnd, edge, height_px, primary_monitor_rect()?)
+}
+
+/// AppBar strip on a specific monitor (used for secondary docks).
+pub fn register_appbar_on(hwnd: HWND, edge: AbEdge, height_px: i32, mon: RECT) -> Result<RECT> {
+    let (edge_raw, rc) = edge_rect(mon, edge, height_px);
     let mut data = abd(hwnd, edge_raw, rc);
     // SAFETY: data is a valid APPBARDATA for the duration of each call.
     unsafe {
@@ -93,18 +144,7 @@ pub fn register_appbar(hwnd: HWND, edge: AbEdge, height_px: i32) -> Result<RECT>
         SHAppBarMessage(ABM_QUERYPOS, &mut data);
         // ABM_QUERYPOS may return the edge above the old taskbar reservation even after its HWND is
         // hidden. Anchor explicitly to rcMonitor so no taskbar-height wallpaper strip remains.
-        match edge {
-            AbEdge::Top => {
-                data.rc.top = mon.top;
-                data.rc.bottom = mon.top + height_px;
-            }
-            AbEdge::Bottom => {
-                data.rc.top = mon.bottom - height_px;
-                data.rc.bottom = mon.bottom;
-            }
-        }
-        data.rc.left = mon.left;
-        data.rc.right = mon.right;
+        data.rc = rc;
         SHAppBarMessage(ABM_SETPOS, &mut data);
     }
     Ok(data.rc)
@@ -112,17 +152,11 @@ pub fn register_appbar(hwnd: HWND, edge: AbEdge, height_px: i32) -> Result<RECT>
 
 /// Re-applies the primary monitor edge after a topology/resolution change.
 pub fn reposition_appbar(hwnd: HWND, edge: AbEdge, height_px: i32) -> Result<RECT> {
-    let mon = primary_monitor_rect()?;
-    let (edge_raw, rc) = match edge {
-        AbEdge::Top => (
-            ABE_TOP,
-            RECT { left: mon.left, top: mon.top, right: mon.right, bottom: mon.top + height_px },
-        ),
-        AbEdge::Bottom => (
-            ABE_BOTTOM,
-            RECT { left: mon.left, top: mon.bottom - height_px, right: mon.right, bottom: mon.bottom },
-        ),
-    };
+    reposition_appbar_on(hwnd, edge, height_px, primary_monitor_rect()?)
+}
+
+pub fn reposition_appbar_on(hwnd: HWND, edge: AbEdge, height_px: i32, mon: RECT) -> Result<RECT> {
+    let (edge_raw, rc) = edge_rect(mon, edge, height_px);
     let mut data = abd(hwnd, edge_raw, rc);
     unsafe {
         SHAppBarMessage(ABM_QUERYPOS, &mut data);
@@ -141,25 +175,57 @@ pub fn unregister_appbar(hwnd: HWND) {
     }
 }
 
-/// All Shell_TrayWnd and Shell_SecondaryTrayWnd windows. The primary tray comes first.
-fn tray_windows() -> Vec<HWND> {
+fn find_class_windows(class: windows::core::PCWSTR) -> Vec<HWND> {
     let mut out = Vec::new();
-    for class in [w!("Shell_TrayWnd"), w!("Shell_SecondaryTrayWnd")] {
-        let mut after = HWND::default();
-        // SAFETY: class is a static wide string; searching top-level windows only.
-        while let Ok(h) = unsafe { FindWindowExW(None, after, class, None) } {
-            if h.0.is_null() {
-                break;
-            }
-            out.push(h);
-            after = h;
+    let mut after = HWND::default();
+    // SAFETY: class is a static wide string; searching top-level windows only.
+    while let Ok(h) = unsafe { FindWindowExW(None, after, class, None) } {
+        if h.0.is_null() {
+            break;
         }
+        out.push(h);
+        after = h;
     }
     out
 }
 
+/// All Shell_TrayWnd and Shell_SecondaryTrayWnd windows. The primary tray comes first.
+fn tray_windows() -> Vec<HWND> {
+    let mut out = find_class_windows(w!("Shell_TrayWnd"));
+    out.extend(find_class_windows(w!("Shell_SecondaryTrayWnd")));
+    out
+}
+
 fn primary_tray() -> Option<HWND> {
-    tray_windows().first().copied()
+    find_class_windows(w!("Shell_TrayWnd")).first().copied()
+}
+
+fn secondary_trays() -> Vec<HWND> {
+    find_class_windows(w!("Shell_SecondaryTrayWnd"))
+}
+
+/// Explorer often re-hides secondary trays when the primary Shell_TrayWnd is hidden.
+/// Keep them visible unless we are covering those monitors with our own docks.
+pub fn ensure_secondary_trays_visible() {
+    if SECONDARY_DOCKS.load(Ordering::SeqCst) {
+        return;
+    }
+    for h in secondary_trays() {
+        unsafe {
+            let _ = ShowWindow(h, SW_SHOW);
+        }
+    }
+}
+
+/// When true, secondary taskbars are hidden because each monitor has a SmartDock AppBar.
+pub fn set_secondary_docks_active(active: bool) {
+    SECONDARY_DOCKS.store(active, Ordering::SeqCst);
+    let cmd = if active { SW_HIDE } else { SW_SHOW };
+    for h in secondary_trays() {
+        unsafe {
+            let _ = ShowWindow(h, cmd);
+        }
+    }
 }
 
 /// Win11 ignores ABM_GETSTATE/ABM_SETSTATE unless hWnd is the taskbar itself.
@@ -181,12 +247,13 @@ fn set_taskbar_state(tray: HWND, state: u32) {
 fn show_primary_tray(show: bool) {
     let cmd = if show { SW_SHOW } else { SW_HIDE };
     if let Some(h) = primary_tray() {
-        // SAFETY: h is the live primary tray window. This process has no secondary dock, so it
-        // must not hide Shell_SecondaryTrayWnd.
+        // SAFETY: h is the live primary tray window. Never touch Shell_SecondaryTrayWnd here —
+        // hiding the primary can make Explorer sync-hide secondaries; we re-show them after.
         unsafe {
             let _ = ShowWindow(h, cmd);
         }
     }
+    ensure_secondary_trays_visible();
 }
 
 /// %APPDATA%\SmartDock
@@ -257,12 +324,22 @@ pub fn ensure_restored_on_exit() {
     restore_taskbar();
 }
 
-/// Re-hides any tray window Explorer re-showed (flash, notification). Call about every 500 ms.
-/// No-op unless the taskbar is hidden by us.
+/// Re-hides the primary tray if Explorer re-showed it, keeps secondary trays in sync with
+/// whether we own per-monitor docks, and recovers from Explorer re-showing trays.
+/// Call about every 500 ms.
 pub fn enforce_taskbar_hidden() {
-    if APPLIED.load(Ordering::SeqCst) {
-        if HIDE_WINDOW.load(Ordering::SeqCst) {
-            show_primary_tray(false);
+    if APPLIED.load(Ordering::SeqCst) && HIDE_WINDOW.load(Ordering::SeqCst) {
+        show_primary_tray(false);
+    } else {
+        ensure_secondary_trays_visible();
+    }
+    // Re-assert secondary dock policy even when the primary hide path already ran
+    // (show_primary_tray re-shows secondaries; dock mode must hide them again).
+    if SECONDARY_DOCKS.load(Ordering::SeqCst) {
+        for h in secondary_trays() {
+            unsafe {
+                let _ = ShowWindow(h, SW_HIDE);
+            }
         }
     }
 }

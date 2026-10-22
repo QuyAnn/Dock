@@ -315,7 +315,7 @@ fn meta(kind: PopupKind) -> Meta {
             color: 0x2EA0_43FF,
             title: "Git activity",
             badge: None,
-            note: "Đếm commit của bạn từ git log trong các thư mục đã cấu hình.",
+            note: "Đếm commit theo git user.email (hoặc Git / email trong Cài đặt); tự tìm repo nếu chưa cấu hình thư mục.",
         },
         PopupKind::Ai => Meta { glyph: "✦", color: 0xD977_57FF, title: "AI usage", badge: None, note: AI_NOTE },
         PopupKind::Weather => Meta { glyph: "☀", color: 0xF5A5_24FF, title: "Thời tiết", badge: None, note: "Open-Meteo." },
@@ -485,7 +485,7 @@ fn draw_all(c: &mut Ctx<'_>, kind: PopupKind, data: &DataState) -> Result<f32> {
             draw_weather(c, y, data.weather.as_ref())?
         }
         PopupKind::Cpu | PopupKind::Ram => draw_system(c, top, kind, &hist)?,
-        PopupKind::Settings => draw_settings(c, top)?,
+        PopupKind::Settings => draw_settings(c, top, data)?,
     };
     footer(c, y, m.note)
 }
@@ -733,7 +733,7 @@ fn spark(c: &mut Ctx<'_>, area: RectF, data: &[f32], color: u32) -> Result<()> {
     Ok(())
 }
 
-fn draw_settings(c: &mut Ctx<'_>, y: f32) -> Result<f32> {
+fn draw_settings(c: &mut Ctx<'_>, y: f32, data: &DataState) -> Result<f32> {
     let settings = SETTINGS_STATE.with(|state| state.borrow().clone());
     let x = c.inner_x();
     let w = c.inner_w();
@@ -795,7 +795,11 @@ fn draw_settings(c: &mut Ctx<'_>, y: f32) -> Result<f32> {
     )?;
     setting_value(c, rect_at(x, y + 295.0, w, 30.0), "Địa điểm", &settings.weather_location)?;
     let repo = if settings.git_folders.is_empty() {
-        "Tự tìm repo".to_owned()
+        if settings.git_author.is_empty() {
+            "Tự tìm repo · user.email".to_owned()
+        } else {
+            format!("Tự tìm repo · {}", settings.git_author)
+        }
     } else {
         format!("{} thư mục · {}", settings.git_folders.len(), if settings.git_author.is_empty() { "email Git" } else { &settings.git_author })
     };
@@ -807,12 +811,13 @@ fn draw_settings(c: &mut Ctx<'_>, y: f32) -> Result<f32> {
         if settings.launch_at_startup { "Bật" } else { "Tắt" },
     )?;
     setting_value(c, rect_at(x, y + 409.0, w, 30.0), "Phím tắt ẩn / hiện", &settings.shortcut)?;
-    c.text(
-        "Bấm Địa điểm hoặc Git / email để sửa settings.json.",
-        rect_at(x, y + 447.0, w, 14.0),
-        font(9.0, MUTED),
-    )?;
-    Ok(y + 470.0)
+    let git_hint = data
+        .git
+        .as_ref()
+        .and_then(|g| g.error.as_deref())
+        .unwrap_or("Bấm Địa điểm hoặc Git / email để sửa settings.json.");
+    c.text(git_hint, rect_at(x, y + 447.0, w, 28.0), font(9.0, MUTED))?;
+    Ok(y + 484.0)
 }
 
 fn setting_value(c: &mut Ctx<'_>, area: RectF, label: &str, value: &str) -> Result<()> {

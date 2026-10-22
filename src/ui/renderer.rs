@@ -353,9 +353,16 @@ impl Renderer {
     }
 
     /// Arc stroke centered at (cx, cy), angles in degrees clockwise from 3 o'clock.
+    /// A full 360° sweep is drawn as two semicircles — a single 360° arc is degenerate in D2D
+    /// (start == end) and draws nothing, which made CPU/RAM track rings invisible.
     pub fn stroke_arc(&mut self, cx: f32, cy: f32, radius: f32, start_deg: f32, sweep_deg: f32, rgba: u32, width: f32) -> Result<()> {
         if sweep_deg.abs() < 0.5 {
             return Ok(());
+        }
+        // Split near-full circles so each AddArc has distinct endpoints.
+        if sweep_deg.abs() >= 359.5 {
+            self.stroke_arc(cx, cy, radius, start_deg, 180.0, rgba, width)?;
+            return self.stroke_arc(cx, cy, radius, start_deg + 180.0, 180.0, rgba, width);
         }
         let factory = d2d_factory()?;
         let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
@@ -382,6 +389,139 @@ impl Renderer {
         let g: &ID2D1Geometry = &geo;
         // SAFETY: `g` lives for the call; default stroke style.
         unsafe { rt.DrawGeometry(g, brush, width, None::<&ID2D1StrokeStyle>) };
+        Ok(())
+    }
+
+    /// Fills a rect with only the top two corners rounded (bottom edge flush / square).
+    /// Used for the dock bar when it sits on the monitor edge so wallpaper cannot peek
+    /// through lower rounded corners.
+    pub fn fill_top_rounded_rect(&mut self, rect: RectF, radius: f32, rgba: u32) -> Result<()> {
+        self.with_top_rounded_path(rect, radius, |rt, brush, geo| {
+            // SAFETY: geo and brush live for the call.
+            unsafe { rt.FillGeometry(geo, brush, None::<&windows::Win32::Graphics::Direct2D::ID2D1Brush>) };
+            Ok(())
+        }, rgba)
+    }
+
+    /// Stroke for a top-rounded / square-bottom rect (inset by half the stroke width).
+    pub fn stroke_top_rounded_rect(&mut self, rect: RectF, radius: f32, rgba: u32, width: f32) -> Result<()> {
+        let half = width / 2.0;
+        let inset = RectF { x: rect.x + half, y: rect.y + half, w: rect.w - width, h: rect.h - width };
+        let r = radius.max(0.0).min(inset.w / 2.0).min(inset.h);
+        self.with_top_rounded_path(inset, r, move |rt, brush, geo| {
+            // SAFETY: geo and brush live for the call.
+            unsafe { rt.DrawGeometry(geo, brush, width, None::<&ID2D1StrokeStyle>) };
+            Ok(())
+        }, rgba)
+    }
+
+    fn with_top_rounded_path(
+        &mut self,
+        rect: RectF,
+        radius: f32,
+        draw: impl FnOnce(&ID2D1HwndRenderTarget, &ID2D1SolidColorBrush, &ID2D1Geometry) -> Result<()>,
+        rgba: u32,
+    ) -> Result<()> {
+        let r = radius.max(0.0).min(rect.w / 2.0).min(rect.h);
+        let factory = d2d_factory()?;
+        let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
+        let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
+        // SAFETY: sink closed before draw.
+        unsafe {
+            let sink = geo.Open()?;
+            use windows::Win32::Graphics::Direct2D::Common::{
+                D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
+            };
+            // Top-left after the corner arc start, going clockwise: top edge → top-right arc →
+            // right edge → bottom-right (square) → bottom edge → bottom-left (square) → left → TL arc.
+            sink.BeginFigure(
+                D2D_POINT_2F { x: x + r, y },
+                D2D1_FIGURE_BEGIN_FILLED,
+            );
+            sink.AddLine(D2D_POINT_2F { x: x + w - r, y });
+            if r > 0.0 {
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F { x: x + w, y: y + r },
+                    size: D2D_SIZE_F { width: r, height: r },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+            }
+            sink.AddLine(D2D_POINT_2F { x: x + w, y: y + h });
+            sink.AddLine(D2D_POINT_2F { x, y: y + h });
+            sink.AddLine(D2D_POINT_2F { x, y: y + r });
+            if r > 0.0 {
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F { x: x + r, y },
+                    size: D2D_SIZE_F { width: r, height: r },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+            }
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+        }
+        let (rt, brush) = self.parts()?;
+        Self::set_color(brush, rgba);
+        let g: &ID2D1Geometry = &geo;
+        draw(rt, brush, g)
+    }
+
+    /// Vertical gradient fill clipped to a top-rounded / square-bottom path.
+    pub fn fill_top_rounded_rect_gradient(&mut self, rect: RectF, radius: f32, top: u32, bottom: u32) -> Result<()> {
+        let r = radius.max(0.0).min(rect.w / 2.0).min(rect.h);
+        let factory = d2d_factory()?;
+        let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
+        let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
+        unsafe {
+            let sink = geo.Open()?;
+            use windows::Win32::Graphics::Direct2D::Common::{
+                D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
+            };
+            sink.BeginFigure(D2D_POINT_2F { x: x + r, y }, D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(D2D_POINT_2F { x: x + w - r, y });
+            if r > 0.0 {
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F { x: x + w, y: y + r },
+                    size: D2D_SIZE_F { width: r, height: r },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+            }
+            sink.AddLine(D2D_POINT_2F { x: x + w, y: y + h });
+            sink.AddLine(D2D_POINT_2F { x, y: y + h });
+            sink.AddLine(D2D_POINT_2F { x, y: y + r });
+            if r > 0.0 {
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F { x: x + r, y },
+                    size: D2D_SIZE_F { width: r, height: r },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+            }
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+        }
+        let (rt, _) = self.parts()?;
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: color(top) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: color(bottom) },
+        ];
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+            startPoint: D2D_POINT_2F { x: rect.x, y: rect.y },
+            endPoint: D2D_POINT_2F { x: rect.x, y: rect.y + rect.h },
+        };
+        // SAFETY: stops live for CreateGradientStopCollection / CreateLinearGradientBrush.
+        let brush = unsafe {
+            let collection = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            rt.CreateLinearGradientBrush(&props, None, &collection)?
+        };
+        let g: &ID2D1Geometry = &geo;
+        unsafe { rt.FillGeometry(g, &brush, None::<&windows::Win32::Graphics::Direct2D::ID2D1Brush>) };
         Ok(())
     }
 

@@ -13,7 +13,6 @@ use serde_json::Value;
 
 use crate::model::{AiUsage, AiWindow};
 
-const TIMEOUT: Duration = Duration::from_secs(15);
 /// /api/oauth/usage is aggressively rate limited.
 const CLAUDE_MIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
@@ -149,7 +148,7 @@ fn reset_text(reset_ms: Option<i64>) -> String {
 
 /// No redirects: a bearer token must never be forwarded to another host.
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(TIMEOUT).redirects(0).build()
+    crate::data::http::agent_no_redirect()
 }
 
 /// Response as JSON, or a short error text that never contains a credential.

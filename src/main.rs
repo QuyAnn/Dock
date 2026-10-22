@@ -73,6 +73,18 @@ struct Shared {
     audio_peak: AtomicU32,
 }
 
+/// Extra dock surface on a non-primary monitor (same tiles, own HWND / AppBar / renderer).
+struct SecondaryDock {
+    hwnd: HWND,
+    monitor: RECT,
+    origin: (f32, f32),
+    dpi: u32,
+    width: f32,
+    renderer: Renderer,
+    tiles: Vec<(&'static str, RectF)>,
+    hover: Option<usize>,
+}
+
 struct App {
     hwnd: HWND,
     /// Dock top-left in screen coordinates, for popup anchors.
@@ -93,6 +105,8 @@ struct App {
     history: History,
     visualizer_running: bool,
     dock_visible: bool,
+    /// One dock per additional monitor; empty on single-display machines.
+    secondaries: Vec<SecondaryDock>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -120,6 +134,7 @@ thread_local! {
     static SHELL_MSG: Cell<u32> = const { Cell::new(0) };
 }
 
+/// Search roots / env override for git. Empty means `refresh_git` will auto-discover repos.
 fn default_repos() -> Vec<PathBuf> {
     if let Ok(value) = std::env::var("SMARTDOCK_REPOS") {
         let configured: Vec<PathBuf> = value
@@ -132,46 +147,8 @@ fn default_repos() -> Vec<PathBuf> {
             return configured;
         }
     }
-    if let Some(path) = std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .map(|p| p.join("SmartDock").join("settings.json"))
-    {
-        if let Ok(text) = std::fs::read_to_string(path) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(items) = json.get("gitFolders").and_then(|v| v.as_array()) {
-                    let configured: Vec<PathBuf> = items
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .map(PathBuf::from)
-                        .filter(|p| p.exists())
-                        .collect();
-                    if !configured.is_empty() {
-                        return configured;
-                    }
-                }
-            }
-        }
-    }
-    let mut candidates = Vec::new();
-    if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
-        for relative in [
-            "source\\repos",
-            "Documents\\GitHub",
-            "Documents\\Projects",
-            "Projects",
-            "dev",
-            "src",
-        ] {
-            let path = home.join(relative);
-            if path.exists() {
-                candidates.push(path);
-            }
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd);
-    }
-    candidates
+    // Empty → data::git::discover_repos() (user.email + profile scan).
+    Vec::new()
 }
 
 fn main() {
@@ -340,18 +317,42 @@ fn create_dock_window(
     screen_h: i32,
     dock_height_px: i32,
 ) -> windows::core::Result<HWND> {
-    let y = screen_h - dock_height_px;
+    create_dock_window_at(hinst, class, 0, screen_h - dock_height_px, screen_w, dock_height_px, "SmartDock")
+}
+
+fn create_dock_window_at(
+    hinst: HINSTANCE,
+    class: PCWSTR,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    title: &str,
+) -> windows::core::Result<HWND> {
+    let title_wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
     let attempts = [
-        ("dock", WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, WS_POPUP, 0, y, screen_w, dock_height_px),
-        ("plain popup", WINDOW_EX_STYLE(0), WS_POPUP, 0, y, screen_w, dock_height_px),
-        ("overlapped", WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW, 100, 100, 400, 200),
+        ("dock", WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, WS_POPUP, x, y, w, h),
+        ("plain popup", WINDOW_EX_STYLE(0), WS_POPUP, x, y, w, h),
     ];
     let mut created = None;
     for (name, ex, style, x, y, w, h) in attempts {
-        // SAFETY: class is registered by the caller; all string args are static literals.
+        // SAFETY: class is registered by the caller; title wide string lives for the call.
         let res = unsafe {
             SetLastError(WIN32_ERROR(0));
-            let res = CreateWindowExW(ex, class, w!("SmartDock"), style, x, y, w, h, None, None, hinst, None);
+            let res = CreateWindowExW(
+                ex,
+                class,
+                PCWSTR(title_wide.as_ptr()),
+                style,
+                x,
+                y,
+                w,
+                h,
+                None,
+                None,
+                hinst,
+                None,
+            );
             log(&format!("CreateWindowExW '{name}' last_error={:?}", GetLastError()));
             res
         };
@@ -365,6 +366,106 @@ fn create_dock_window(
         }
     }
     created.ok_or_else(|| windows::core::Error::new(E_FAIL, "CreateWindowExW failed for every style"))
+}
+
+/// Builds a dock HWND + AppBar + renderer for every non-primary monitor.
+fn build_secondary_docks(
+    hinst: HINSTANCE,
+    class: PCWSTR,
+    primary: RECT,
+    dock_height_dip: f32,
+) -> Vec<SecondaryDock> {
+    let mut out = Vec::new();
+    for mon in appbar::enum_monitor_rects() {
+        if mon.left == primary.left && mon.top == primary.top && mon.right == primary.right && mon.bottom == primary.bottom {
+            continue;
+        }
+        let mon_w = mon.right - mon.left;
+        let mon_h = mon.bottom - mon.top;
+        if mon_w <= 0 || mon_h <= 0 {
+            continue;
+        }
+        // Approximate DPI from width vs primary; refined after CreateWindow via window_dpi.
+        let approx_dpi = 96u32;
+        let dock_h = dpi::dip_to_px(dock_height_dip, approx_dpi);
+        let corner = dpi::dip_to_px(16.0, approx_dpi);
+        let Ok(hwnd) = create_dock_window_at(
+            hinst,
+            class,
+            mon.left,
+            mon.bottom - dock_h,
+            mon_w,
+            dock_h + corner,
+            "SmartDockSecondary",
+        ) else {
+            log(&format!("secondary dock create failed for monitor {:?}", (mon.left, mon.top, mon.right, mon.bottom)));
+            continue;
+        };
+        let dpi_value = dpi::window_dpi(hwnd);
+        let dock_h = dpi::dip_to_px(dock_height_dip, dpi_value);
+        let corner = dpi::dip_to_px(16.0, dpi_value);
+        let Ok(rect) = appbar::register_appbar_on(hwnd, AbEdge::Bottom, dock_h, mon) else {
+            log("secondary appbar register failed");
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            continue;
+        };
+        let pixel_w = rect.right - rect.left;
+        let window_h = dock_h + corner;
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                rect.left,
+                rect.top,
+                pixel_w,
+                window_h,
+                SWP_NOACTIVATE,
+            );
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        apply_dwm_rounding(hwnd);
+        let renderer = Renderer::new(hwnd, pixel_w, window_h, dpi_value);
+        log(&format!(
+            "secondary dock on monitor ({},{}..{},{}) hwnd={:?}",
+            mon.left, mon.top, mon.right, mon.bottom, hwnd
+        ));
+        out.push(SecondaryDock {
+            hwnd,
+            monitor: mon,
+            origin: (rect.left as f32, rect.top as f32),
+            dpi: dpi_value,
+            width: dpi::px_to_dip(pixel_w, dpi_value),
+            renderer,
+            tiles: Vec::new(),
+            hover: None,
+        });
+    }
+    appbar::set_secondary_docks_active(!out.is_empty());
+    out
+}
+
+/// Unregisters AppBars and returns HWNDs to destroy. DestroyWindow must run **outside**
+/// any `APP` RefCell borrow — it re-enters `wnd_proc`.
+fn take_secondary_dock_hwnds(docks: &mut Vec<SecondaryDock>) -> Vec<HWND> {
+    let hwnds: Vec<HWND> = docks
+        .drain(..)
+        .map(|dock| {
+            appbar::unregister_appbar(dock.hwnd);
+            dock.hwnd
+        })
+        .collect();
+    appbar::set_secondary_docks_active(false);
+    hwnds
+}
+
+fn destroy_secondary_hwnds(hwnds: &[HWND]) {
+    for &hwnd in hwnds {
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 }
 
 fn run() -> windows::core::Result<()> {
@@ -437,7 +538,7 @@ fn run() -> windows::core::Result<()> {
     let shared = Arc::new(Shared {
         data: Mutex::new(DataState::default()),
         control: Mutex::new(ControlState::read()),
-        settings: Mutex::new(initial_settings),
+        settings: Mutex::new(initial_settings.clone()),
         liquid: Mutex::new(None),
         refresh_liquid: AtomicBool::new(false),
         refresh_slow: AtomicBool::new(false),
@@ -451,6 +552,11 @@ fn run() -> windows::core::Result<()> {
     apps.refresh(&attention);
 
     let renderer = Renderer::new(hwnd, pixel_width, dock_window_height_px, dpi_value);
+    let secondaries = build_secondary_docks(hinst, class, rect, DOCK_HEIGHT);
+    for sec in &secondaries {
+        glass::apply_dock_glass(sec.hwnd, initial_settings.glass_opacity);
+    }
+    log(&format!("secondary docks: {}", secondaries.len()));
     APP.with(|a| {
         *a.borrow_mut() = Some(App {
             hwnd,
@@ -467,6 +573,7 @@ fn run() -> windows::core::Result<()> {
             history: History::default(),
             visualizer_running: false,
             dock_visible: true,
+            secondaries,
         })
     });
 
@@ -512,8 +619,9 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     if enabled.music { left.push(t("media", 165.0)); }
     if enabled.weather && settings.weather_position == "tile" { left.push(t("weather", 100.0)); }
     let mut right = vec![t("cc", 56.0), t("gear", 22.0)];
-    if enabled.cpu { right.push(t("cpu", 42.0)); }
-    if enabled.ram { right.push(t("ram", 42.0)); }
+    // Dock-Rc .ring-tile width 34 around a 28px SVG ring.
+    if enabled.cpu { right.push(t("cpu", 34.0)); }
+    if enabled.ram { right.push(t("ram", 34.0)); }
     right.push(t("clock", 64.0));
     Zones {
         left,
@@ -636,11 +744,12 @@ fn tile_view(
         },
         "start" => TileView { style: Style::Start, ..TileView::card("", "") },
         "gear" => TileView::bare("\u{E713}"),
+        // Dock-Rc Ring shows the bare percent inside the circle (not "CPU 6" / "RAM 65").
         "cpu" => TileView {
             style: Style::Ring,
             progress: Some(stats.cpu_pct / 100.0),
             accent: gauge_color(stats.cpu_pct),
-            ..TileView::card("", format!("CPU {:.0}", stats.cpu_pct))
+            ..TileView::card(format!("CPU {:.0}%", stats.cpu_pct), format!("{:.0}", stats.cpu_pct))
         },
         "ram" => {
             let pct = if stats.ram_total_mb > 0 { stats.ram_used_mb as f32 * 100.0 / stats.ram_total_mb as f32 } else { 0.0 };
@@ -649,7 +758,7 @@ fn tile_view(
                 progress: Some(pct / 100.0),
                 // RAM is blue until it is nearly full (AppSystem tiles use #4aa8ff).
                 accent: if pct > 85.0 { 0xFF5D_5DFF } else { 0x4AA8_FFFF },
-                ..TileView::card("", format!("RAM {pct:.0}"))
+                ..TileView::card(format!("RAM {pct:.0}%"), format!("{pct:.0}"))
             }
         }
         "clock" => {
@@ -673,6 +782,41 @@ fn tile_view(
     }
 }
 
+fn paint_surface(
+    renderer: &mut Renderer,
+    width: f32,
+    hover: Option<usize>,
+    tiles_out: &mut Vec<(&'static str, RectF)>,
+    apps_state: &AppsState,
+    stats: &Stats,
+    data: &DataState,
+    control: &ControlState,
+    audio_peak: f32,
+    settings: &settings::Settings,
+    backdrop: Option<&LiquidBitmap>,
+) {
+    let zones = layout_tiles(apps_state.windows.len(), settings);
+    let rects = dock::layout(&zones.left, &zones.center, &zones.right, width);
+    let defs: Vec<&Tile> = zones.left.iter().chain(&zones.center).chain(&zones.right).collect();
+    let views: Vec<TileView> = defs
+        .iter()
+        .map(|t| tile_view(t.id, data, control, stats, audio_peak, settings))
+        .collect();
+    *tiles_out = defs.iter().zip(rects.iter()).map(|(t, r)| (t.id, *r)).collect();
+    let apps_rect = tiles_out.iter().find(|(id, _)| *id == "apps").map(|(_, r)| *r);
+    let res = renderer
+        .begin()
+        .and_then(|_| dock::draw_dock(renderer, &views, &rects, hover, backdrop, settings.glass_opacity))
+        .and_then(|_| match apps_rect {
+            Some(r) => apps::draw_apps(renderer, r, apps_state),
+            None => Ok(()),
+        })
+        .and_then(|_| renderer.end());
+    if let Err(e) = res {
+        log(&format!("paint failed: {e}"));
+    }
+}
+
 fn repaint() {
     APP.with(|a| {
         let mut slot = a.borrow_mut();
@@ -683,64 +827,82 @@ fn repaint() {
         let control = app.shared.control.lock().unwrap().clone();
         let audio_peak = f32::from_bits(app.shared.audio_peak.load(Ordering::Relaxed));
         let backdrop = app.shared.liquid.lock().unwrap().clone();
-
         let settings = app.shared.settings.lock().unwrap().clone();
-        let zones = layout_tiles(app.apps.windows.len(), &settings);
-        let rects = dock::layout(&zones.left, &zones.center, &zones.right, app.width);
-        let defs: Vec<&Tile> = zones.left.iter().chain(&zones.center).chain(&zones.right).collect();
-        let views: Vec<TileView> = defs
-            .iter()
-            .map(|t| tile_view(t.id, &data, &control, &stats, audio_peak, &settings))
-            .collect();
-        app.tiles = defs.iter().zip(rects.iter()).map(|(t, r)| (t.id, *r)).collect();
 
-        let apps_rect = app.tiles.iter().find(|(id, _)| *id == "apps").map(|(_, r)| *r);
-        let res = app
-            .renderer
-            .begin()
-            .and_then(|_| dock::draw_dock(
-                &mut app.renderer,
-                &views,
-                &rects,
-                app.hover,
-                backdrop.as_deref(),
-                settings.glass_opacity,
-            ))
-            .and_then(|_| match apps_rect {
-                Some(r) => apps::draw_apps(&mut app.renderer, r, &app.apps),
-                None => Ok(()),
-            })
-            .and_then(|_| app.renderer.end());
-        if let Err(e) = res {
-            log(&format!("paint failed: {e}"));
+        paint_surface(
+            &mut app.renderer,
+            app.width,
+            app.hover,
+            &mut app.tiles,
+            &app.apps,
+            &stats,
+            &data,
+            &control,
+            audio_peak,
+            &settings,
+            backdrop.as_deref(),
+        );
+        // Secondary monitors do not share the primary liquid bitmap crop; tint + DWM acrylic
+        // still give a frosted look until per-monitor liquid is rendered.
+        for sec in &mut app.secondaries {
+            paint_surface(
+                &mut sec.renderer,
+                sec.width,
+                sec.hover,
+                &mut sec.tiles,
+                &app.apps,
+                &stats,
+                &data,
+                &control,
+                audio_peak,
+                &settings,
+                None,
+            );
         }
     });
 }
 
 /// Updates the hovered tile from a pointer position. Returns true when the hovered tile changed.
-fn set_hover(hover_at: Option<(f32, f32)>) -> bool {
+fn set_hover_on(hwnd: HWND, hover_at: Option<(f32, f32)>) -> bool {
     APP.with(|a| {
         let Ok(mut slot) = a.try_borrow_mut() else { return false };
         let Some(app) = slot.as_mut() else { return false };
-        let rects: Vec<RectF> = app.tiles.iter().map(|(_, r)| *r).collect();
-        let next = hover_at.and_then(|(x, y)| dock::hit_test(x, y, &rects));
-        let changed = next != app.hover;
-        app.hover = next;
-        changed
+        if app.hwnd == hwnd {
+            let rects: Vec<RectF> = app.tiles.iter().map(|(_, r)| *r).collect();
+            let next = hover_at.and_then(|(x, y)| dock::hit_test(x, y, &rects));
+            let changed = next != app.hover;
+            app.hover = next;
+            return changed;
+        }
+        if let Some(sec) = app.secondaries.iter_mut().find(|s| s.hwnd == hwnd) {
+            let rects: Vec<RectF> = sec.tiles.iter().map(|(_, r)| *r).collect();
+            let next = hover_at.and_then(|(x, y)| dock::hit_test(x, y, &rects));
+            let changed = next != sec.hover;
+            sec.hover = next;
+            return changed;
+        }
+        false
     })
 }
 
-fn dock_click(x: f32, y: f32) -> Click {
+fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
     APP.with(|a| {
         let Ok(slot) = a.try_borrow() else { return Click::None };
         let Some(app) = slot.as_ref() else { return Click::None };
-        let Some((id, rect)) = app.tiles.iter().find(|(_, r)| dock::hit_test(x, y, &[*r]).is_some()).copied() else {
+        let (tiles, origin, dpi_value) = if app.hwnd == hwnd {
+            (&app.tiles, app.origin, app.dpi)
+        } else if let Some(sec) = app.secondaries.iter().find(|s| s.hwnd == hwnd) {
+            (&sec.tiles, sec.origin, sec.dpi)
+        } else {
             return Click::None;
         };
-        let scale = dpi::scale(app.dpi);
+        let Some((id, rect)) = tiles.iter().find(|(_, r)| dock::hit_test(x, y, &[*r]).is_some()).copied() else {
+            return Click::None;
+        };
+        let scale = dpi::scale(dpi_value);
         let anchor = RectF {
-            x: app.origin.0 + rect.x * scale,
-            y: app.origin.1,
+            x: origin.0 + rect.x * scale,
+            y: origin.1,
             w: rect.w * scale,
             h: DOCK_HEIGHT * scale,
         };
@@ -750,6 +912,7 @@ fn dock_click(x: f32, y: f32) -> Click {
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
             "claude" | "codex" | "cursor" | "grok" => Click::Open(OpenPopup::Data(id), anchor),
             "media" => Click::Open(OpenPopup::Data("media"), anchor),
+            "weather" => Click::Open(OpenPopup::Data("weather"), anchor),
             "clock" => Click::Open(OpenPopup::Data("clock"), anchor),
             "cpu" => Click::Open(OpenPopup::Data("cpu"), anchor),
             "ram" => Click::Open(OpenPopup::Data("ram"), anchor),
@@ -889,6 +1052,9 @@ fn on_popup_click(x: f32, y: f32) {
                     popup_content::SettingsAction::GlassOpacity(value) => {
                         settings.glass_opacity = value;
                         glass::apply_dock_glass(app.hwnd, value);
+                        for sec in &app.secondaries {
+                            glass::apply_dock_glass(sec.hwnd, value);
+                        }
                     }
                     popup_content::SettingsAction::HiddenTaskbar(hidden) => {
                         settings.taskbar_mode = if hidden { "hidden" } else { "autohide" }.to_owned();
@@ -949,8 +1115,8 @@ fn on_popup_hidden() {
 fn shutdown() {
     popup::hide();
     OPEN.with(|o| o.set(None));
-    APP.with(|a| {
-        if let Some(app) = a.borrow_mut().take() {
+    let secondary_hwnds = APP.with(|a| {
+        if let Some(mut app) = a.borrow_mut().take() {
             unsafe {
                 // SAFETY: hwnd is still valid until DestroyWindow in the caller.
                 let _ = KillTimer(app.hwnd, TIMER_REFRESH);
@@ -960,8 +1126,12 @@ fn shutdown() {
             }
             tasks::unregister_shell_hook(app.hwnd);
             appbar::unregister_appbar(app.hwnd);
+            take_secondary_dock_hwnds(&mut app.secondaries)
+        } else {
+            Vec::new()
         }
     });
+    destroy_secondary_hwnds(&secondary_hwnds);
     appbar::ensure_restored_on_exit();
 }
 
@@ -1051,9 +1221,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     if app.dock_visible {
                         let hidden = app.shared.settings.lock().unwrap().taskbar_mode == "hidden";
                         appbar::hide_taskbar(hidden);
-                        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        let _ = ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
+                        for sec in &app.secondaries {
+                            let _ = ShowWindow(sec.hwnd, SW_SHOWNOACTIVATE);
+                        }
                     } else {
-                        let _ = ShowWindow(hwnd, SW_HIDE);
+                        let _ = ShowWindow(app.hwnd, SW_HIDE);
+                        for sec in &app.secondaries {
+                            let _ = ShowWindow(sec.hwnd, SW_HIDE);
+                        }
                         appbar::restore_taskbar();
                     }
                 }
@@ -1070,7 +1246,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_LBUTTONUP => {
             let (x, y) = client_point(lparam);
-            let click = dock_click(x, y);
+            let click = dock_click_on(hwnd, x, y);
             log(&format!("click at ({x},{y}) -> {}", match &click {
                 Click::None => "none",
                 Click::Activate(_) => "activate",
@@ -1098,7 +1274,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let _ = TrackMouseEvent(&mut tme);
             // The app icons magnify under the pointer, so every move repaints.
             apps::set_pointer(Some(x));
-            set_hover(Some((x, y)));
+            set_hover_on(hwnd, Some((x, y)));
             repaint();
             LRESULT(0)
         }
@@ -1109,35 +1285,64 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_MOUSELEAVE => {
             apps::set_pointer(None);
-            set_hover(None);
+            set_hover_on(hwnd, None);
             repaint();
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
-            APP.with(|a| {
-                if let Some(app) = a.borrow_mut().as_mut() {
-                    let dpi_value = dpi::window_dpi(hwnd);
-                    let dock_h = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
-                    if let Ok(rect) = appbar::reposition_appbar(hwnd, AbEdge::Bottom, dock_h) {
-                        let pixel_w = rect.right - rect.left;
-                        let window_h = dock_h + dpi::dip_to_px(16.0, dpi_value);
-                        let _ = SetWindowPos(
-                            hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_w, window_h, SWP_NOACTIVATE,
-                        );
-                        app.origin = (rect.left as f32, rect.top as f32);
-                        app.dpi = dpi_value;
-                        app.width = dpi::px_to_dip(pixel_w, dpi_value);
-                        app.renderer.resize(pixel_w, window_h, dpi_value);
-                        app.shared.refresh_liquid.store(true, Ordering::SeqCst);
-                        log(&format!(
-                            "display change: appbar=({},{}..{},{}) dpi={dpi_value}",
-                            rect.left, rect.top, rect.right, rect.bottom
-                        ));
+            // Only the primary dock owns topology rebuilds; secondary HWNDs also receive this.
+            let is_primary = APP.with(|a| a.borrow().as_ref().map(|app| app.hwnd == hwnd).unwrap_or(false));
+            if is_primary {
+                let mut stale = Vec::new();
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        let dpi_value = dpi::window_dpi(hwnd);
+                        let dock_h = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
+                        if let Ok(rect) = appbar::reposition_appbar(hwnd, AbEdge::Bottom, dock_h) {
+                            let pixel_w = rect.right - rect.left;
+                            let window_h = dock_h + dpi::dip_to_px(16.0, dpi_value);
+                            let _ = SetWindowPos(
+                                hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_w, window_h, SWP_NOACTIVATE,
+                            );
+                            app.origin = (rect.left as f32, rect.top as f32);
+                            app.dpi = dpi_value;
+                            app.width = dpi::px_to_dip(pixel_w, dpi_value);
+                            app.renderer.resize(pixel_w, window_h, dpi_value);
+                            app.shared.refresh_liquid.store(true, Ordering::SeqCst);
+                            log(&format!(
+                                "display change: appbar=({},{}..{},{}) dpi={dpi_value}",
+                                rect.left, rect.top, rect.right, rect.bottom
+                            ));
+                            stale = take_secondary_dock_hwnds(&mut app.secondaries);
+                        }
                     }
-                }
-            });
-            appbar::enforce_taskbar_hidden();
-            repaint();
+                });
+                destroy_secondary_hwnds(&stale);
+                APP.with(|a| {
+                    if let Some(app) = a.borrow_mut().as_mut() {
+                        let hinst: HINSTANCE = match unsafe { GetModuleHandleW(None) } {
+                            Ok(h) => h.into(),
+                            Err(_) => return,
+                        };
+                        let class = w!("SmartDockDock");
+                        let opacity = app.shared.settings.lock().unwrap().glass_opacity;
+                        let primary = RECT {
+                            left: app.origin.0 as i32,
+                            top: app.origin.1 as i32,
+                            right: app.origin.0 as i32 + dpi::dip_to_px(app.width, app.dpi),
+                            bottom: app.origin.1 as i32 + dpi::dip_to_px(DOCK_HEIGHT, app.dpi),
+                        };
+                        // Prefer live monitor rect for matching; fall back to dock strip.
+                        let primary_mon = appbar::primary_monitor_rect().unwrap_or(primary);
+                        app.secondaries = build_secondary_docks(hinst, class, primary_mon, DOCK_HEIGHT);
+                        for sec in &app.secondaries {
+                            glass::apply_dock_glass(sec.hwnd, opacity);
+                        }
+                    }
+                });
+                appbar::enforce_taskbar_hidden();
+                repaint();
+            }
             LRESULT(0)
         }
         WM_SETTINGCHANGE => {
@@ -1145,12 +1350,28 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_ENDSESSION | WM_CLOSE => {
-            shutdown();
-            let _ = DestroyWindow(hwnd);
+            let is_primary = APP.with(|a| a.borrow().as_ref().map(|app| app.hwnd == hwnd).unwrap_or(true));
+            if is_primary {
+                shutdown();
+                let _ = DestroyWindow(hwnd);
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
-            PostQuitMessage(0);
+            // Secondary docks are destroyed during rebuild while APP may already be borrowed.
+            // Only end the message loop for the primary (or after shutdown cleared APP).
+            let quit = APP
+                .try_with(|a| match a.try_borrow() {
+                    Ok(slot) => match slot.as_ref() {
+                        None => true, // shutdown already took App
+                        Some(app) => app.hwnd == hwnd,
+                    },
+                    Err(_) => false, // nested borrow during rebuild
+                })
+                .unwrap_or(false);
+            if quit {
+                PostQuitMessage(0);
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

@@ -63,7 +63,15 @@ fn tile(title: &str, value: String, progress: Option<f32>) -> TileView {
 pub fn git_tile(d: &DataState) -> TileView {
     match &d.git {
         None => tile("GIT", "–".to_owned(), None),
-        Some(g) if g.error.is_some() => tile("GIT", "—".to_owned(), None),
+        Some(g) if g.error.is_some() => {
+            // Still show an empty heatmap so the tile matches Dock-Rc; value stays an em-dash
+            // until repos/email are configured (details live in the Git popup / Settings).
+            TileView {
+                style: Style::Git,
+                cells: heat_levels(&g.heatmap, 16, 3),
+                ..TileView::card("GIT", "—".to_owned())
+            }
+        }
         Some(g) => TileView {
             style: Style::Git,
             cells: heat_levels(&g.heatmap, 16, 3),

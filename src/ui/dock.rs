@@ -13,7 +13,7 @@ pub const DOCK_H: f32 = 46.0;
 const BAR_RADIUS: f32 = 16.0;
 const TILE_H: f32 = 34.0;
 const TILE_RADIUS: f32 = 10.0;
-const ROW_PAD: f32 = 7.0; // equal optical inset at both ends; keeps edge strokes unclipped
+const ROW_PAD: f32 = 5.0; // styles.css .dock-row padding: 0 5px
 const ZONE_GAP: f32 = 5.0; // .zone gap
 const ROW_GAP: f32 = 6.0; // .dock-row gap between zones
 
@@ -25,7 +25,7 @@ const TILE_HOVER_FILL: u32 = 0x1E1E_23A1; // rgba(30,30,35,.63)
 const TILE_HOVER_BORDER: u32 = 0xFFFF_FF24; // rgba(255,255,255,.14)
 const TEXT: u32 = 0xF1F1_F4FF;
 const MUTED: u32 = 0xFFFF_FF8C; // rgba(255,255,255,.55)
-const RING_TRACK: u32 = 0xFFFF_FF1F; // rgba(255,255,255,.12)
+const RING_TRACK: u32 = 0xFFFF_FF33; // rgba(255,255,255,.20) — visible grey track behind accent arc
 const BTN_FILL: u32 = 0xFFFF_FF12; // .cc-btn background, rgba(255,255,255,.07)
 const BTN_BORDER: u32 = 0xFFFF_FF14; // rgba(255,255,255,.08)
 const CLOCK_TOP: u32 = 0xFF5A_3CFF;
@@ -186,10 +186,12 @@ pub fn draw_dock(
         r.draw_bitmap(b.w, b.h, &b.rgba, bar)?;
     }
     let tint = glass_fill_color(opacity_pct);
-    r.fill_rounded_rect(bar, BAR_RADIUS, tint)?;
+    // Flush to the monitor edge: round only the top corners. Rounding the bottom lets a few
+    // sharp wallpaper pixels show through at the lower left/right.
+    r.fill_top_rounded_rect(bar, BAR_RADIUS, tint)?;
     // A second fill below y=16 doubled the tint alpha and created a hard horizontal seam.
-    r.fill_rounded_rect_gradient(bar, BAR_RADIUS, GLASS_SHEEN_TOP, 0xFFFF_FF00)?;
-    r.stroke_rounded_rect(bar, BAR_RADIUS, BAR_BORDER, 1.0)?;
+    r.fill_top_rounded_rect_gradient(bar, BAR_RADIUS, GLASS_SHEEN_TOP, 0xFFFF_FF00)?;
+    r.stroke_top_rounded_rect(bar, BAR_RADIUS, BAR_BORDER, 1.0)?;
 
     for (i, (t, rc)) in tiles.iter().zip(rects).enumerate() {
         let hovered = hover == Some(i);
@@ -281,16 +283,23 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
 
 fn draw_ring(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
-    // SVG ring: 28 px box, radius 11.5, stroke 2.4, starts at 12 o'clock.
+    // Dock-Rc Ring: 28 px box, r=11.5, stroke 2.4, track rgba(255,255,255,.12), value centered.
     let (cx, cy) = (rc.x + rc.w / 2.0, rc.y + rc.h / 2.0);
     let radius = 11.5;
     let width = 2.4;
+    // Full grey track first (split into semicircles inside stroke_arc), then the accent arc.
     r.stroke_arc(cx, cy, radius, 0.0, 360.0, RING_TRACK, width)?;
     if let Some(p) = t.progress {
         let accent = if t.accent != 0 { t.accent } else { 0x4AA8_FFFF };
-        r.stroke_arc(cx, cy, radius, -90.0, 360.0 * p.clamp(0.0, 1.0), accent, width)?;
+        let sweep = 360.0 * p.clamp(0.0, 1.0);
+        if sweep >= 0.5 {
+            r.stroke_arc(cx, cy, radius, -90.0, sweep, accent, width)?;
+        }
     }
-    r.draw_text_styled(&t.value, rc, 7.5, TEXT, Align::Center, TextStyle::Bold)
+    // Number only (Dock-Rc ring-val), inset so glyphs never sit on the stroke.
+    let inset = radius - width;
+    let text = RectF { x: cx - inset, y: cy - inset, w: inset * 2.0, h: inset * 2.0 };
+    r.draw_text_styled(&t.value, text, 9.0, TEXT, Align::Center, TextStyle::Bold)
 }
 
 fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {

@@ -21,6 +21,22 @@ jobs:
       - name: Build release
         run: cargo build --release --locked
 
+      - name: Verify ureq TLS feature wiring
+        shell: pwsh
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          if ($manifest -notmatch 'ureq\s*=\s*\{[^}]*native-tls') {
+            throw "Cargo.toml must enable ureq native-tls (HTTPS agents need an explicit TlsConnector)."
+          }
+          $http = Get-Content src/data/http.rs -Raw
+          if ($http -notmatch 'tls_connector') {
+            throw "src/data/http.rs must call AgentBuilder::tls_connector — native-tls alone does not enable HTTPS."
+          }
+          Write-Host "TLS wiring OK: native-tls feature + tls_connector in http.rs"
+
+      - name: TLS smoke test
+        run: cargo test --locked native_tls_backend_is_configured -- --nocapture
+
       - name: Verify static CRT dependencies
         shell: pwsh
         run: |

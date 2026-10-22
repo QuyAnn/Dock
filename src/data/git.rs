@@ -10,6 +10,10 @@ use crate::model::GitDay;
 
 const DAYS: i64 = 119; // 17 weeks
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Max directory depth when auto-scanning under the user profile.
+const SCAN_DEPTH: u32 = 3;
+/// Cap auto-discovered repos so a huge home tree cannot stall the worker.
+const MAX_AUTO_REPOS: usize = 40;
 
 #[derive(Clone, Debug, Default)]
 pub struct GitSummary {
@@ -33,11 +37,16 @@ fn git(args: &[&str], cwd: Option<&Path>) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+fn is_git_repo(path: &Path) -> bool {
+    let git = path.join(".git");
+    git.is_dir() || git.is_file() // bare / worktree: .git may be a file
+}
+
 /// Each folder that is a repo itself, otherwise its direct subfolders that are repos.
 fn find_repos(folders: &[PathBuf]) -> Vec<PathBuf> {
     let mut repos: Vec<PathBuf> = Vec::new();
     for folder in folders {
-        if folder.join(".git").exists() {
+        if is_git_repo(folder) {
             if !repos.contains(folder) {
                 repos.push(folder.clone());
             }
@@ -46,10 +55,124 @@ fn find_repos(folders: &[PathBuf]) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(folder) else { continue };
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() && p.join(".git").exists() && !repos.contains(&p) {
+            if p.is_dir() && is_git_repo(&p) && !repos.contains(&p) {
                 repos.push(p);
             }
         }
+    }
+    repos
+}
+
+fn skip_dir_name(name: &str) -> bool {
+    matches!(
+        name,
+        "node_modules"
+            | ".git"
+            | "target"
+            | "build"
+            | "dist"
+            | ".cache"
+            | "AppData"
+            | "Application Data"
+            | "Local Settings"
+            | "Cookies"
+            | "NTUSER.DAT"
+            | "Recent"
+            | "Temp"
+            | "tmp"
+            | ".nuget"
+            | ".vscode"
+            | ".cursor"
+            | "vendor"
+    )
+}
+
+/// Depth-limited walk under `root` collecting git repos (including `root` itself).
+fn scan_repos(root: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+    if out.len() >= MAX_AUTO_REPOS {
+        return;
+    }
+    if is_git_repo(root) {
+        if !out.contains(&root.to_path_buf()) {
+            out.push(root.to_path_buf());
+        }
+        return; // do not descend into a repo's nested packages
+    }
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    for entry in entries.flatten() {
+        if out.len() >= MAX_AUTO_REPOS {
+            return;
+        }
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') && name != ".git" {
+            // Still allow scanning typical project dirs; skip only heavy/system ones above.
+        }
+        if skip_dir_name(&name) {
+            continue;
+        }
+        scan_repos(&p, depth - 1, out);
+    }
+}
+
+/// Folders to search when Settings has no `gitFolders`: common project roots + a shallow
+/// walk of the user profile (and public Documents).
+pub fn default_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        for relative in [
+            "source\\repos",
+            "Documents\\GitHub",
+            "Documents\\Projects",
+            "Documents",
+            "Projects",
+            "dev",
+            "src",
+            "code",
+            "repos",
+            "work",
+            "Desktop",
+        ] {
+            let path = home.join(relative);
+            if path.is_dir() {
+                roots.push(path);
+            }
+        }
+        // Always include the profile itself for a shallow scan (depth-limited).
+        if home.is_dir() && !roots.iter().any(|r| r == &home) {
+            roots.push(home);
+        }
+    }
+    // Drive-letter company defaults from Dock-Rc, when present on this machine.
+    for drive_path in [r"D:\PAYMENT6", r"D:\SmartDock", r"D:\dev", r"D:\src"] {
+        let p = PathBuf::from(drive_path);
+        if p.is_dir() {
+            roots.push(p);
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if !roots.contains(&cwd) {
+            roots.push(cwd);
+        }
+    }
+    roots
+}
+
+/// Auto-discover repos under the default search roots (depth-limited).
+pub fn discover_repos() -> Vec<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
+    let mut repos = Vec::new();
+    for root in default_search_roots() {
+        // Profile root: shallow walk. Named project folders: a bit deeper.
+        let depth = if home.as_ref() == Some(&root) { SCAN_DEPTH } else { 2 };
+        scan_repos(&root, depth, &mut repos);
     }
     repos
 }
@@ -67,13 +190,19 @@ pub fn refresh_git(repos: &[PathBuf], configured_author: &str) -> GitSummary {
     } else {
         configured_author.trim().to_owned()
     };
-    let repo_dirs = find_repos(repos);
+
+    let repo_dirs = if repos.is_empty() {
+        discover_repos()
+    } else {
+        find_repos(repos)
+    };
+
     if !git_available {
-        error = Some("git.exe not found in PATH".to_owned());
+        error = Some("Không thấy git.exe trong PATH — cài Git for Windows hoặc thêm vào PATH (Cài đặt)".to_owned());
     } else if author.is_empty() {
-        error = Some("git user.email is not set".to_owned());
+        error = Some("Chưa có git user.email — đặt trong Cài đặt hoặc: git config --global user.email".to_owned());
     } else if repo_dirs.is_empty() {
-        error = Some("no git repos in the configured folders".to_owned());
+        error = Some("Không tìm thấy repo git — thêm thư mục trong Cài đặt (Git / email)".to_owned());
     } else {
         let author_arg = format!("--author={author}");
         let since = format!("--since={DAYS} days ago");
