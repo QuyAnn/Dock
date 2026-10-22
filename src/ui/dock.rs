@@ -536,8 +536,22 @@ const SHELF_RADIUS: f32 = 12.0;
 
 /// One continuous, very light liquid-glass capsule behind the icon group (macOS Tahoe dock).
 fn draw_shelf(r: &mut Renderer, rc: RectF) -> Result<()> {
+    let scale = r.dpi() as f32 / 96.0;
+    let rc = snap_to_pixels(rc, scale);
     r.fill_rounded_rect(rc, SHELF_RADIUS, 0xFFFF_FF12)?;
-    super::glass::draw_highlights(r, rc, SHELF_RADIUS, 0.75)
+    // 1 px rims are stroked half a device pixel inside the edge so each rim lands on
+    // exactly one pixel row/column (crisp, and nothing bleeds into the bar margin).
+    let half = 0.5 / scale;
+    let rim = RectF { x: rc.x + half, y: rc.y + half, w: rc.w - 2.0 * half, h: rc.h - 2.0 * half };
+    super::glass::draw_highlights(r, rim, SHELF_RADIUS - half, 0.75)
+}
+
+/// Rounds a DIP rect's edges to whole device pixels at `scale` (DPI / 96).
+pub fn snap_to_pixels(rc: RectF, scale: f32) -> RectF {
+    let s = scale.max(0.01);
+    let (x0, y0) = ((rc.x * s).round(), (rc.y * s).round());
+    let (x1, y1) = (((rc.x + rc.w) * s).round(), ((rc.y + rc.h) * s).round());
+    RectF { x: x0 / s, y: y0 / s, w: (x1 - x0) / s, h: (y1 - y0) / s }
 }
 
 #[cfg(test)]
@@ -557,6 +571,22 @@ mod tests {
         ];
         let right = vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
         (left, center, right)
+    }
+
+    #[test]
+    fn dock_layout_shelf_snaps_to_device_pixels_with_equal_margins() {
+        let shelf = RectF { x: 650.0, y: 3.0, w: 600.0, h: super::super::apps::CLUSTER_H };
+        for &scale in &[1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let s = snap_to_pixels(shelf, scale);
+            let (top, bottom) = (s.y * scale, (s.y + s.h) * scale);
+            assert!((top - top.round()).abs() < 1e-3 && (bottom - bottom.round()).abs() < 1e-3);
+            // Margins inside the visible bar (rounded to whole pixels) differ by at most 1 px
+            // and are equal when the bar height in px is even-split.
+            let bar = (DOCK_H * scale).round();
+            let (mt, mb) = (top, bar - bottom);
+            assert!((mt - mb).abs() <= 1.0, "scale {scale}: {mt} vs {mb}");
+        }
+        assert_eq!(snap_to_pixels(shelf, 1.0).y, 3.0);
     }
 
     #[test]
