@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"] // GUI app: no console window when launched from Explorer
 //! SmartDock entry point: AppBar dock window with Direct2D tiles and popups.
 //! Startup: recover taskbar from a crash -> create dock -> register AppBar -> hide taskbar.
 //! Every exit path (WM_CLOSE, panic, Ctrl+C) restores the taskbar.
