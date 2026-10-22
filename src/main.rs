@@ -61,6 +61,7 @@ const SETTINGS_POPUP_W: f32 = 460.0;
 const POPUP_H_DEFAULT: f32 = 260.0;
 const TIMER_REFRESH: usize = 1; // 1 s: apps, stats, popup refresh, repaint
 const TIMER_GUARD: usize = 2; // 500 ms: keep the Windows taskbar hidden
+const TIMER_EXPLORER: usize = 0x5E5E; // one-shot: Explorer restarted, re-attach after it settles
 const TIMER_VISUALIZER: usize = 3; // ~30 fps, enabled only while media is playing
 const HOTKEY_TOGGLE: i32 = 1;
 
@@ -1752,13 +1753,47 @@ fn on_popup_tick() {
 }
 
 thread_local! {
-    /// Times the work-area guard had to re-apply a reservation (for fight detection).
-    static WORK_AREA_FIXES: RefCell<Vec<std::time::Instant>> = const { RefCell::new(Vec::new()) };
+    /// Times the work-area guard found a dock reservation missing (for fight detection).
+    static WORK_AREA_MISSES: RefCell<Vec<std::time::Instant>> = const { RefCell::new(Vec::new()) };
+    static LAST_REREGISTER: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    static LAST_FORCE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    /// The guard turned the tray listener off for this session (it kept breaking the work area).
+    static TRAY_OFF_BY_GUARD: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Keeps maximized windows above every dock: if a monitor's work area does not end at its
-/// dock's top, set it explicitly. If that keeps being undone while our tray listener runs,
-/// turn the listener off and re-register the AppBars the normal way.
+fn taskbar_created_msg() -> u32 {
+    static MSG_ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    // SAFETY: registers (or looks up) a global message name.
+    *MSG_ID.get_or_init(|| unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) })
+}
+
+/// Explorer restarted: tray listener off, taskbars hidden once, AppBars registered with the
+/// new Explorer, then the listener back on (if enabled).
+fn reattach_to_explorer(primary: HWND) {
+    let tray_enabled = APP.with(|a| {
+        a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.shared.settings.lock().unwrap().tray_service)).unwrap_or(false)
+    });
+    win::traysvc::shutdown();
+    appbar::enforce_taskbar_hidden();
+    unsafe {
+        // Synchronous: ABM_REMOVE + ABM_NEW for the primary, secondaries rebuilt.
+        SendMessageW(primary, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
+    }
+    LAST_REREGISTER.with(|c| c.set(Some(std::time::Instant::now())));
+    WORK_AREA_MISSES.with(|m| m.borrow_mut().clear());
+    appbar::enforce_taskbar_hidden();
+    let tray_enabled = tray_enabled && !TRAY_OFF_BY_GUARD.with(Cell::get);
+    if tray_enabled {
+        win::traysvc::start();
+    }
+    log(&format!("explorer: re-attached (AppBars re-registered, tray listener {})", if tray_enabled { "restarted" } else { "off" }));
+}
+
+/// Keeps maximized windows above every dock. A missing reservation is first repaired the
+/// normal way (re-register the AppBars); only if that does not hold is the work area set
+/// directly, at most every 5 s so we never fight Explorer in a tight loop (each set makes
+/// Explorer re-lay-out its taskbars, which flickers). If misses keep coming while our tray
+/// listener runs, the listener is turned off.
 fn guard_work_area(primary: HWND) {
     let docks: Vec<HWND> = APP.with(|a| {
         a.try_borrow()
@@ -1766,24 +1801,37 @@ fn guard_work_area(primary: HWND) {
             .and_then(|b| b.as_ref().map(|app| std::iter::once(app.hwnd).chain(app.secondaries.iter().map(|s| s.hwnd)).collect()))
             .unwrap_or_default()
     });
-    let fixed = docks.iter().filter(|&&h| appbar::ensure_work_area(h)).count();
-    if fixed == 0 {
+    let missing: Vec<HWND> = docks.into_iter().filter(|&h| appbar::work_area_missing(h)).collect();
+    if missing.is_empty() {
         return;
     }
     let now = std::time::Instant::now();
-    let recent = WORK_AREA_FIXES.with(|f| {
-        let mut f = f.borrow_mut();
-        f.push(now);
-        f.retain(|t| now.duration_since(*t).as_secs() < 30);
-        f.len()
+    let misses = WORK_AREA_MISSES.with(|m| {
+        let mut m = m.borrow_mut();
+        m.push(now);
+        m.retain(|t| now.duration_since(*t).as_secs() < 30);
+        m.len()
     });
-    if recent >= 4 && win::traysvc::running() {
-        log("tray: work area keeps losing the dock reservation while the listener runs; turning the listener off and re-registering the AppBars");
+    if misses >= 8 && win::traysvc::running() {
+        log("tray: work area keeps losing the dock reservation while the listener runs; turning the listener off for this session");
+        TRAY_OFF_BY_GUARD.with(|c| c.set(true));
         win::traysvc::shutdown();
-        WORK_AREA_FIXES.with(|f| f.borrow_mut().clear());
-        // Same path as a topology change: re-registers the primary and secondary AppBars.
-        unsafe {
-            let _ = PostMessageW(primary, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
+    }
+    let since = |c: &'static std::thread::LocalKey<Cell<Option<std::time::Instant>>>| {
+        c.with(|c| c.get()).map_or(u64::MAX, |t| now.duration_since(t).as_secs())
+    };
+    if since(&LAST_REREGISTER) >= 15 {
+        LAST_REREGISTER.with(|c| c.set(Some(now)));
+        log("workarea: dock reservation missing; re-registering the AppBars");
+        // AppBars must be registered while Explorer owns Shell_TrayWnd, so this also
+        // pauses our tray listener around the registration.
+        reattach_to_explorer(primary);
+        return;
+    }
+    if since(&LAST_REREGISTER) >= 2 && since(&LAST_FORCE) >= 5 {
+        LAST_FORCE.with(|c| c.set(Some(now)));
+        for h in missing {
+            appbar::ensure_work_area(h);
         }
     }
 }
@@ -1844,6 +1892,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
     if msg == WM_NCCREATE {
         return LRESULT(1);
     }
+    let taskbar_created = taskbar_created_msg();
+    if taskbar_created != 0 && msg == taskbar_created {
+        let is_primary = APP.with(|a| a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.hwnd == hwnd)).unwrap_or(false));
+        if is_primary && !win::traysvc::own_broadcast_recent() {
+            // A new Explorer: wait until it has finished building its taskbars (debounced),
+            // then hide them once, register the AppBars with it and restart the tray listener.
+            log("explorer: TaskbarCreated from a new Explorer; re-attaching in 2 s");
+            unsafe {
+                SetTimer(hwnd, TIMER_EXPLORER, 2000, None);
+            }
+        }
+        return LRESULT(0);
+    }
     let shell_msg = SHELL_MSG.with(Cell::get);
     if shell_msg != 0 && msg == shell_msg {
         if let Some(event) = tasks::parse_shell_message(wparam.0, lparam.0) {
@@ -1891,6 +1952,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     });
                     refresh_open_popup();
                     repaint();
+                }
+                TIMER_EXPLORER => {
+                    let _ = KillTimer(hwnd, TIMER_EXPLORER);
+                    reattach_to_explorer(hwnd);
                 }
                 TIMER_GUARD => {
                     appbar::enforce_taskbar_hidden();
@@ -2018,7 +2083,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     if let Some(app) = a.borrow_mut().as_mut() {
                         let dpi_value = dpi::window_dpi(hwnd);
                         let dock_h = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
-                        if let Ok(rect) = appbar::reposition_appbar(hwnd, AbEdge::Bottom, dock_h) {
+                        // Full re-registration: after an Explorer restart the new Explorer does
+                        // not know the old AppBar, so a reposition alone reserves nothing.
+                        appbar::unregister_appbar(hwnd);
+                        if let Ok(rect) = appbar::register_appbar(hwnd, AbEdge::Bottom, dock_h) {
                             let pixel_w = rect.right - rect.left;
                             let window_h = dock_h + dpi::dip_to_px(16.0, dpi_value);
                             let _ = SetWindowPos(

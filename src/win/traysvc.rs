@@ -15,7 +15,8 @@
 //! window (NOTIFYICON_VERSION_4 semantics when the app asked for them). No synthetic input.
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::Duration;
 
 use windows::core::{w, PCWSTR, PWSTR};
@@ -105,15 +106,36 @@ fn ts() -> String {
 
 /// Starts the listener thread (idempotent). Failures are logged; the dock keeps working and
 /// the popup then simply has no icons.
+static THREAD_ALIVE: AtomicBool = AtomicBool::new(false);
+static OWN_BROADCAST_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// True for a few seconds after we broadcast TaskbarCreated ourselves, so the dock does not
+/// mistake our own broadcast for an Explorer restart.
+pub fn own_broadcast_recent() -> bool {
+    now_ms().saturating_sub(OWN_BROADCAST_MS.load(Ordering::SeqCst)) < 4000
+}
+
+/// Starts the listener thread (again, after a shutdown) unless it is already running.
 pub fn start() {
-    static ONCE: OnceLock<()> = OnceLock::new();
-    ONCE.get_or_init(|| {
-        let spawned = std::thread::Builder::new().name("tray-svc".into()).spawn(run);
-        if let Err(e) = spawned {
-            crate::log(&format!("tray: cannot start listener thread: {e}"));
-            FAILED.store(true, Ordering::SeqCst);
-        }
+    if THREAD_ALIVE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    STOPPED.store(false, Ordering::SeqCst);
+    FAILED.store(false, Ordering::SeqCst);
+    let spawned = std::thread::Builder::new().name("tray-svc".into()).spawn(|| {
+        run();
+        OUR_TRAY.store(0, Ordering::SeqCst);
+        THREAD_ALIVE.store(false, Ordering::SeqCst);
     });
+    if let Err(e) = spawned {
+        crate::log(&format!("tray: cannot start listener thread: {e}"));
+        FAILED.store(true, Ordering::SeqCst);
+        THREAD_ALIVE.store(false, Ordering::SeqCst);
+    }
 }
 
 /// The listener window exists.
@@ -192,6 +214,7 @@ fn broadcast_taskbar_created(why: &str) {
     unsafe {
         let msg = RegisterWindowMessageW(w!("TaskbarCreated"));
         if msg != 0 {
+            OWN_BROADCAST_MS.store(now_ms(), Ordering::SeqCst);
             let ok = SendNotifyMessageW(HWND_BROADCAST, msg, WPARAM(0), LPARAM(0)).is_ok();
             // Broadcasts skip message-only windows, which some apps use for their icon
             // (e.g. NVIDIA's NotificationIconWindowClass): post to those directly.
@@ -226,7 +249,10 @@ fn run() {
                 style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0x8),
                 ..Default::default()
             };
-            if RegisterClassW(&wc) == 0 {
+            // A restarted listener finds its classes still registered: that is fine.
+            if RegisterClassW(&wc) == 0
+                && windows::Win32::Foundation::GetLastError() != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS
+            {
                 crate::log("tray: RegisterClass failed; tray icons unavailable");
                 FAILED.store(true, Ordering::SeqCst);
                 return;

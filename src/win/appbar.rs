@@ -414,6 +414,28 @@ pub fn recover_from_previous_crash() {
 }
 
 
+/// True when the work area of `dock`'s monitor reaches below the dock top.
+pub fn work_area_missing(dock: HWND) -> bool {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindow};
+    // SAFETY: plain queries on our own dock window.
+    unsafe {
+        if !IsWindow(dock).as_bool() {
+            return false;
+        }
+        let mut wr = RECT::default();
+        if GetWindowRect(dock, &mut wr).is_err() {
+            return false;
+        }
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromWindow(dock, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            return false;
+        }
+        let m = mi.rcMonitor;
+        wr.top > m.top + (m.bottom - m.top) / 2 && wr.top < m.bottom && mi.rcWork.bottom > wr.top
+    }
+}
+
 /// Set once we wrote a work area ourselves (SPI_SETWORKAREA); undone on exit.
 static WORK_AREA_FORCED: AtomicBool = AtomicBool::new(false);
 static WORK_AREA_LOGS: AtomicU32 = AtomicU32::new(0);
