@@ -28,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, DeregisterShellHookWindow, GWL_EXSTYLE, GW_OWNER, SW_MINIMIZE,
     SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     AllowSetForegroundWindow, FindWindowW, ShowWindowAsync, SwitchToThisWindow, ASFW_ANY, SC_TASKLIST,
-    WM_SYSCOMMAND, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, SC_MINIMIZE,
+    WM_SYSCOMMAND, SC_CLOSE, EVENT_SYSTEM_FOREGROUND, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, SC_MINIMIZE,
     ShowWindow, IsWindow, GetDesktopWindow, GetShellWindow,
 };
 
@@ -476,8 +476,11 @@ fn effective_foreground() -> isize {
 pub fn capture_click_state() {
     let fg = effective_foreground();
     CLICK_FG.store(fg, Ordering::SeqCst);
-    let start = start_window().is_some();
+    let start = start_open_now();
     CLICK_START_OPEN.store(start, Ordering::SeqCst);
+    if start {
+        crate::log(&format!("{} click down: Start is open", ts()));
+    }
 }
 
 /// Whether Start was open when the current click began.
@@ -625,15 +628,132 @@ pub fn minimize_window(hwnd: isize) {
 
 /// Graceful close via WM_CLOSE (never TerminateProcess / taskkill).
 pub fn close_window(hwnd: isize) {
-    let target = HWND(hwnd as _);
-    unsafe {
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(target, Some(&mut pid as *mut u32));
-        if pid == 0 || pid == GetCurrentProcessId() {
-            return;
+    close_windows(vec![hwnd]);
+}
+
+/// Taskbar-style "Close window(s)": asks every real top-level window of the app to close,
+/// politely (WM_SYSCOMMAND SC_CLOSE, like the taskbar's own menu). Never kills a process.
+/// Runs on a worker thread and logs every attempt; elevated targets (UIPI refuses our
+/// messages) are retried through UI Automation's WindowPattern.Close, and if that is refused
+/// too the user gets a small "needs admin" hint.
+pub fn close_windows(hwnds: Vec<isize>) {
+    let mut targets: Vec<isize> = Vec::new();
+    for h in hwnds {
+        let root = close_target(h);
+        if root != 0 && !targets.contains(&root) {
+            targets.push(root);
         }
-        let _ = PostMessageW(target, WM_CLOSE, WPARAM(0), LPARAM(0));
     }
+    crate::log(&format!("{} close: request for {} window(s) {:x?}", ts(), targets.len(), targets));
+    if targets.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut blocked: Vec<(isize, String)> = Vec::new();
+        for &h in &targets {
+            let hwnd = HWND(h as _);
+            let mut pid = 0u32;
+            // SAFETY: plain queries / posts on a possibly stale handle.
+            unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+            if pid == 0 || pid == unsafe { GetCurrentProcessId() } {
+                crate::log(&format!("{} close: hwnd={h:#x} skipped (gone or own window)", ts()));
+                continue;
+            }
+            let exe = process_identity(pid).0;
+            let name = Path::new(&exe).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let sys = unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) };
+            let sys_err = sys.as_ref().err().map(|e| format!("{:#x}", e.code().0));
+            let mut ok = sys.is_ok();
+            let mut via = "sc_close";
+            if !ok {
+                // Some windows ignore system commands they did not create; WM_CLOSE is the fallback.
+                ok = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) }.is_ok();
+                via = "wm_close";
+            }
+            crate::log(&format!(
+                "{} close: hwnd={h:#x} class={} exe={name} pid={pid} posted={ok} via={via} sc_err={}",
+                ts(),
+                class_of(hwnd),
+                sys_err.as_deref().unwrap_or("-")
+            ));
+            if !ok {
+                // UIPI: a medium-integrity process cannot post to an elevated window.
+                let uia = uia_close(hwnd);
+                crate::log(&format!("{} close: hwnd={h:#x} uia_close={uia}", ts()));
+                if !uia {
+                    blocked.push((h, name));
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        for &h in &targets {
+            // SAFETY: plain queries.
+            let alive = unsafe { IsWindow(HWND(h as _)).as_bool() && IsWindowVisible(HWND(h as _)).as_bool() };
+            crate::log(&format!("{} close: hwnd={h:#x} after 1.5s -> {}", ts(), if alive { "still open (app may be asking to save, or hides to tray)" } else { "closed" }));
+        }
+        if !blocked.is_empty() {
+            let names: Vec<String> = blocked.iter().map(|(_, n)| n.clone()).collect();
+            crate::log(&format!("{} close: needs admin for {:?} (elevated, UIPI blocked)", ts(), names));
+            needs_admin_hint(&names.join(", "));
+        }
+    });
+}
+
+/// The window that should receive the close: the root owner of `hwnd` when that owner is a
+/// visible top-level window (dialogs close with their app window), else `hwnd` itself.
+fn close_target(hwnd: isize) -> isize {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOTOWNER};
+    let h = HWND(hwnd as _);
+    // SAFETY: plain queries on a possibly stale handle.
+    unsafe {
+        if !IsWindow(h).as_bool() {
+            return 0;
+        }
+        let root = GetAncestor(h, GA_ROOTOWNER);
+        if !root.is_invalid() && root != h && IsWindowVisible(root).as_bool() {
+            return root.0 as isize;
+        }
+    }
+    hwnd
+}
+
+/// UI Automation WindowPattern.Close; works across integrity levels only where Windows allows.
+fn uia_close(hwnd: HWND) -> bool {
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+    use windows::Win32::UI::Accessibility::{CUIAutomation, IUIAutomation, IUIAutomationWindowPattern, UIA_WindowPatternId};
+    // SAFETY: COM calls on this worker thread; every interface is released on drop.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let Ok(uia) = CoCreateInstance::<_, IUIAutomation>(&CUIAutomation, None, CLSCTX_INPROC_SERVER) else {
+            return false;
+        };
+        let Ok(el) = uia.ElementFromHandle(hwnd) else { return false };
+        let Ok(pattern) = el.GetCurrentPatternAs::<IUIAutomationWindowPattern>(UIA_WindowPatternId) else {
+            return false;
+        };
+        pattern.Close().is_ok()
+    }
+}
+
+/// Small non-blocking note when an elevated app refused to be closed by the dock.
+fn needs_admin_hint(names: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_SETFOREGROUND, MB_TOPMOST};
+    let text = windows::core::HSTRING::from(format!(
+        "{names} is running as administrator, so SmartDock (not elevated) is not allowed to close it.\n\nClose it from its own window instead."
+    ));
+    let title = windows::core::HSTRING::from("SmartDock · needs admin");
+    std::thread::spawn(move || unsafe {
+        // SAFETY: both strings live for the call; ownerless box on its own thread.
+        MessageBoxW(None, &text, &title, MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+    });
+}
+
+/// Local wall-clock timestamp for decision logs.
+fn ts() -> String {
+    use windows::Win32::System::SystemInformation::GetLocalTime;
+    // SAFETY: plain query.
+    let t = unsafe { GetLocalTime() };
+    format!("[{:02}:{:02}:{:02}.{:03}]", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds)
 }
 
 /// Starts a new instance of an exe (or .lnk). Packaged apps go through the shell.
@@ -654,15 +774,12 @@ pub fn launch_exe(exe: &str) {
     }
 }
 
-/// Dock Start button: toggles the Start menu.
-///
-/// If Start was open when the mouse went down, it is closed. Otherwise WM_SYSCOMMAND/SC_TASKLIST
-/// is posted to Shell_TrayWnd; after 450 ms, if Start is visible but not foreground it is made
-/// foreground (so a click elsewhere dismisses it normally); if it is not visible at all, one
-/// Win-key press is the fallback for this explicit click.
+/// Dock Start button: toggles the Start menu. The decision (open vs close) is taken from the
+/// state captured at mouse-down; opening sends exactly one toggle (SC_TASKLIST) and never a
+/// second one, so Start cannot close itself right after opening. Outside clicks are left to Windows.
 pub fn open_start_menu() {
-    if start_was_open_at_click() || start_window().is_some() {
-        crate::log("start: open at click -> closing");
+    if start_was_open_at_click() {
+        crate::log(&format!("{} start: open at mouse-down -> closing", ts()));
         close_start_menu();
         return;
     }
@@ -676,33 +793,43 @@ pub fn open_start_menu() {
             _ => false,
         }
     };
-    crate::log(&format!("start: SC_TASKLIST posted={posted}"));
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(450));
-        match start_window() {
-            Some(h) => {
-                let fg = unsafe { GetForegroundWindow() };
-                if fg == h {
-                    crate::log("start: menu open (foreground)");
-                } else {
-                    // Visible without focus never sees the outside click; give it the foreground.
-                    let ok = unsafe { SetForegroundWindow(h).as_bool() };
-                    crate::log(&format!("start: menu open, not foreground (fg class {}); set_fg={ok}", class_of(fg)));
-                }
-            }
-            None => {
+    crate::log(&format!("{} start: closed at mouse-down -> open; SC_TASKLIST posted={posted}", ts()));
+    if !posted {
+        // The only toggle sent in this case (SC_TASKLIST never went out).
+        send_win_key();
+        return;
+    }
+    std::thread::spawn(|| {
+        // Observe only: learn the Start host window so later clicks can close it. No toggles here.
+        for delay in [300u64, 700] {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+            let fg = unsafe { GetForegroundWindow() };
+            if let Some(h) = start_window().or_else(|| fg_start_like(fg).then_some(fg)) {
+                START_HWND.store(h.0 as isize, Ordering::SeqCst);
+                let mut pid = 0u32;
+                unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+                let exe = process_identity(pid).0;
                 crate::log(&format!(
-                    "start: not open after SC_TASKLIST (fg class {}), sending Win key",
-                    class_of(unsafe { GetForegroundWindow() })
+                    "{} start: open (hwnd={:#x} host={} foreground={})",
+                    ts(),
+                    h.0 as isize,
+                    Path::new(&exe).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    fg == h
                 ));
-                send_win_key();
+                return;
             }
         }
+        crate::log(&format!(
+            "{} start: no Start window seen yet (fg class {}); no fallback toggle sent",
+            ts(),
+            class_of(unsafe { GetForegroundWindow() })
+        ));
     });
 }
 
 /// Closes Start: hand the foreground back to the last app (Start dismisses itself on losing
-/// focus, exactly like clicking the desktop); if it is still open 250 ms later, one Win key.
+/// focus, exactly like clicking the desktop); if it is verifiably still open 300 ms later,
+/// one Win key (a close, never an open: it is only sent while Start is seen open).
 pub fn close_start_menu() {
     let back = LAST_APP.load(Ordering::SeqCst);
     let target = if back != 0 && unsafe { IsWindow(HWND(back as _)).as_bool() } {
@@ -714,24 +841,49 @@ pub fn close_start_menu() {
         let _ = AllowSetForegroundWindow(ASFW_ANY);
         SetForegroundWindow(target).as_bool()
     };
-    crate::log(&format!("start: closing via foreground -> {:#x} ({}) ok={ok}", target.0 as isize, class_of(target)));
+    crate::log(&format!("{} start: closing via foreground -> {:#x} ({}) ok={ok}", ts(), target.0 as isize, class_of(target)));
     std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(250));
-        if start_window().is_some() {
-            crate::log("start: still open, sending Win key");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        if start_open_now() {
+            crate::log(&format!("{} start: still open, sending Win key to close", ts()));
             send_win_key();
         } else {
-            crate::log("start: closed");
+            crate::log(&format!("{} start: closed", ts()));
         }
     });
 }
 
-/// Called for a dock click that hit nothing: like clicking the desktop, it dismisses Start.
+/// Called for a genuine dock click that hit nothing: dismisses Start only if it was open when
+/// this click went down (never on mouse-up or focus changes).
 pub fn dismiss_start_if_open() {
-    if start_was_open_at_click() || start_window().is_some() {
-        crate::log("start: empty dock click while open -> closing");
+    if start_was_open_at_click() {
+        crate::log(&format!("{} start: empty dock click while open -> closing", ts()));
         close_start_menu();
     }
+}
+
+/// Start host window learned after opening (Windows builds differ in which process hosts it).
+static START_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Whether Start is open right now: a visible, uncloaked Start host window, or a shell
+/// CoreWindow flyout (Start/Search) holding the foreground.
+fn start_open_now() -> bool {
+    start_window().is_some() || fg_start_like(unsafe { GetForegroundWindow() })
+}
+
+fn fg_start_like(fg: HWND) -> bool {
+    if fg.is_invalid() || class_of(fg) != "Windows.UI.Core.CoreWindow" {
+        return false;
+    }
+    if fg.0 as isize == START_HWND.load(Ordering::SeqCst) || is_start_host(fg) {
+        return true;
+    }
+    let mut pid = 0u32;
+    // SAFETY: plain query.
+    unsafe { GetWindowThreadProcessId(fg, Some(&mut pid)) };
+    let exe = process_identity(pid).0.to_ascii_lowercase();
+    // The touch keyboard / emoji panel is a CoreWindow too but never Start.
+    !exe.ends_with("textinputhost.exe")
 }
 
 fn class_of(hwnd: HWND) -> String {
@@ -751,7 +903,7 @@ fn is_start_host(hwnd: HWND) -> bool {
     // SAFETY: plain query.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     let exe = process_identity(pid).0.to_ascii_lowercase();
-    ["startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe"]
+    ["startmenuexperiencehost.exe", "searchhost.exe", "searchapp.exe", "shellhost.exe"]
         .iter()
         .any(|n| exe.ends_with(n))
 }

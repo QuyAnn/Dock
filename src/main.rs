@@ -1362,7 +1362,9 @@ fn popup_rect() -> RectF {
 fn on_popup_click(x: f32, y: f32) {
     let rect = popup_rect();
     if OPEN.with(Cell::get) == Some(OpenPopup::AppMenu) {
-        if let Some(action) = appmenu::hit_test(x, y) {
+        let hit = appmenu::hit_test(x, y);
+        log(&format!("appmenu: click at ({x:.0},{y:.0}) -> {hit:?}"));
+        if let Some(action) = hit {
             APP.with(|a| {
                 let slot = a.borrow();
                 let Some(app) = slot.as_ref() else { return };

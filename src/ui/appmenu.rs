@@ -7,7 +7,7 @@ use super::renderer::{Align, Renderer, TextStyle};
 use crate::model::WindowEntry;
 use crate::settings::{DockPin, Settings};
 use crate::win::icons::IconBitmap;
-use crate::win::tasks::{close_window, focus_window, launch_exe};
+use crate::win::tasks::{focus_window, launch_exe};
 
 const PAD_X: f32 = 10.0;
 const ROW_H: f32 = 32.0;
@@ -218,9 +218,8 @@ pub fn apply(action: AppMenuAction, settings: &mut Settings) {
             }
         }
         AppMenuAction::CloseAll => {
-            for w in &menu.windows {
-                close_window(w.hwnd);
-            }
+            crate::log(&format!("appmenu: close {} window(s) of {}", menu.windows.len(), menu.name));
+            crate::win::tasks::close_windows(menu.windows.iter().map(|w| w.hwnd).collect());
         }
     }
 }
