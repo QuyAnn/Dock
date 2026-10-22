@@ -67,7 +67,10 @@ pub fn from_group(name: &str, exe: &str, wins: &[WindowEntry], icon: Option<Icon
         .dock_pins
         .iter()
         .find(|p| p.exe.eq_ignore_ascii_case(exe))
-        .map(|p| format!("dock:{}", p.exe.to_ascii_lowercase()));
+        .map(|p| format!("dock:{}", p.exe.to_ascii_lowercase()))
+        .or_else(|| {
+            crate::data::usage::is_auto_pinned(exe, settings).then(|| format!("auto:{}", exe.to_ascii_lowercase()))
+        });
     AppMenuData {
         name: name.to_owned(),
         exe: exe.to_owned(),
@@ -204,9 +207,15 @@ pub fn apply(action: AppMenuAction, settings: &mut Settings) {
                     name: menu.name.clone(),
                 });
             }
+            settings.auto_pin_hidden.retain(|h| !h.eq_ignore_ascii_case(&menu.exe));
         }
         AppMenuAction::Unpin => {
+            let auto = crate::data::usage::is_auto_pinned(&menu.exe, settings);
             settings.dock_pins.retain(|p| !p.exe.eq_ignore_ascii_case(&menu.exe));
+            // Remember an unpinned auto pin so it never comes back on its own.
+            if auto && !settings.auto_pin_hidden.iter().any(|h| h.eq_ignore_ascii_case(&menu.exe)) {
+                settings.auto_pin_hidden.push(menu.exe.clone());
+            }
         }
         AppMenuAction::CloseAll => {
             for w in &menu.windows {

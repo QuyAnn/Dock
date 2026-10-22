@@ -583,7 +583,7 @@ fn run() -> windows::core::Result<()> {
     // ABM_QUERYPOS can return a rect one taskbar-height above rcMonitor.bottom.
     appbar::hide_taskbar(initial_settings.taskbar_mode == "hidden");
     appbar::install_tray_show_hook();
-    tasks::install_foreground_hook(None);
+    tasks::install_foreground_hook(Some(data::usage::on_foreground));
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
     let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, dock_height_px)?;
@@ -628,7 +628,14 @@ fn run() -> windows::core::Result<()> {
     start_audio_meter(shared.clone());
 
     let mut apps = AppsState::default();
+    data::usage::init();
     apps.pins = pins_of(&initial_settings);
+    log(&format!(
+        "autopin: enabled={} count={} shown=[{}]",
+        initial_settings.auto_pin,
+        initial_settings.auto_pin_count,
+        data::usage::auto_pins(&initial_settings).iter().map(|(_, n)| n.as_str()).collect::<Vec<_>>().join(", ")
+    ));
     let attention = Attention::default();
     apps.refresh(&attention);
 
@@ -1178,8 +1185,11 @@ fn update_app_thumbnails(hwnd: HWND, x: f32, y: f32) {
     }
 }
 
+/// Manual pins first, then the auto-pinned most-used apps (stable between daily re-ranks).
 fn pins_of(settings: &settings::Settings) -> Vec<(String, String)> {
-    settings.dock_pins.iter().map(|p| (p.exe.clone(), p.name.clone())).collect()
+    let mut pins: Vec<(String, String)> = settings.dock_pins.iter().map(|p| (p.exe.clone(), p.name.clone())).collect();
+    pins.extend(data::usage::auto_pins(settings));
+    pins
 }
 
 fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
@@ -1415,6 +1425,20 @@ fn on_popup_click(x: f32, y: f32) {
                         settings.launch_at_startup = !settings.launch_at_startup;
                         settings::sync_startup(settings.launch_at_startup);
                     }
+                    popup_content::SettingsAction::ToggleAutoPin => {
+                        settings.auto_pin = !settings.auto_pin;
+                    }
+                    popup_content::SettingsAction::CycleAutoPinCount => {
+                        settings.auto_pin = true;
+                        settings.auto_pin_count = match settings.auto_pin_count {
+                            0..=3 => 4,
+                            4..=5 => 6,
+                            6..=7 => 8,
+                            8..=9 => 10,
+                            10..=11 => 12,
+                            _ => 4,
+                        };
+                    }
                     popup_content::SettingsAction::OpenConfig => {
                         let _ = settings::save(&settings);
                         if let Some(path) = settings::path() {
@@ -1586,6 +1610,7 @@ fn on_popup_tick() {
 }
 
 fn shutdown() {
+    data::usage::flush();
     popup::hide();
     OPEN.with(|o| o.set(None));
     let secondary_hwnds = APP.with(|a| {
@@ -1659,6 +1684,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                                     *current_settings = disk_settings;
                                     app.shared.refresh_slow.store(true, Ordering::SeqCst);
                                 }
+                                data::usage::tick();
                                 app.apps.pins = pins_of(&current_settings);
                                 drop(current_settings);
                                 app.apps.refresh(&app.attention);

@@ -5,3 +5,4 @@ pub mod ai;       // Claude/Codex/Cursor usage from local credentials + HTTP
 pub mod weather;  // Open-Meteo or existing provider
 pub mod history;  // rolling 2-minute CPU and RAM samples for sparklines
 pub mod http;     // ureq Agent with native-tls connector (required for HTTPS)
+pub mod usage;    // foreground-time / UserAssist ranking for auto-pinned launchers

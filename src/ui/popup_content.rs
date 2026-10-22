@@ -110,6 +110,8 @@ pub enum SettingsAction {
     ToggleWeatherPosition,
     ToggleStartup,
     OpenConfig,
+    ToggleAutoPin,
+    CycleAutoPinCount,
 }
 
 
@@ -205,6 +207,11 @@ pub fn hit_settings(x: f32, y: f32, rect: RectF) -> Option<SettingsAction> {
     }
     if contains(rect_at(inner_x, top + 371.0, inner_w, 30.0), x, y) {
         return Some(SettingsAction::ToggleStartup);
+    }
+    let auto = rect_at(inner_x, top + 447.0, inner_w, 30.0);
+    if contains(auto, x, y) {
+        // Left half toggles; the value on the right cycles the count.
+        return Some(if x < auto.x + auto.w * 0.6 { SettingsAction::ToggleAutoPin } else { SettingsAction::CycleAutoPinCount });
     }
     None
 }
@@ -811,13 +818,15 @@ fn draw_settings(c: &mut Ctx<'_>, y: f32, data: &DataState) -> Result<f32> {
         if settings.launch_at_startup { "Bật" } else { "Tắt" },
     )?;
     setting_value(c, rect_at(x, y + 409.0, w, 30.0), "Phím tắt ẩn / hiện", &settings.shortcut)?;
+    let auto = if settings.auto_pin { format!("Bật · {} app", settings.auto_pin_count) } else { "Tắt".to_owned() };
+    setting_value(c, rect_at(x, y + 447.0, w, 30.0), "Tự ghim app hay dùng", &auto)?;
     let git_hint = data
         .git
         .as_ref()
         .and_then(|g| g.error.as_deref())
         .unwrap_or("Bấm Địa điểm hoặc Git / email để sửa settings.json.");
-    c.text(git_hint, rect_at(x, y + 447.0, w, 28.0), font(9.0, MUTED))?;
-    Ok(y + 484.0)
+    c.text(git_hint, rect_at(x, y + 485.0, w, 28.0), font(9.0, MUTED))?;
+    Ok(y + 522.0)
 }
 
 fn setting_value(c: &mut Ctx<'_>, area: RectF, label: &str, value: &str) -> Result<()> {

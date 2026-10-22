@@ -65,6 +65,12 @@ pub struct Settings {
     pub shortcut: String,
     /// SmartDock-owned pins (never written to the Windows taskbar pins folder).
     pub dock_pins: Vec<DockPin>,
+    /// Show the most-used apps as pinned launchers (merged after manual pins).
+    pub auto_pin: bool,
+    /// How many auto pins to show.
+    pub auto_pin_count: u32,
+    /// Auto pins the user removed with Unpin (exe paths); never auto-pinned again.
+    pub auto_pin_hidden: Vec<String>,
 }
 
 impl Default for Settings {
@@ -80,6 +86,9 @@ impl Default for Settings {
             git_author: String::new(),
             shortcut: "Ctrl+Alt+D".to_owned(),
             dock_pins: Vec::new(),
+            auto_pin: true,
+            auto_pin_count: 8,
+            auto_pin_hidden: Vec::new(),
         }
     }
 }
