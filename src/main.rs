@@ -97,8 +97,6 @@ thread_local! {
     /// Height of the currently shown data popup, from `popup_content::content_height`.
     static POPUP_H_CUR: Cell<f32> = const { Cell::new(POPUP_H_DEFAULT) };
     static SHELL_MSG: Cell<u32> = const { Cell::new(0) };
-    /// True while CreateWindowExW runs, so every message the window receives is logged.
-    static CREATING: Cell<bool> = const { Cell::new(false) };
 }
 
 fn default_repos() -> Vec<PathBuf> {
@@ -195,46 +193,14 @@ fn start_background_refresh(shared: Arc<Shared>, screen: (i32, i32)) {
     });
 }
 
-/// Stock window procedure for the probe class.
-unsafe extern "system" fn probe_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
-/// Unregistered probe class with the stock window procedure, to tell a class problem from a window problem.
-fn probe_window(hinst: HINSTANCE) {
-    let name = w!("SmartDockProbe");
-    let wc = WNDCLASSEXW {
-        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        lpfnWndProc: Some(probe_proc),
-        hInstance: hinst,
-        lpszClassName: name,
-        ..Default::default()
-    };
-    unsafe {
-        // SAFETY: wc and the class name are valid for the call.
-        let atom = RegisterClassExW(&wc);
-        log(&format!("probe class atom={atom}"));
-        let res = CreateWindowExW(WINDOW_EX_STYLE(0), name, w!("probe"), WS_POPUP, 0, 0, 10, 10, None, None, hinst, None);
-        match res {
-            Ok(h) if !h.is_invalid() => {
-                log("probe window created");
-                let _ = DestroyWindow(h);
-            }
-            _ => log(&format!("probe window failed, last_error={:?}", GetLastError())),
-        }
-    }
-}
-
 /// Creates the dock window. Tries the full dock style first, then plainer styles, logging each attempt.
 fn create_dock_window(hinst: HINSTANCE, class: PCWSTR, screen_w: i32, screen_h: i32) -> windows::core::Result<HWND> {
-    probe_window(hinst);
     let y = screen_h - DOCK_HEIGHT;
     let attempts = [
         ("dock", WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, WS_POPUP, 0, y, screen_w, DOCK_HEIGHT),
         ("plain popup", WINDOW_EX_STYLE(0), WS_POPUP, 0, y, screen_w, DOCK_HEIGHT),
         ("overlapped", WINDOW_EX_STYLE(0), WS_OVERLAPPEDWINDOW, 100, 100, 400, 200),
     ];
-    CREATING.with(|c| c.set(true));
     let mut created = None;
     for (name, ex, style, x, y, w, h) in attempts {
         // SAFETY: class is registered by the caller; all string args are static literals.
@@ -253,7 +219,6 @@ fn create_dock_window(hinst: HINSTANCE, class: PCWSTR, screen_w: i32, screen_h: 
             _ => log(&format!("window '{name}' failed")),
         }
     }
-    CREATING.with(|c| c.set(false));
     created.ok_or_else(|| windows::core::Error::new(E_FAIL, "CreateWindowExW failed for every style"))
 }
 
@@ -679,8 +644,10 @@ fn on_shell_event(event: ShellEvent) {
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if CREATING.with(Cell::get) {
-        log(&format!("create message {msg:#x}"));
+    // Returning TRUE from WM_NCCREATE tells Windows to continue creating the window. Letting
+    // DefWindowProc answer it made CreateWindowExW fail for this window class.
+    if msg == WM_NCCREATE {
+        return LRESULT(1);
     }
     let shell_msg = SHELL_MSG.with(Cell::get);
     if shell_msg != 0 && msg == shell_msg {
