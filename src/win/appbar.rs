@@ -13,8 +13,10 @@ use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABE_BOTTOM, ABE_TOP, ABM_GETSTATE, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
     ABM_SETPOS, ABM_SETSTATE, ABS_ALWAYSONTOP, ABS_AUTOHIDE, APPBARDATA,
 };
+use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, ShowWindow, SW_HIDE, SW_SHOW, WM_APP,
+    FindWindowExW, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible, ShowWindow,
+    EVENT_OBJECT_SHOW, OBJID_WINDOW, SW_HIDE, SW_SHOW, WINEVENT_OUTOFCONTEXT, WM_APP,
 };
 
 /// Callback message for AppBar notifications (ABN_*), WM_APP + 0x5d as in the old app.
@@ -33,6 +35,9 @@ pub enum AbEdge {
 static APPLIED: AtomicBool = AtomicBool::new(false);
 /// Hidden mode removes the primary tray HWND; autohide mode leaves it available at the edge.
 static HIDE_WINDOW: AtomicBool = AtomicBool::new(true);
+/// True while SmartDock has docks on secondary monitors: their Shell_SecondaryTrayWnd is
+/// then hidden too (in hidden mode), since our dock replaces it there.
+static SECONDARY_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Taskbar AppBar state (ABS_*) from before we changed it.
 static ORIGINAL_STATE: AtomicU32 = AtomicU32::new(ABS_ALWAYSONTOP);
 
@@ -147,20 +152,76 @@ fn secondary_trays() -> Vec<HWND> {
     find_class_windows(w!("Shell_SecondaryTrayWnd"))
 }
 
-/// Explorer often re-hides secondary trays when the primary Shell_TrayWnd is hidden.
-/// Always force them visible — secondary SmartDock windows are additive and must never
-/// leave a monitor without a usable taskbar (66ecd48 regression).
-pub fn ensure_secondary_trays_visible() {
+/// Whether secondary trays should currently be hidden: taskbar hidden by us in "hidden" mode
+/// and a SmartDock dock exists on the secondary monitors.
+fn secondaries_should_hide() -> bool {
+    APPLIED.load(Ordering::SeqCst) && HIDE_WINDOW.load(Ordering::SeqCst) && SECONDARY_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// Brings every Shell_SecondaryTrayWnd to the wanted state (hidden while our secondary docks
+/// replace it, otherwise shown). Only acts on trays whose visibility differs, so it is cheap
+/// to call from the guard timer and the show-event hook.
+pub fn sync_secondary_trays() {
+    let hide = secondaries_should_hide();
     for h in secondary_trays() {
+        // SAFETY: h is a live tray window from FindWindowExW.
         unsafe {
-            let _ = ShowWindow(h, SW_SHOW);
+            let visible = IsWindowVisible(h).as_bool();
+            if hide && visible {
+                let _ = ShowWindow(h, SW_HIDE);
+            } else if !hide && !visible {
+                let _ = ShowWindow(h, SW_SHOW);
+            }
         }
     }
 }
 
-/// Kept for call-site compatibility. Secondary trays are **never** hidden by this process.
-pub fn set_secondary_docks_active(_active: bool) {
-    ensure_secondary_trays_visible();
+/// Kept for call sites: same as `sync_secondary_trays`.
+pub fn ensure_secondary_trays_visible() {
+    sync_secondary_trays();
+}
+
+/// Tells the taskbar logic whether SmartDock currently has secondary-monitor docks.
+pub fn set_secondary_docks_active(active: bool) {
+    SECONDARY_ACTIVE.store(active, Ordering::SeqCst);
+    sync_secondary_trays();
+}
+
+/// Explorer re-shows a hidden tray when the pointer touches an auto-hide edge. Re-hide it the
+/// moment it is shown (EVENT_OBJECT_SHOW from Explorer's process only), not 500 ms later.
+pub fn install_tray_show_hook() {
+    let Some(tray) = primary_tray() else { return };
+    let mut pid = 0u32;
+    // SAFETY: plain query on a live window; the hook is out-of-context and lives for the process.
+    unsafe {
+        GetWindowThreadProcessId(tray, Some(&mut pid));
+        if pid == 0 {
+            return;
+        }
+        let hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, None, Some(on_tray_show), pid, 0, WINEVENT_OUTOFCONTEXT);
+        crate::log(&format!("taskbar: show hook installed={}", !hook.is_invalid()));
+    }
+}
+
+unsafe extern "system" fn on_tray_show(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    if id_object != OBJID_WINDOW.0 || hwnd.is_invalid() || !APPLIED.load(Ordering::SeqCst) {
+        return;
+    }
+    let mut buf = [0u16; 32];
+    // SAFETY: valid buffer; hwnd may be stale, in which case the call returns 0.
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+    if class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd" {
+        enforce_taskbar_hidden();
+    }
 }
 
 /// Win11 ignores ABM_GETSTATE/ABM_SETSTATE unless hWnd is the taskbar itself.
@@ -188,7 +249,7 @@ fn show_primary_tray(show: bool) {
             let _ = ShowWindow(h, cmd);
         }
     }
-    ensure_secondary_trays_visible();
+    sync_secondary_trays();
 }
 
 /// %APPDATA%\SmartDock
@@ -249,8 +310,8 @@ pub fn restore_taskbar() {
     if let Some(tray) = primary_tray() {
         set_taskbar_state(tray, ORIGINAL_STATE.load(Ordering::SeqCst));
     }
-    show_primary_tray(true);
     APPLIED.store(false, Ordering::SeqCst);
+    show_primary_tray(true); // also re-shows secondary trays (APPLIED is false now)
     remove_state_file();
 }
 
@@ -259,14 +320,19 @@ pub fn ensure_restored_on_exit() {
     restore_taskbar();
 }
 
-/// Re-hides the primary tray if Explorer re-showed it, and always keeps secondary trays visible.
-/// Call about every 500 ms.
+/// Re-hides the primary tray (and the secondary trays while our secondary docks exist) if
+/// Explorer re-showed them. Call about every 500 ms and from the show hook.
 pub fn enforce_taskbar_hidden() {
     if APPLIED.load(Ordering::SeqCst) && HIDE_WINDOW.load(Ordering::SeqCst) {
-        show_primary_tray(false);
-    } else {
-        ensure_secondary_trays_visible();
+        if let Some(h) = primary_tray() {
+            // SAFETY: live tray window.
+            if unsafe { IsWindowVisible(h).as_bool() } {
+                show_primary_tray(false);
+                return;
+            }
+        }
     }
+    sync_secondary_trays();
 }
 
 fn process_alive(pid: u32) -> bool {

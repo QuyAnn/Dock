@@ -507,8 +507,8 @@ fn build_secondary_docks(
             hover: None,
         });
     }
-    // Secondary trays stay visible; docks are additive.
-    appbar::set_secondary_docks_active(false);
+    // Our secondary docks replace Shell_SecondaryTrayWnd (hidden in "hidden" taskbar mode).
+    appbar::set_secondary_docks_active(!out.is_empty());
     out
 }
 
@@ -582,6 +582,7 @@ fn run() -> windows::core::Result<()> {
     // Remove the taskbar's edge claim before asking the shell to place our AppBar. Otherwise
     // ABM_QUERYPOS can return a rect one taskbar-height above rcMonitor.bottom.
     appbar::hide_taskbar(initial_settings.taskbar_mode == "hidden");
+    appbar::install_tray_show_hook();
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
     let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, dock_height_px)?;
