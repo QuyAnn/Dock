@@ -13,7 +13,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use windows::core::{Interface, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HWND};
+use windows::Win32::Foundation::{CloseHandle, ERROR_MORE_DATA, ERROR_SUCCESS, HWND};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, STGM_READ,
 };
@@ -23,7 +23,8 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
+use windows::Win32::UI::Shell::{IShellItem2, IShellLinkW, SHCreateItemFromParsingName, ShellLink};
 use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
 use crate::settings::Settings;
@@ -34,6 +35,7 @@ const RANK_KEEP: usize = 24;
 /// One foreground stretch counts at most this long (idle / away time is not usage).
 const MAX_STRETCH_SECS: f64 = 30.0 * 60.0;
 const DAY_SECS: u64 = 24 * 3600;
+const SEED_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -49,6 +51,8 @@ struct AppUsage {
 struct UsageFile {
     apps: HashMap<String, AppUsage>,
     seeded: bool,
+    /// Seeding logic version; a newer one re-seeds once (adds, never overwrites local data).
+    seed_version: u32,
     ranked_at: u64,
     ranking: Vec<String>,
 }
@@ -77,13 +81,14 @@ pub fn init() {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    if !file.seeded {
+    if !file.seeded || file.seed_version < SEED_VERSION {
         let seeded = seed_from_user_assist();
         crate::log(&format!("autopin: seeded {} apps from UserAssist", seeded.len()));
         for (key, u) in seeded {
             file.apps.entry(key).or_insert(u);
         }
         file.seeded = true;
+        file.seed_version = SEED_VERSION;
     }
     rank(&mut file);
     *STATE.lock().unwrap() = Some(State {
@@ -332,6 +337,32 @@ fn expand_name(name: &str) -> Option<PathBuf> {
     (p.is_absolute()).then_some(p)
 }
 
+/// Exe behind a desktop-app AUMID (e.g. "Chrome", "Anysphere.Cursor"): the AppsFolder item's
+/// System.Link.TargetParsingPath. Packaged (UWP) apps have none and are skipped.
+fn aumid_target(aumid: &str) -> Option<String> {
+    if aumid.starts_with("UEME_") || aumid.contains('\\') {
+        return None;
+    }
+    if aumid.eq_ignore_ascii_case("Microsoft.Windows.Explorer") {
+        return std::env::var_os("windir").map(|w| PathBuf::from(w).join("explorer.exe").to_string_lossy().into_owned());
+    }
+    // PKEY_Link_TargetParsingPath
+    const KEY: PROPERTYKEY = PROPERTYKEY {
+        fmtid: windows::core::GUID::from_u128(0xb9b4b3fc_2b51_4a42_b5d8_324146afcf25),
+        pid: 2,
+    };
+    let wide: Vec<u16> = format!("shell:AppsFolder\\{aumid}").encode_utf16().chain(Some(0)).collect();
+    // SAFETY: COM item used on this thread; the returned string is freed by PWSTR conversion.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let item: IShellItem2 = SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+        let p = item.GetString(&KEY).ok()?;
+        let s = p.to_string().ok();
+        windows::Win32::System::Com::CoTaskMemFree(Some(p.0 as *const _));
+        s.filter(|t| t.to_ascii_lowercase().ends_with(".exe"))
+    }
+}
+
 /// Target exe of a .lnk shortcut (empty when it does not point at an exe).
 fn resolve_lnk(lnk: &Path) -> Option<String> {
     let wide: Vec<u16> = lnk.as_os_str().to_string_lossy().encode_utf16().chain(Some(0)).collect();
@@ -362,7 +393,7 @@ fn seed_from_user_assist() -> HashMap<String, AppUsage> {
         loop {
             let mut name = [0u16; 1024];
             let mut name_len = name.len() as u32;
-            let mut data = [0u8; 128];
+            let mut data = [0u8; 2048];
             let mut data_len = data.len() as u32;
             // SAFETY: buffers and lengths describe valid local arrays.
             let rc = unsafe {
@@ -378,6 +409,10 @@ fn seed_from_user_assist() -> HashMap<String, AppUsage> {
                 )
             };
             index += 1;
+            // A value larger than the buffer (UEME_CTLSESSION) is skipped, not the end.
+            if rc == ERROR_MORE_DATA {
+                continue;
+            }
             if rc != ERROR_SUCCESS {
                 break;
             }
@@ -387,7 +422,7 @@ fn seed_from_user_assist() -> HashMap<String, AppUsage> {
             let decoded = rot13(&String::from_utf16_lossy(&name[..name_len as usize]));
             let runs = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
             let focus_ms = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
-            let Some(p) = expand_name(&decoded) else { continue };
+            let Some(p) = expand_name(&decoded).or_else(|| aumid_target(&decoded).map(PathBuf::from)) else { continue };
             let exe = if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
                 match resolve_lnk(&p) {
                     Some(t) => t,
