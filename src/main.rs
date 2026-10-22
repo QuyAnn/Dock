@@ -105,9 +105,33 @@ fn main() {
     }
 
     if let Err(e) = run() {
-        eprintln!("[smartdock] fatal: {e}");
+        let msg = format!("SmartDock không khởi động được:
+{e}");
+        log(&msg);
+        show_error(&msg);
     }
+    log("exit");
     appbar::ensure_restored_on_exit();
+}
+
+/// Appends a line to %APPDATA%SmartDocksmartdock.log. The GUI build has no console to print to.
+fn log(msg: &str) {
+    use std::io::Write;
+    let Ok(appdata) = std::env::var("APPDATA") else { return };
+    let dir = std::path::Path::new(&appdata).join("SmartDock");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("smartdock.log")) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
+fn show_error(msg: &str) {
+    let text = windows::core::HSTRING::from(msg);
+    let title = windows::core::HSTRING::from("SmartDock");
+    unsafe {
+        // SAFETY: both strings are live for the call.
+        MessageBoxW(None, &text, &title, MB_ICONERROR);
+    }
 }
 
 unsafe extern "system" fn console_handler(_ctrl_type: u32) -> BOOL {
@@ -144,6 +168,7 @@ fn start_background_refresh(shared: Arc<Shared>) {
 }
 
 fn run() -> windows::core::Result<()> {
+    log("start");
     let hinst: HINSTANCE = unsafe { GetModuleHandleW(None)?.into() };
     let class = w!("SmartDockDock");
     let wc = WNDCLASSEXW {
@@ -179,7 +204,9 @@ fn run() -> windows::core::Result<()> {
     };
 
     // Reserve the work area at the bottom so maximized windows stop above the dock.
+    log("window created");
     let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, DOCK_HEIGHT)?;
+    log(&format!("appbar rect {:?}", (rect.left, rect.top, rect.right, rect.bottom)));
     let width = (rect.right - rect.left) as f32;
     unsafe {
         // SAFETY: hwnd is our live window.
@@ -227,6 +254,7 @@ fn run() -> windows::core::Result<()> {
     }
     repaint();
 
+    log("message loop");
     let mut msg = MSG::default();
     unsafe {
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -234,6 +262,7 @@ fn run() -> windows::core::Result<()> {
             DispatchMessageW(&msg);
         }
     }
+    log("message loop ended");
     Ok(())
 }
 
