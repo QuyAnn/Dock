@@ -288,6 +288,7 @@ fn run() -> windows::core::Result<()> {
 
     popup::set_painter(paint_popup);
     popup::set_click_handler(on_popup_click);
+    popup::set_on_hide(on_popup_hidden);
 
     let shared = Arc::new(Shared {
         data: Mutex::new(DataState::default()),
@@ -544,6 +545,7 @@ fn dock_click(x: f32, y: f32) -> Click {
             "cpu" => Click::Open(OpenPopup::Data("cpu"), anchor),
             "ram" => Click::Open(OpenPopup::Data("ram"), anchor),
             "cc" => Click::Open(OpenPopup::Control, anchor),
+            "gear" => Click::Open(OpenPopup::Data("settings"), anchor),
             _ => Click::None,
         }
     })
@@ -557,6 +559,7 @@ fn popup_kind(id: &str) -> PopupKind {
         "clock" => PopupKind::Clock,
         "cpu" => PopupKind::Cpu,
         "ram" => PopupKind::Ram,
+        "settings" => PopupKind::Settings,
         _ => PopupKind::Media,
     }
 }
@@ -671,6 +674,11 @@ fn on_popup_click(x: f32, y: f32) {
             let _ = system::media_control(action);
         });
     }
+}
+
+fn on_popup_hidden() {
+    OPEN.with(|o| o.set(None));
+    CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
 }
 
 fn shutdown() {

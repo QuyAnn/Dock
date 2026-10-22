@@ -55,6 +55,7 @@ thread_local! {
     static POPUP: RefCell<Option<Popup>> = const { RefCell::new(None) };
     static PAINTER: Cell<Option<fn(&mut Renderer, RectF)>> = const { Cell::new(None) };
     static CLICK: Cell<Option<fn(f32, f32)>> = const { Cell::new(None) };
+    static ON_HIDE: Cell<Option<fn()>> = const { Cell::new(None) };
 }
 
 /// Sets the body painter, called inside each frame after the background (see `paint`).
@@ -67,11 +68,13 @@ pub fn set_painter(f: fn(&mut Renderer, RectF)) {
     PAINTER.with(|p| p.set(Some(f)));
 }
 
+pub fn set_on_hide(f: fn()) {
+    ON_HIDE.with(|c| c.set(Some(f)));
+}
+
 /// Opens the popup above (or below, if the anchor is in the top half) `anchor`, centered on it.
 /// `anchor` and the result are in screen coordinates. Replaces any open popup.
 pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
-    hide();
-
     let dpi = dpi::system_dpi();
     let width_px = dpi::dip_to_px(width, dpi);
     let height_px = dpi::dip_to_px(height as f32, dpi);
@@ -212,6 +215,9 @@ pub fn hide() {
             }
         }
     });
+    if let Some(f) = ON_HIDE.with(Cell::get) {
+        f();
+    }
 }
 
 fn hinstance() -> HINSTANCE {
