@@ -226,28 +226,97 @@ unsafe extern "system" fn on_tray_show(
 
 /// Set while the tray-overflow flyout is opening/open (see `win::overflow`).
 static TRAY_PEEK: AtomicBool = AtomicBool::new(false);
+/// We added WS_EX_LAYERED (alpha 0) to the primary tray for the current peek.
+static PEEK_LAYERED: AtomicBool = AtomicBool::new(false);
 
-/// Temporarily shows the hidden primary taskbar without activating it, so UI Automation can
-/// reach its XAML tray (a hidden window's XAML content is not in the UIA tree) and the
-/// overflow flyout it owns can stay open. Returns the tray hwnd and whether it was hidden.
-pub fn peek_primary_tray() -> Option<(HWND, bool)> {
+/// Temporarily "shows" the hidden primary taskbar so UI Automation can reach its XAML tray
+/// (a hidden window's XAML content is not in the UIA tree) and the overflow flyout it owns
+/// can stay open — but never visibly: it is made fully transparent (layered, alpha 0)
+/// *before* it is shown, never activated, and kept just under our topmost dock.
+/// Returns the tray hwnd and whether it was hidden.
+pub fn peek_primary_tray(dock: HWND) -> Option<(HWND, bool)> {
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA;
     let tray = primary_tray()?;
     TRAY_PEEK.store(true, Ordering::SeqCst);
-    // SAFETY: live shell window; SW_SHOWNA never activates it.
+    // SAFETY: plain queries/updates on the live shell window.
     let was_hidden = unsafe { !IsWindowVisible(tray).as_bool() };
     if was_hidden {
+        ghost_tray(tray, true);
         unsafe {
             let _ = ShowWindow(tray, SW_SHOWNA);
         }
     }
+    keep_tray_under(tray, dock);
     Some((tray, was_hidden))
 }
 
-/// Ends `peek_primary_tray`: re-hides the taskbar if hidden mode is on.
+/// Keeps the (transparent) peeked tray just below our dock in the topmost band.
+pub fn keep_tray_under(tray: HWND, dock: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOOWNERZORDER};
+    // SAFETY: z-order only; neither window is activated, moved or resized.
+    unsafe {
+        let _ = SetWindowPos(tray, dock, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+}
+
+/// Adds (alpha 0) or removes the layered style we put on the tray.
+fn ghost_tray(tray: HWND, on: bool) {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
+    };
+    // SAFETY: style/alpha updates on the live shell window; restored by `end_tray_peek`,
+    // `restore_taskbar` and `clear_stale_tray_ghost` on the next start.
+    unsafe {
+        let ex = GetWindowLongPtrW(tray, GWL_EXSTYLE);
+        if on {
+            if ex & WS_EX_LAYERED.0 as isize != 0 {
+                // Already layered by Explorer: only lower the alpha would fight it; skip.
+                crate::log("taskbar: tray already layered, not ghosting");
+                return;
+            }
+            SetWindowLongPtrW(tray, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
+            let ok = SetLayeredWindowAttributes(tray, COLORREF(0), 0, LWA_ALPHA).is_ok();
+            PEEK_LAYERED.store(true, Ordering::SeqCst);
+            crate::log(&format!("taskbar: tray made transparent for overflow peek ok={ok}"));
+        } else if PEEK_LAYERED.swap(false, Ordering::SeqCst) {
+            SetWindowLongPtrW(tray, GWL_EXSTYLE, ex & !(WS_EX_LAYERED.0 as isize));
+        }
+    }
+}
+
+/// A previous run that died mid-peek can leave the tray layered at alpha 0: undo that.
+pub fn clear_stale_tray_ghost() {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetLayeredWindowAttributes, GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, LAYERED_WINDOW_ATTRIBUTES_FLAGS,
+        LWA_ALPHA, WS_EX_LAYERED,
+    };
+    let Some(tray) = primary_tray() else { return };
+    // SAFETY: plain queries/updates on the live shell window.
+    unsafe {
+        let ex = GetWindowLongPtrW(tray, GWL_EXSTYLE);
+        if ex & WS_EX_LAYERED.0 as isize == 0 {
+            return;
+        }
+        let (mut key, mut alpha, mut flags) = (COLORREF(0), 255u8, LAYERED_WINDOW_ATTRIBUTES_FLAGS(0));
+        if GetLayeredWindowAttributes(tray, Some(&mut key), Some(&mut alpha), Some(&mut flags)).is_ok()
+            && flags.0 & LWA_ALPHA.0 != 0
+            && alpha == 0
+        {
+            SetWindowLongPtrW(tray, GWL_EXSTYLE, ex & !(WS_EX_LAYERED.0 as isize));
+            crate::log("taskbar: cleared a stale transparent tray from a previous run");
+        }
+    }
+}
+
+/// Ends `peek_primary_tray`: re-hides the taskbar (hidden mode), then drops the transparency.
 pub fn end_tray_peek() {
     TRAY_PEEK.store(false, Ordering::SeqCst);
     enforce_taskbar_hidden();
+    if let Some(tray) = primary_tray() {
+        ghost_tray(tray, false);
+    }
 }
 
 /// Win11 ignores ABM_GETSTATE/ABM_SETSTATE unless hWnd is the taskbar itself.
@@ -330,6 +399,10 @@ pub fn set_hidden_mode(hidden: bool) {
 /// Restores the taskbar saved by `hide_taskbar`. Idempotent and synchronous: safe to call
 /// from any thread, including panic hooks and Ctrl+C handlers.
 pub fn restore_taskbar() {
+    TRAY_PEEK.store(false, Ordering::SeqCst);
+    if let Some(tray) = primary_tray() {
+        ghost_tray(tray, false);
+    }
     if !APPLIED.load(Ordering::SeqCst) {
         return;
     }
@@ -383,6 +456,7 @@ fn process_alive(pid: u32) -> bool {
 /// Restores the taskbar if a previous run died while it was hidden, then deletes the state file.
 /// Skipped if the recorded process is still running (second instance), to avoid fighting it.
 pub fn recover_from_previous_crash() {
+    clear_stale_tray_ghost();
     let Some(dir) = state_dir() else { return };
     let path = dir.join(STATE_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else { return };

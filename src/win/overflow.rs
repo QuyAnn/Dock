@@ -91,7 +91,7 @@ fn run(dock: isize, was_open: bool, anchor: (i32, i32), dock_top: i32, mon: (i32
         crate::log(&format!("{} overflow: chevron click while open -> Windows already closed it", ts()));
         return;
     }
-    let peek = crate::win::appbar::peek_primary_tray();
+    let peek = crate::win::appbar::peek_primary_tray(HWND(dock as _));
     let Some((tray, was_hidden)) = peek else {
         crate::log(&format!("{} overflow: Shell_TrayWnd not found", ts()));
         return;
@@ -102,11 +102,13 @@ fn run(dock: isize, was_open: bool, anchor: (i32, i32), dock_top: i32, mon: (i32
         tray.0 as isize
     ));
     // The XAML tray needs a moment after the taskbar is shown before UIA can see it.
+    let under = || crate::win::appbar::keep_tray_under(tray, HWND(dock as _));
     let mut ok = false;
     for attempt in 0..8 {
         if attempt > 0 || was_hidden {
             std::thread::sleep(std::time::Duration::from_millis(60));
         }
+        under();
         ok = invoke_chevron();
         if ok {
             crate::log(&format!("{} overflow: UIA Invoke ok (attempt {})", ts(), attempt + 1));
@@ -121,6 +123,7 @@ fn run(dock: isize, was_open: bool, anchor: (i32, i32), dock_top: i32, mon: (i32
     let mut shown = false;
     for _ in 0..30 {
         std::thread::sleep(std::time::Duration::from_millis(50));
+        under();
         if is_open() {
             shown = true;
             break;
@@ -136,6 +139,7 @@ fn run(dock: isize, was_open: bool, anchor: (i32, i32), dock_top: i32, mon: (i32
     // The shell can re-place it once its content is laid out; settle it a few times.
     for _ in 0..3 {
         std::thread::sleep(std::time::Duration::from_millis(120));
+        under();
         if is_open() {
             place(anchor.0, anchor.1, dock_top, mon.0, mon.1);
         }
@@ -143,7 +147,8 @@ fn run(dock: isize, was_open: bool, anchor: (i32, i32), dock_top: i32, mon: (i32
     // Keep the taskbar peeked (it is behind the dock) until the flyout closes.
     let started = std::time::Instant::now();
     while is_open() && started.elapsed() < std::time::Duration::from_secs(600) {
-        std::thread::sleep(std::time::Duration::from_millis(150));
+        under();
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     crate::log(&format!(
         "{} overflow: flyout closed after {:.1} s; re-hiding taskbar",
