@@ -23,8 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindow,
     GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
     IsWindowVisible, PostMessageW, RegisterShellHookWindow, RegisterWindowMessageW,
-    SetForegroundWindow, ShowWindow, DeregisterShellHookWindow, GWL_EXSTYLE, GW_OWNER, SW_MINIMIZE,
+    SetForegroundWindow, DeregisterShellHookWindow, GWL_EXSTYLE, GW_OWNER, SW_MINIMIZE,
     SW_RESTORE, SW_SHOWNORMAL, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    AllowSetForegroundWindow, FindWindowW, ShowWindowAsync, SwitchToThisWindow, ASFW_ANY, SC_TASKLIST,
+    WM_SYSCOMMAND,
 };
 
 use crate::model::WindowEntry;
@@ -378,7 +380,9 @@ fn last_foreign() -> isize {
 /// Taskbar-style click: focused (or last-foreign when fg is 0) → minimize; otherwise restore+focus.
 pub fn activate_window(hwnd: isize) {
     let fg = foreground_hwnd();
-    if fg == hwnd || (fg == 0 && last_foreign() == hwnd) {
+    // SAFETY: IsIconic on a possibly stale handle just returns false.
+    let iconic = unsafe { IsIconic(HWND(hwnd as _)).as_bool() };
+    if !iconic && (fg == hwnd || (fg == 0 && last_foreign() == hwnd)) {
         minimize_window(hwnd);
         return;
     }
@@ -386,6 +390,11 @@ pub fn activate_window(hwnd: isize) {
 }
 
 /// Brings a window to the front (restoring it if minimized). Never activates SmartDock.
+///
+/// The click on the dock gives this process the foreground right; we pass it on with
+/// AllowSetForegroundWindow, restore asynchronously (works for hung/elevated windows such as
+/// Task Manager without blocking the dock), then SetForegroundWindow with a brief input attach.
+/// If Windows still refuses, SwitchToThisWindow is the shell's own fallback.
 pub fn focus_window(hwnd: isize) {
     let target = HWND(hwnd as _);
     // SAFETY: plain Win32 calls on a handle that may be stale; failures are ignored.
@@ -393,13 +402,14 @@ pub fn focus_window(hwnd: isize) {
         let mut pid = 0u32;
         GetWindowThreadProcessId(target, Some(&mut pid as *mut u32));
         if pid == 0 || pid == GetCurrentProcessId() {
+            crate::log(&format!("focus hwnd={hwnd:#x} skipped (pid={pid})"));
             return;
         }
-        if IsIconic(target).as_bool() {
-            let _ = ShowWindow(target, SW_RESTORE);
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        let iconic = IsIconic(target).as_bool();
+        if iconic {
+            let _ = ShowWindowAsync(target, SW_RESTORE);
         }
-        // Attaching to the foreground thread lets SetForegroundWindow succeed from a background process.
-        // Always detach below, even if the calls fail, so input state is never left shared.
         let fg = GetForegroundWindow();
         let fg_tid = GetWindowThreadProcessId(fg, None);
         let cur_tid = GetCurrentThreadId();
@@ -408,15 +418,25 @@ pub fn focus_window(hwnd: isize) {
             let _ = AttachThreadInput(cur_tid, fg_tid, BOOL::from(true));
         }
         let _ = BringWindowToTop(target);
-        let _ = SetForegroundWindow(target);
+        let set_ok = SetForegroundWindow(target).as_bool();
         if attach {
             let _ = AttachThreadInput(cur_tid, fg_tid, BOOL::from(false));
         }
+        let mut switched = false;
+        if !set_ok || GetForegroundWindow() != target {
+            SwitchToThisWindow(target, BOOL::from(true));
+            switched = true;
+        }
         note_foreign_foreground(hwnd);
+        crate::log(&format!(
+            "focus hwnd={hwnd:#x} iconic={iconic} set_fg={set_ok} switch_fallback={switched} fg_is_target={}",
+            GetForegroundWindow() == target
+        ));
     }
 }
 
-/// Minimizes a user window without activating SmartDock.
+/// Minimizes a user window without activating SmartDock. Async so an elevated or hung
+/// window (e.g. Task Manager) can never block the dock.
 pub fn minimize_window(hwnd: isize) {
     let target = HWND(hwnd as _);
     unsafe {
@@ -425,7 +445,8 @@ pub fn minimize_window(hwnd: isize) {
         if pid == 0 || pid == GetCurrentProcessId() {
             return;
         }
-        let _ = ShowWindow(target, SW_MINIMIZE);
+        let ok = ShowWindowAsync(target, SW_MINIMIZE).as_bool();
+        crate::log(&format!("minimize hwnd={hwnd:#x} posted={ok}"));
     }
 }
 
@@ -460,8 +481,50 @@ pub fn launch_exe(exe: &str) {
     }
 }
 
-/// Opens Start by synthesizing one Win-key press. Called only from the explicit Start button.
+/// Opens the Start menu from the dock's Start button.
+///
+/// Primary path: post WM_SYSCOMMAND/SC_TASKLIST to the shell's Shell_TrayWnd (what the taskbar
+/// Start button itself does; works with the taskbar hidden and is not subject to UIPI input
+/// blocking). If Start is not in the foreground shortly after, fall back to one Win-key press
+/// on behalf of this explicit user click.
 pub fn open_start_menu() {
+    // SAFETY: FindWindowW/PostMessageW with static strings; the tray HWND may be absent.
+    let posted = unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        match FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) {
+            Ok(tray) if !tray.is_invalid() => {
+                PostMessageW(tray, WM_SYSCOMMAND, WPARAM(SC_TASKLIST as usize), LPARAM(0)).is_ok()
+            }
+            _ => false,
+        }
+    };
+    crate::log(&format!("start: SC_TASKLIST posted={posted}"));
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(450));
+        if start_in_foreground() {
+            crate::log("start: menu open");
+            return;
+        }
+        crate::log("start: not open after SC_TASKLIST, sending Win key");
+        send_win_key();
+    });
+}
+
+/// True when the Start/Search host owns the foreground (Windows 10/11 CoreWindow host).
+fn start_in_foreground() -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            return false;
+        }
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(fg, &mut buf);
+        let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+        class == "Windows.UI.Core.CoreWindow" || class == "Xaml_WindowedPopupClass"
+    }
+}
+
+fn send_win_key() {
     let inputs = [
         INPUT {
             r#type: INPUT_KEYBOARD,
@@ -476,9 +539,8 @@ pub fn open_start_menu() {
             },
         },
     ];
-    unsafe {
-        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-    }
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    crate::log(&format!("start: win key sent={sent}"));
 }
 
 /// Registers `hwnd` for shell messages; returns the message id of "SHELLHOOK".
