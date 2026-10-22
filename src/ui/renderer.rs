@@ -12,18 +12,23 @@ use windows::core::{s, w, Result, HRESULT};
 const D2DERR_RECREATE_TARGET: HRESULT = HRESULT(0x8899_000C_u32 as i32);
 use windows::Win32::Foundation::{BOOL, E_INVALIDARG, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_POINT_2F,
+    D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory1, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
     ID2D1StrokeStyle, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE,
+    D2D1_ARC_SIZE_SMALL, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA, D2D1_GAMMA_2_2,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_SWEEP_DIRECTION_CLOCKWISE, ID2D1Geometry,
+    ID2D1PathGeometry,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED,
-    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
+    DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
     DWRITE_WORD_WRAPPING_NO_WRAP,
@@ -43,8 +48,8 @@ pub enum Align {
 thread_local! {
     static D2D: RefCell<Option<ID2D1Factory1>> = const { RefCell::new(None) };
     static DWRITE: RefCell<Option<IDWriteFactory>> = const { RefCell::new(None) };
-    // Cache key: (font size * 10, alignment). Few sizes are used, so this stays tiny.
-    static FORMATS: RefCell<Vec<((u32, Align), IDWriteTextFormat)>> = const { RefCell::new(Vec::new()) };
+    // Cache key: (font size * 10, alignment, style). Few combinations are used, so this stays tiny.
+    static FORMATS: RefCell<Vec<((u32, Align, TextStyle), IDWriteTextFormat)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn d2d_factory() -> Result<ID2D1Factory1> {
@@ -71,9 +76,19 @@ fn dwrite_factory() -> Result<IDWriteFactory> {
     })
 }
 
-/// Cached text format for (size, align). Vertically centered, single line.
-fn text_format(size: f32, align: Align) -> Result<IDWriteTextFormat> {
-    let key = ((size * 10.0).round() as u32, align);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextStyle {
+    /// Segoe UI Variable Text, regular.
+    Ui,
+    /// Segoe UI Variable Text, semibold-bold, like `b` in the old CSS.
+    Bold,
+    /// Segoe MDL2 Assets glyphs (Windows system icons).
+    Icon,
+}
+
+/// Cached text format for (size, align, style). Vertically centered, single line.
+fn text_format(size: f32, align: Align, style: TextStyle) -> Result<IDWriteTextFormat> {
+    let key = ((size * 10.0).round() as u32, align, style);
     let cached = FORMATS.with(|c| c.borrow().iter().find(|(k, _)| *k == key).map(|(_, f)| f.clone()));
     if let Some(f) = cached {
         return Ok(f);
@@ -81,10 +96,15 @@ fn text_format(size: f32, align: Align) -> Result<IDWriteTextFormat> {
     let dw = dwrite_factory()?;
     let f = unsafe {
         // SAFETY: family name and locale are static UTF-16 literals.
+        let (family, weight) = match style {
+            TextStyle::Ui => (w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_NORMAL),
+            TextStyle::Bold => (w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_BOLD),
+            TextStyle::Icon => (w!("Segoe MDL2 Assets"), DWRITE_FONT_WEIGHT_NORMAL),
+        };
         dw.CreateTextFormat(
-            w!("Segoe UI Variable Text"),
+            family,
             None::<&windows::Win32::Graphics::DirectWrite::IDWriteFontCollection>,
-            DWRITE_FONT_WEIGHT_NORMAL,
+            weight,
             DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL,
             size,
@@ -250,7 +270,19 @@ impl Renderer {
 
     /// Single-line text, vertically centered in `rect`, clipped to it.
     pub fn draw_text(&mut self, text: &str, rect: RectF, size: f32, rgba: u32, align: Align) -> Result<()> {
-        let format = text_format(size, align)?;
+        self.draw_text_styled(text, rect, size, rgba, align, TextStyle::Ui)
+    }
+
+    pub fn draw_text_styled(
+        &mut self,
+        text: &str,
+        rect: RectF,
+        size: f32,
+        rgba: u32,
+        align: Align,
+        style: TextStyle,
+    ) -> Result<()> {
+        let format = text_format(size, align, style)?;
         let (rt, brush) = self.parts()?;
         Self::set_color(brush, rgba);
         let wide: Vec<u16> = text.encode_utf16().collect();
@@ -259,6 +291,61 @@ impl Renderer {
         unsafe {
             rt.DrawText(&wide, &format, &r, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL)
         };
+        Ok(())
+    }
+
+    /// Linear top-to-bottom gradient inside a rounded rect (`.clock-time`, `.dock` tint).
+    pub fn fill_rounded_rect_gradient(&mut self, rect: RectF, radius: f32, top: u32, bottom: u32) -> Result<()> {
+        let (rt, _) = self.parts()?;
+        let stops = [
+            D2D1_GRADIENT_STOP { position: 0.0, color: color(top) },
+            D2D1_GRADIENT_STOP { position: 1.0, color: color(bottom) },
+        ];
+        // SAFETY: `stops` lives for the call; the brush is local and dropped at the end.
+        let brush = unsafe {
+            let coll = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: D2D_POINT_2F { x: rect.x, y: rect.y },
+                endPoint: D2D_POINT_2F { x: rect.x, y: rect.y + rect.h },
+            };
+            rt.CreateLinearGradientBrush(&props, None, &coll)?
+        };
+        let rr = rounded(rect, radius);
+        // SAFETY: `rr` lives for the call.
+        unsafe { rt.FillRoundedRectangle(&rr, &brush) };
+        Ok(())
+    }
+
+    /// Arc stroke centered at (cx, cy), angles in degrees clockwise from 3 o'clock.
+    pub fn stroke_arc(&mut self, cx: f32, cy: f32, radius: f32, start_deg: f32, sweep_deg: f32, rgba: u32, width: f32) -> Result<()> {
+        if sweep_deg.abs() < 0.5 {
+            return Ok(());
+        }
+        let factory = d2d_factory()?;
+        let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
+        let pt = |deg: f32| {
+            let a = deg.to_radians();
+            D2D_POINT_2F { x: cx + radius * a.cos(), y: cy + radius * a.sin() }
+        };
+        // SAFETY: the sink is closed before the geometry is used.
+        unsafe {
+            let sink = geo.Open()?;
+            sink.BeginFigure(pt(start_deg), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: pt(start_deg + sweep_deg),
+                size: D2D_SIZE_F { width: radius, height: radius },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: if sweep_deg.abs() > 180.0 { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+            });
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            sink.Close()?;
+        }
+        let (rt, brush) = self.parts()?;
+        Self::set_color(brush, rgba);
+        let g: &ID2D1Geometry = &geo;
+        // SAFETY: `g` lives for the call; default stroke style.
+        unsafe { rt.DrawGeometry(g, brush, width, None::<&ID2D1StrokeStyle>) };
         Ok(())
     }
 

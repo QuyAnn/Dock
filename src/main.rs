@@ -13,12 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use chrono::Local;
+use chrono::{Datelike, Local};
 use windows::core::w;
 use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use model::Stats;
@@ -58,6 +59,8 @@ struct App {
     attention: Attention,
     /// Tile id and rect from the last paint, used for hit testing.
     tiles: Vec<(&'static str, RectF)>,
+    /// Index into `tiles` of the tile under the pointer.
+    hover: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -212,6 +215,7 @@ fn run() -> windows::core::Result<()> {
             apps,
             attention,
             tiles: Vec::new(),
+            hover: None,
         })
     });
 
@@ -233,8 +237,8 @@ fn run() -> windows::core::Result<()> {
     Ok(())
 }
 
-/// Tiles per zone, in display order. Left: git, AI providers, media. Center: running apps.
-/// Right: Control Center, settings, CPU, RAM, clock. The apps width follows the open window count.
+/// Tiles per zone, in display order, with widths from styles.css.
+/// Left: git, AI providers, media. Center: running apps. Right: Control Center, settings, CPU, RAM, clock.
 struct Zones {
     left: Vec<Tile>,
     center: Vec<Tile>,
@@ -245,57 +249,111 @@ fn layout_tiles(app_count: usize) -> Zones {
     let apps_w = (16.0 + app_count as f32 * 38.0).max(72.0);
     let t = |id, width| Tile { id, width, height: 0.0 };
     Zones {
-        left: vec![t("git", 110.0), t("claude", 110.0), t("codex", 110.0), t("media", 142.0)],
+        left: vec![t("git", 118.0), t("claude", 100.0), t("codex", 100.0), t("media", 142.0)],
         center: vec![Tile { id: "apps", width: apps_w, height: 44.0 }],
-        right: vec![t("cc", 60.0), t("gear", 22.0), t("cpu", 34.0), t("ram", 34.0), t("clock", 64.0)],
+        right: vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 34.0), t("ram", 34.0), t("clock", 50.0)],
     }
 }
 
+/// Bar color for AI usage, from `barColor` in AiTiles.tsx.
+fn usage_color(pct: f32) -> u32 {
+    if pct >= 90.0 {
+        0xFF5D_5DFF
+    } else if pct >= 70.0 {
+        0xFFB3_40FF
+    } else {
+        0x3FD2_7FFF
+    }
+}
+
+/// Gauge color for CPU/RAM, from `pctColor` in common.tsx.
+fn gauge_color(pct: f32) -> u32 {
+    if pct > 85.0 {
+        0xFF5D_5DFF
+    } else if pct > 65.0 {
+        0xFFB3_40FF
+    } else {
+        0x3FD2_7FFF
+    }
+}
+
+/// AI tile: colored square, provider label, session percent, reset time and a usage bar.
 fn ai_view(data: &DataState, name: &str) -> TileView {
-    let value = match data.ai.iter().find(|a| a.name == name) {
-        Some(a) if !a.session_pct.is_nan() => format!("{:.0}%", a.session_pct),
-        Some(a) => a.reset_text.clone(),
-        None => "—".into(),
+    let (label, bg) = match name {
+        "Claude" => ("Claude", 0xD977_57FF),
+        _ => ("ChatGPT", 0x0D0D_0DFF),
     };
-    TileView { style: Style::Card, title: name.into(), value, sub: String::new(), icon: None }
+    let usage = data.ai.iter().find(|a| a.name == name);
+    let (value, sub, progress, accent) = match usage {
+        Some(a) if !a.session_pct.is_nan() => (
+            format!("{:.0}%", a.session_pct),
+            a.reset_text.clone(),
+            Some((a.session_pct / 100.0).clamp(0.0, 1.0)),
+            usage_color(a.session_pct),
+        ),
+        Some(a) => (a.reset_text.clone(), String::new(), None, 0),
+        None => ("…".into(), String::new(), None, 0),
+    };
+    TileView { progress, accent, bg, sub, ..TileView::card(label, value) }
+}
+
+/// Weather glyph for a WMO code, from `weatherInfo` in common.tsx.
+fn weather_icon(code: u32) -> &'static str {
+    match code {
+        0 => "☀️",
+        1..=2 => "🌤️",
+        3 => "☁️",
+        4..=48 => "🌫️",
+        49..=57 => "🌦️",
+        58..=67 => "🌧️",
+        68..=77 => "🌨️",
+        78..=82 => "🌧️",
+        83..=86 => "🌨️",
+        _ => "⛈️",
+    }
 }
 
 fn tile_view(id: &str, data: &DataState, control: &ControlState, stats: &Stats) -> TileView {
     let now = Local::now();
-    let card = |title: &str, value: String| TileView {
-        style: Style::Card,
-        title: title.into(),
-        value,
-        sub: String::new(),
-        icon: None,
-    };
     match id {
         "git" => tiles::git_tile(data),
         "claude" => ai_view(data, "Claude"),
         "codex" => ai_view(data, "Codex"),
         "media" => tiles::media_tile(data),
-        "cc" => card("Control", format!("Vol {:.0}%", control.volume * 100.0)),
-        "gear" => TileView { style: Style::Bare, title: String::new(), value: "⚙".into(), sub: String::new(), icon: None },
+        // .cc-btn: Wi-Fi and volume glyphs (Segoe MDL2 Assets).
+        "cc" => TileView { style: Style::Button, value: "\u{E701}\u{E767}".into(), ..TileView::card("", "") },
+        "gear" => TileView::bare("\u{E713}"),
         "cpu" => TileView {
             style: Style::Ring,
-            title: String::new(),
-            value: format!("{:.0}", stats.cpu_pct),
-            sub: String::new(),
-            icon: None,
+            progress: Some(stats.cpu_pct / 100.0),
+            accent: gauge_color(stats.cpu_pct),
+            ..TileView::card("", format!("{:.0}", stats.cpu_pct))
         },
         "ram" => {
             let pct = if stats.ram_total_mb > 0 { stats.ram_used_mb as f32 * 100.0 / stats.ram_total_mb as f32 } else { 0.0 };
-            TileView { style: Style::Ring, title: String::new(), value: format!("{pct:.0}"), sub: String::new(), icon: None }
+            TileView {
+                style: Style::Ring,
+                progress: Some(pct / 100.0),
+                // RAM is blue until it is nearly full (AppSystem tiles use #4aa8ff).
+                accent: if pct > 85.0 { 0xFF5D_5DFF } else { 0x4AA8_FFFF },
+                ..TileView::card("", format!("{pct:.0}"))
+            }
         }
-        "clock" => TileView {
-            style: Style::Clock,
-            title: now.format("%d/%m").to_string(),
-            value: now.format("%H:%M").to_string(),
-            sub: data.weather.as_ref().map(|w| format!("{:.0}°", w.current.temp)).unwrap_or_default(),
-            icon: None,
-        },
+        "clock" => {
+            let day = ["CN", "T2", "T3", "T4", "T5", "T6", "T7"][now.weekday().num_days_from_sunday() as usize];
+            let sub = data
+                .weather
+                .as_ref()
+                .map(|w| format!("{} {:.0}°", weather_icon(w.current.code), w.current.temp))
+                .unwrap_or_default();
+            TileView {
+                style: Style::Clock,
+                sub,
+                ..TileView::card(format!("{day} {}", now.format("%d")), now.format("%H:%M").to_string())
+            }
+        }
         // The apps zone is drawn by apps::draw_apps; it has no background of its own.
-        _ => TileView { style: Style::Bare, title: String::new(), value: String::new(), sub: String::new(), icon: None },
+        _ => TileView::bare(""),
     }
 }
 
@@ -318,7 +376,7 @@ fn repaint() {
         let res = app
             .renderer
             .begin()
-            .and_then(|_| dock::draw_dock(&mut app.renderer, &views, &rects))
+            .and_then(|_| dock::draw_dock(&mut app.renderer, &views, &rects, app.hover))
             .and_then(|_| match apps_rect {
                 Some(r) => apps::draw_apps(&mut app.renderer, r, &app.apps),
                 None => Ok(()),
@@ -328,6 +386,22 @@ fn repaint() {
             eprintln!("[smartdock] paint failed: {e}");
         }
     });
+}
+
+/// Updates the hovered tile from a pointer position. Repaints only when it changes.
+fn set_hover(hover_at: Option<(f32, f32)>) {
+    let changed = APP.with(|a| {
+        let Ok(mut slot) = a.try_borrow_mut() else { return false };
+        let Some(app) = slot.as_mut() else { return false };
+        let rects: Vec<RectF> = app.tiles.iter().map(|(_, r)| *r).collect();
+        let next = hover_at.and_then(|(x, y)| dock::hit_test(x, y, &rects));
+        let changed = next != app.hover;
+        app.hover = next;
+        changed
+    });
+    if changed {
+        repaint();
+    }
 }
 
 fn dock_click(x: f32, y: f32) -> Click {
@@ -493,6 +567,25 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::Activate(h) => tasks::activate_window(h),
                 Click::Open(which, anchor) => open_popup(which, anchor),
             }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xffff) as i16 as f32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as f32;
+            // Ask for WM_MOUSELEAVE; Windows cancels the request after each leave.
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            // SAFETY: tme is a valid local struct for the call.
+            let _ = TrackMouseEvent(&mut tme);
+            set_hover(Some((x, y)));
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            set_hover(None);
             LRESULT(0)
         }
         WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {

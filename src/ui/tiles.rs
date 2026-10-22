@@ -55,16 +55,42 @@ impl DataState {
     }
 }
 
-fn tile(title: &str, value: String, _progress: Option<f32>) -> TileView {
-    TileView { style: Style::Card, title: title.to_owned(), value, sub: String::new(), icon: None }
+fn tile(title: &str, value: String, progress: Option<f32>) -> TileView {
+    TileView { progress, ..TileView::card(title, value) }
 }
 
+/// Git card: today / week / streak numbers and a 16-week mini heatmap (3 rows, Fri-Sun).
 pub fn git_tile(d: &DataState) -> TileView {
     match &d.git {
         None => tile("GIT", "–".to_owned(), None),
         Some(g) if g.error.is_some() => tile("GIT", "Lỗi".to_owned(), None),
-        Some(g) => tile("GIT", g.today.to_string(), Some((g.week as f32 / WEEK_GOAL).min(1.0))),
+        Some(g) => TileView {
+            style: Style::Git,
+            cells: heat_levels(&g.heatmap, 16, 3),
+            ..TileView::card("GIT", format!("{} today  {} week  {} streak", g.today, g.week, g.streak))
+        },
     }
+}
+
+/// Heatmap levels 0..=4, column-major, same bucketing as `Heatmap` in GitTile.tsx.
+/// `days` is oldest first and ends with today. Future days are level 0.
+fn heat_levels(days: &[crate::model::GitDay], weeks: usize, rows: usize) -> Vec<u8> {
+    let today_dow = Local::now().weekday().num_days_from_monday() as i64;
+    let level = |n: u32| -> u8 { match n { 0 => 0, 1 => 1, 2..=3 => 2, 4..=6 => 3, _ => 4 } };
+    let mut out = Vec::with_capacity(weeks * rows);
+    for col in 0..weeks {
+        let w = (weeks - 1 - col) as i64; // column 0 is the oldest week
+        for row in (7 - rows)..7 {
+            let offset = w * 7 + (today_dow - row as i64);
+            let lvl = if offset < 0 {
+                0
+            } else {
+                days.len().checked_sub(1 + offset as usize).map_or(0, |i| level(days[i].commits))
+            };
+            out.push(lvl);
+        }
+    }
+    out
 }
 
 /// First provider's 5-hour session usage. Without data, the status text is shown instead.
