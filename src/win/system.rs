@@ -340,6 +340,48 @@ pub fn wifi_enabled() -> Option<bool> {
     radio_enabled(RadioKind::WiFi)
 }
 
+/// Signal quality (0..=100) of the best connected WLAN interface; None when not connected.
+pub fn wifi_signal() -> Option<u8> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::NetworkManagement::WiFi::{
+        wlan_interface_state_connected, wlan_intf_opcode_current_connection, WlanCloseHandle, WlanEnumInterfaces,
+        WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
+    };
+    // SAFETY: every WLAN allocation is freed with WlanFreeMemory and the handle is closed;
+    // the slice covers exactly dwNumberOfItems entries of the returned list.
+    unsafe {
+        let mut version = 0u32;
+        let mut h = HANDLE::default();
+        if WlanOpenHandle(2, None, &mut version, &mut h) != 0 {
+            return None;
+        }
+        let mut best: Option<u8> = None;
+        let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
+        if WlanEnumInterfaces(h, None, &mut list) == 0 && !list.is_null() {
+            let n = (*list).dwNumberOfItems as usize;
+            let items = std::slice::from_raw_parts((*list).InterfaceInfo.as_ptr(), n);
+            for it in items {
+                if it.isState != wlan_interface_state_connected {
+                    continue;
+                }
+                let mut size = 0u32;
+                let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+                if WlanQueryInterface(h, &it.InterfaceGuid, wlan_intf_opcode_current_connection, None, &mut size, &mut data, None) == 0
+                    && !data.is_null()
+                {
+                    let attr = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
+                    let q = attr.wlanAssociationAttributes.wlanSignalQuality.min(100) as u8;
+                    best = Some(best.map_or(q, |b| b.max(q)));
+                    WlanFreeMemory(data);
+                }
+            }
+            WlanFreeMemory(list as *const std::ffi::c_void);
+        }
+        let _ = WlanCloseHandle(h, None);
+        best
+    }
+}
+
 pub fn set_wifi(on: bool) -> Result<()> {
     set_radio(RadioKind::WiFi, on)
 }

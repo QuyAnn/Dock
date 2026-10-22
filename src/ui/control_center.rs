@@ -8,6 +8,7 @@ use super::dock::RectF;
 use super::renderer::{Align, Renderer, TextStyle};
 use crate::model::Media;
 use crate::win::system::{self, MediaAction};
+use super::sficons;
 
 /// Snapshot of system state shown by the panel.
 #[derive(Clone, Debug, Default)]
@@ -16,6 +17,7 @@ pub struct ControlState {
     pub muted: bool,
     pub brightness: Option<u32>, // percent, None when DDC/CI is unsupported
     pub wifi: Option<bool>,     // None when there is no Wi-Fi radio
+    pub wifi_signal: Option<u8>, // WLAN signal quality 0..=100 while connected
     pub bluetooth: Option<bool>, // None when there is no Bluetooth radio
     pub dark: bool,
 }
@@ -29,6 +31,7 @@ impl ControlState {
             muted,
             brightness: system::get_brightness(),
             wifi: system::wifi_enabled(),
+            wifi_signal: system::wifi_signal(),
             bluetooth: system::bluetooth_enabled(),
             dark: system::dark_mode(),
         }
@@ -113,11 +116,8 @@ const FILL: u32 = 0xFFFF_FFEB; // rgba(255,255,255,.92)
 const GLYPH_DARK: u32 = 0x5555_55FF; // #555 slider icon
 
 // Segoe MDL2 Assets codepoints.
-const GLYPH_WIFI: &str = "\u{E701}";
 const GLYPH_BT: &str = "\u{E702}";
 const GLYPH_BRIGHTNESS: &str = "\u{E706}";
-const GLYPH_VOLUME: &str = "\u{E767}";
-const GLYPH_MUTE: &str = "\u{E74F}";
 const GLYPH_NETWORK: &str = "\u{E968}";
 const GLYPH_MOON: &str = "\u{E708}";
 
@@ -198,7 +198,7 @@ fn fade(rgba: u32, k: f32) -> u32 {
 /// Circle button, macOS Control Center style. ON = filled system blue with a white glyph;
 /// OFF = translucent liquid-glass circle (light fill + specular rim) with a white glyph.
 /// `k` fades the circle, `icon_k` the glyph.
-fn draw_round(r: &mut Renderer, rect: RectF, glyph: &str, size: f32, on: bool, k: f32, icon_k: f32) -> Result<()> {
+fn draw_round(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, k: f32, icon_k: f32) -> Result<()> {
     let radius = rect.h / 2.0;
     if on {
         r.fill_rounded_rect(rect, radius, fade(ACCENT, k))?;
@@ -207,7 +207,29 @@ fn draw_round(r: &mut Renderer, rect: RectF, glyph: &str, size: f32, on: bool, k
         r.fill_rounded_rect(rect, radius, fade(ROUND_BG, k))?;
         super::glass::draw_highlights(r, rect, radius, k)?;
     }
-    r.draw_text_styled(glyph, rect, size, fade(TEXT, icon_k), Align::Center, TextStyle::Icon)
+    draw_glyph(r, rect, glyph, size, fade(TEXT, icon_k))
+}
+
+/// A panel icon: a Segoe glyph, or the dock's SF-style vector Wi-Fi / speaker icons.
+#[derive(Clone, Copy)]
+enum Glyph {
+    Text(&'static str),
+    Wifi(sficons::Wifi),
+    /// Volume 0..1 and muted.
+    Speaker(f32, bool),
+}
+
+fn draw_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, rgba: u32) -> Result<()> {
+    let cx = rect.x + rect.w / 2.0;
+    let cy = rect.y + rect.h / 2.0;
+    match glyph {
+        Glyph::Text(t) => r.draw_text_styled(t, rect, size, rgba, Align::Center, TextStyle::Icon),
+        Glyph::Wifi(w) => sficons::draw_wifi(r, RectF { x: cx - size / 2.0, y: cy - size / 2.0, w: size, h: size }, w, rgba),
+        Glyph::Speaker(v, m) => {
+            let w = size * 18.0 / 16.0;
+            sficons::draw_speaker(r, RectF { x: cx - w / 2.0, y: cy - size / 2.0, w, h: size }, v, m, rgba)
+        }
+    }
 }
 
 /// Liquid-glass module (same material language as the dock tiles): light translucent fill,
@@ -219,7 +241,7 @@ fn draw_module(r: &mut Renderer, rect: RectF) -> Result<()> {
 
 /// One `.cc-toggle` row: round button, bold label, sub text.
 struct Toggle<'a> {
-    glyph: &'a str,
+    glyph: Glyph,
     label: &'a str,
     sub: &'a str,
     on: bool,
@@ -242,7 +264,7 @@ fn draw_toggle(r: &mut Renderer, row: RectF, t: Toggle) -> Result<()> {
 }
 
 /// Square shortcut (`.cc-sq`): round glyph centered above a 10 px label.
-fn draw_square(r: &mut Renderer, rect: RectF, glyph: &str, label: &str) -> Result<()> {
+fn draw_square(r: &mut Renderer, rect: RectF, glyph: Glyph, label: &str) -> Result<()> {
     draw_module(r, rect)?;
     let top = rect.y + (rect.h - 45.0) / 2.0; // 28 circle + 4 gap + 13 text
     let round = RectF { x: rect.x + (rect.w - ROUND) / 2.0, y: top, w: ROUND, h: ROUND };
@@ -259,7 +281,7 @@ fn draw_cap(r: &mut Renderer, card: RectF, title: &str, value: &str) -> Result<(
 }
 
 /// Thumb-style capsule (`.cc-slider`): white fill to `frac`, white thumb circle, glyph at left.
-fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, glyph: &str) -> Result<()> {
+fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, glyph: Glyph) -> Result<()> {
     let k = if enabled { 1.0 } else { 0.4 };
     let track = RectF { x: s.x + 24.0, w: (s.w - 24.0).max(THUMB), ..s };
     let x0 = track.x + THUMB / 2.0;
@@ -277,7 +299,7 @@ fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, glyph: &st
     }
     // Thumb: no drop shadow (the CSS box-shadow is not drawn).
     r.fill_rounded_rect(RectF { x: end - THUMB / 2.0, y: s.y, w: THUMB, h: THUMB }, THUMB / 2.0, fade(WHITE, k))?;
-    r.draw_text_styled(glyph, icon_of(s), 14.0, fade(GLYPH_DARK, k), Align::Center, TextStyle::Icon)
+    draw_glyph(r, icon_of(s), glyph, 14.0, fade(GLYPH_DARK, k))
 }
 
 fn radio_sub(v: Option<bool>) -> &'static str {
@@ -298,7 +320,11 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
         r,
         l.wifi,
         Toggle {
-            glyph: GLYPH_WIFI,
+            glyph: Glyph::Wifi(match sficons::Wifi::from_state(state.wifi, state.wifi_signal) {
+                // The round button already shows on/off; keep the fan full while on.
+                sficons::Wifi::Disconnected if state.wifi == Some(true) => sficons::Wifi::Bars(3),
+                w => w,
+            }),
             label: "Wi-Fi",
             sub: radio_sub(state.wifi),
             on: state.wifi == Some(true),
@@ -310,7 +336,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
         r,
         l.bluetooth,
         Toggle {
-            glyph: GLYPH_BT,
+            glyph: Glyph::Text(GLYPH_BT),
             label: "Bluetooth",
             sub: radio_sub(state.bluetooth),
             on: state.bluetooth == Some(true),
@@ -319,11 +345,11 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
         },
     )?;
 
-    draw_square(r, l.net, GLYPH_NETWORK, "Mạng")?;
-    draw_square(r, l.sound, GLYPH_VOLUME, "Âm thanh")?;
+    draw_square(r, l.net, Glyph::Text(GLYPH_NETWORK), "Mạng")?;
+    draw_square(r, l.sound, Glyph::Speaker(1.0, false), "Âm thanh")?;
     draw_module(r, l.dark)?;
     let moon = RectF { x: l.dark.x + 7.0, y: l.dark.y + 6.0, w: 28.0, h: 28.0 };
-    draw_round(r, moon, GLYPH_MOON, 14.0, state.dark, 1.0, 1.0)?;
+    draw_round(r, moon, Glyph::Text(GLYPH_MOON), 14.0, state.dark, 1.0, 1.0)?;
     r.draw_text("Chế độ tối", RectF { x: moon.x + 36.0, y: l.dark.y, w: l.dark.w - 45.0, h: l.dark.h }, 10.5, TEXT, Align::Left)?;
 
     // Brightness: unsupported shows the note and a disabled, empty capsule.
@@ -332,14 +358,13 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
         None => (0.0, "Không hỗ trợ".to_string()),
     };
     draw_cap(r, l.brightness, "Màn hình", &br_text)?;
-    draw_capsule(r, slider_of(l.brightness), br_frac, state.brightness.is_some(), GLYPH_BRIGHTNESS)?;
+    draw_capsule(r, slider_of(l.brightness), br_frac, state.brightness.is_some(), Glyph::Text(GLYPH_BRIGHTNESS))?;
 
     // Volume: the glyph at left toggles mute, as in the TSX speaker button.
     let vol = state.volume.clamp(0.0, 1.0);
     let vol_text = if state.muted { "Đã tắt tiếng".to_string() } else { format!("{}%", (vol * 100.0).round() as u32) };
     draw_cap(r, l.volume, "Âm thanh", &vol_text)?;
-    let glyph = if state.muted { GLYPH_MUTE } else { GLYPH_VOLUME };
-    draw_capsule(r, slider_of(l.volume), vol, true, glyph)?;
+    draw_capsule(r, slider_of(l.volume), vol, true, Glyph::Speaker(vol, state.muted))?;
 
     draw_now_playing(r, l.media, media)
 }

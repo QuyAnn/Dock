@@ -99,6 +99,16 @@ pub struct TileView {
     /// Extra small usage bars (0..1, color) drawn top-right on a card, e.g. Cursor's
     /// "Auto + Composer" and "API models" limits next to the main $ bar.
     pub mini: Vec<(f32, u32)>,
+    /// Control Center button: SF-style Wi-Fi + speaker icons (None draws `value` glyphs).
+    pub status: Option<StatusIcons>,
+}
+
+/// State for the dock's Wi-Fi / speaker status icons.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StatusIcons {
+    pub wifi: super::sficons::Wifi,
+    pub volume: f32,
+    pub muted: bool,
 }
 
 impl TileView {
@@ -117,6 +127,7 @@ impl TileView {
             cells: Vec::new(),
             glyph: None,
             mini: Vec::new(),
+            status: None,
         }
     }
 
@@ -464,6 +475,14 @@ fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
 fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     // .cc-btn: 34 px, radius 8, faint fill; hover brightens it.
     card_frame(r, rc, hovered)?;
+    if let Some(st) = t.status {
+        // macOS menu-bar look: Wi-Fi fan (15 px) then speaker (17x15), white, vector.
+        let cy = rc.y + rc.h / 2.0;
+        let wifi = RectF { x: rc.x + 7.0, y: cy - 7.5, w: 15.0, h: 15.0 };
+        let spk = RectF { x: wifi.x + wifi.w + 6.0, y: cy - 7.5, w: 17.0, h: 15.0 };
+        super::sficons::draw_wifi(r, wifi, st.wifi, 0xFFFF_FFFF)?;
+        return super::sficons::draw_speaker(r, spk, st.volume, st.muted, 0xFFFF_FFF0);
+    }
     // Glyphs sit side by side, 14 px each with a 7 px gap.
     let mut x = rc.x + 9.0;
     for (index, glyph) in t.value.chars().enumerate() {

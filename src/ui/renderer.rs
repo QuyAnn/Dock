@@ -790,6 +790,52 @@ impl Renderer {
 
 /// Path-geometry drawing used by `svgpath`. Kept in its own block so it does not touch the core API.
 impl Renderer {
+    /// Like `draw_geometry_with`, but strokes use round caps and joins (SF Symbols look).
+    pub fn draw_geometry_round(
+        &mut self,
+        build: impl FnOnce(&windows::Win32::Graphics::Direct2D::ID2D1GeometrySink) -> Result<()>,
+        rgba: u32,
+        stroke: Option<f32>,
+    ) -> Result<()> {
+        use windows::Win32::Graphics::Direct2D::{
+            D2D1_CAP_STYLE_ROUND, D2D1_DASH_STYLE_SOLID, D2D1_LINE_JOIN_ROUND, D2D1_STROKE_STYLE_PROPERTIES1,
+            D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+        };
+        let factory = d2d_factory()?;
+        let geo: ID2D1PathGeometry = unsafe { factory.CreatePathGeometry()?.into() };
+        // SAFETY: the sink is closed before the geometry is used, even when `build` fails.
+        unsafe {
+            let sink = geo.Open()?;
+            let built = build(&sink);
+            let closed = sink.Close();
+            built?;
+            closed?;
+        }
+        let props = D2D1_STROKE_STYLE_PROPERTIES1 {
+            startCap: D2D1_CAP_STYLE_ROUND,
+            endCap: D2D1_CAP_STYLE_ROUND,
+            dashCap: D2D1_CAP_STYLE_ROUND,
+            lineJoin: D2D1_LINE_JOIN_ROUND,
+            miterLimit: 10.0,
+            dashStyle: D2D1_DASH_STYLE_SOLID,
+            dashOffset: 0.0,
+            transformType: D2D1_STROKE_TRANSFORM_TYPE_NORMAL,
+        };
+        // SAFETY: plain factory call with a valid properties struct.
+        let style: ID2D1StrokeStyle = unsafe { factory.CreateStrokeStyle(&props, None)?.into() };
+        let (rt, brush) = self.parts()?;
+        Self::set_color(brush, rgba);
+        let g: &ID2D1Geometry = &geo;
+        // SAFETY: `g` and `style` live for the call.
+        unsafe {
+            match stroke {
+                Some(width) => rt.DrawGeometry(g, brush, width, &style),
+                None => rt.FillGeometry(g, brush, None::<&windows::Win32::Graphics::Direct2D::ID2D1Brush>),
+            }
+        };
+        Ok(())
+    }
+
     /// Builds a path geometry through `build` (which drives an open sink), then fills it
     /// (`stroke` is None) or strokes it with the given width in DIPs.
     pub fn draw_geometry_with(

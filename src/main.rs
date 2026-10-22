@@ -885,11 +885,14 @@ fn tile_view(
             view
         }
         "weather" => tiles::weather_tile(data),
-        // .cc-btn: Wi-Fi and volume glyphs (Segoe MDL2 Assets).
+        // .cc-btn: macOS menu-bar style Wi-Fi and speaker icons (D2D geometry).
         "cc" => TileView {
             style: Style::Button,
-            value: "\u{E701}\u{E767}".into(),
-            progress: control.wifi.map(|on| if on { 1.0 } else { 0.0 }),
+            status: Some(dock::StatusIcons {
+                wifi: ui::sficons::Wifi::from_state(control.wifi, control.wifi_signal),
+                volume: control.volume,
+                muted: control.muted,
+            }),
             ..TileView::card("", "")
         },
         "start" => TileView { style: Style::Start, ..TileView::card("", "") },
