@@ -21,13 +21,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::dock::RectF;
 use super::renderer::{apply_acrylic, apply_popup_corners, Align, Renderer, POPUP_CORNER_RADIUS};
 use crate::win::dpi;
-use crate::win::tasks::focus_window;
+use crate::win::tasks::{close_window, focus_window};
 
 pub const TIMER_THUMB_DELAY: usize = 40;
 pub const TIMER_THUMB_POLL: usize = 41;
 
 /// Rest time on an icon before the first peek appears.
-const HOVER_DELAY_MS: u32 = 250;
+const HOVER_DELAY_MS: u32 = 600;
 /// Switching between icons while a peek is already open: near-instant, no flicker.
 const SWITCH_DELAY_MS: u32 = 60;
 /// Pointer must stay outside icon + peek this long before the peek hides (crossing the gap).
@@ -398,20 +398,27 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         WM_LBUTTONUP => {
             let x = (lp.0 & 0xffff) as i16 as i32;
             let y = ((lp.0 >> 16) & 0xffff) as i16 as i32;
-            let target = HOST.with(|h| {
-                h.borrow().as_ref().and_then(|host| {
-                    host.thumbs
-                        .iter()
-                        .find(|t| {
-                            x >= t.dest.left
-                                && x < t.dest.right
-                                && y >= t.dest.top - 20
-                                && y < t.dest.bottom
-                        })
-                        .map(|t| t.hwnd_src)
+            let (target, close) = HOST.with(|h| {
+                h.borrow().as_ref().map_or((None, false), |host| {
+                    let scale = dpi::scale(host.renderer.dpi());
+                    let hit = host.thumbs.iter().find(|t| {
+                        x >= t.dest.left && x < t.dest.right && y >= t.dest.top - 20 && y < t.dest.bottom
+                    });
+                    match hit {
+                        Some(t) => {
+                            let r = close_btn_px(t, scale);
+                            let on_btn = x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+                            (Some(t.hwnd_src), on_btn)
+                        }
+                        None => (None, false),
+                    }
                 })
             });
-            if let Some(src) = target {
+            if let (Some(src), true) = (target, close) {
+                crate::log(&format!("peek click -> close hwnd={src:#x}"));
+                hide();
+                close_window(src);
+            } else if let Some(src) = target {
                 crate::log(&format!("peek click -> focus hwnd={src:#x}"));
                 hide();
                 focus_window(src);
@@ -420,6 +427,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
+}
+
+/// Close button size, DIP: top-right of each thumbnail's title row.
+const CLOSE_SIZE: f32 = 18.0;
+
+/// The close button's rect in window pixels (title row is 20 DIP above the thumbnail).
+fn close_btn_px(t: &Thumb, scale: f32) -> RECT {
+    let size = (CLOSE_SIZE * scale) as i32;
+    let top = t.dest.top - (20.0 * scale) as i32;
+    RECT { left: t.dest.right - size, top, right: t.dest.right, bottom: top + size }
 }
 
 fn paint(hwnd: HWND, _hdc: HDC) {
@@ -444,10 +461,23 @@ fn paint(hwnd: HWND, _hdc: HDC) {
                     RectF {
                         x: t.dest.left as f32 / scale,
                         y: t.dest.top as f32 / scale - 20.0,
-                        w: (t.dest.right - t.dest.left) as f32 / scale,
+                        w: (t.dest.right - t.dest.left) as f32 / scale - CLOSE_SIZE - 4.0,
                         h: 18.0,
                     },
                 )
+            })
+            .collect();
+        let buttons: Vec<RectF> = host
+            .thumbs
+            .iter()
+            .map(|t| {
+                let b = close_btn_px(t, scale);
+                RectF {
+                    x: b.left as f32 / scale,
+                    y: b.top as f32 / scale,
+                    w: CLOSE_SIZE,
+                    h: CLOSE_SIZE,
+                }
             })
             .collect();
         let r = &mut host.renderer;
@@ -457,6 +487,13 @@ fn paint(hwnd: HWND, _hdc: HDC) {
             for (title, rc) in &titles {
                 // DirectWrite: full Unicode (Vietnamese) titles, ellipsized to the thumbnail width.
                 r.draw_text(title, *rc, 11.0, 0xF4F4_F7FF, Align::Left)?;
+            }
+            for b in &buttons {
+                // Soft translucent disc with a hairline white cross.
+                r.fill_rounded_rect(*b, CLOSE_SIZE / 2.0, 0xFFFF_FF2E)?;
+                let (cx, cy, k) = (b.x + b.w / 2.0, b.y + b.h / 2.0, 3.3);
+                r.stroke_line(cx - k, cy - k, cx + k, cy + k, 0xFFFF_FFE6, 1.4)?;
+                r.stroke_line(cx - k, cy + k, cx + k, cy - k, 0xFFFF_FFE6, 1.4)?;
             }
             r.end()
         });

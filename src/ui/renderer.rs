@@ -406,6 +406,23 @@ impl Renderer {
         Ok(())
     }
 
+    /// Straight line segment, default (flat) caps.
+    pub fn stroke_line(&mut self, x0: f32, y0: f32, x1: f32, y1: f32, rgba: u32, width: f32) -> Result<()> {
+        let (rt, brush) = self.parts()?;
+        Self::set_color(brush, rgba);
+        // SAFETY: points are plain values; brush belongs to this target.
+        unsafe {
+            rt.DrawLine(
+                D2D_POINT_2F { x: x0, y: y0 },
+                D2D_POINT_2F { x: x1, y: y1 },
+                brush,
+                width,
+                None::<&ID2D1StrokeStyle>,
+            )
+        };
+        Ok(())
+    }
+
     /// Fills a rect with only the top two corners rounded (bottom edge flush / square).
     /// Used for the dock bar when it sits on the monitor edge so wallpaper cannot peek
     /// through lower rounded corners.
