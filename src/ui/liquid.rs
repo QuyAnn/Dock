@@ -42,14 +42,53 @@ const MAX_DPR: f32 = 4.0;
 
 /// Renders the refracted wallpaper behind the dock bar with `DOCK_LENS`.
 pub fn render_liquid(wallpaper: &WallpaperPixels, bar: RectF, screen: (i32, i32)) -> LiquidBitmap {
-    render_with(wallpaper, bar, screen, &DOCK_LENS)
-}
-
-fn render_with(wp: &WallpaperPixels, bar: RectF, screen: (i32, i32), o: &LensOptions) -> LiquidBitmap {
-    let bw = bar.w.round().max(1.0) as u32;
-    let bh = bar.h.round().max(1.0) as u32;
     // The bar spans the whole dock height, so its height over DOCK_H is the device scale.
     let dpr = (bar.h / DOCK_H).clamp(1.0, MAX_DPR);
+    let place = Placement::new(wallpaper, screen);
+    render_with(&|x, y| place.sample(wallpaper, x, y), bar, &DOCK_LENS, dpr, true)
+}
+
+/// Frosted material for floating popups, macOS style: a wide blur of whatever is behind, boosted
+/// saturation, no refraction (strength 0). Corner radius matches the DWM clip.
+pub const FROST_LENS: LensOptions =
+    LensOptions { radius: 8.0, band: 1.0, strength: 0.0, blur: 30.0, saturate: 1.7, aberration: 0.0 };
+
+/// Frosted backdrop from the wallpaper alone (used until a live screen grab is possible).
+pub fn render_popup(wallpaper: &WallpaperPixels, rect: RectF, screen: (i32, i32), dpr: f32) -> LiquidBitmap {
+    let place = Placement::new(wallpaper, screen);
+    render_with(&|x, y| place.sample(wallpaper, x, y), rect, &FROST_LENS, dpr.clamp(1.0, MAX_DPR), false)
+}
+
+/// A grab of the screen: straight RGBA, `w * h * 4` bytes, at virtual-screen position (x, y).
+pub struct ScreenGrab {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub rgba: Vec<u8>,
+}
+
+/// Frosted backdrop of a live screen grab behind the popup. `rect` is the popup in the same
+/// pixel space as the grab's (x, y) origin (virtual-screen px).
+pub fn render_frost(grab: &ScreenGrab, rect: RectF, dpr: f32) -> LiquidBitmap {
+    let sample = |x: f32, y: f32| -> [f32; 3] {
+        let ix = ((x - grab.x as f32).floor() as i32).clamp(0, grab.w - 1);
+        let iy = ((y - grab.y as f32).floor() as i32).clamp(0, grab.h - 1);
+        let i = ((iy * grab.w + ix) * 4) as usize;
+        [grab.rgba[i] as f32, grab.rgba[i + 1] as f32, grab.rgba[i + 2] as f32]
+    };
+    render_with(&sample, rect, &FROST_LENS, dpr.clamp(1.0, MAX_DPR), false)
+}
+
+fn render_with(
+    sample: &dyn Fn(f32, f32) -> [f32; 3],
+    bar: RectF,
+    o: &LensOptions,
+    dpr: f32,
+    flat_bottom: bool,
+) -> LiquidBitmap {
+    let bw = bar.w.round().max(1.0) as u32;
+    let bh = bar.h.round().max(1.0) as u32;
     let blur_px = o.blur * dpr;
     let k = o.strength * dpr;
     let band = o.band * dpr;
@@ -63,7 +102,6 @@ fn render_with(wp: &WallpaperPixels, bar: RectF, screen: (i32, i32), o: &LensOpt
     let gh = (bh as i32 + 2 * margin + GRID - 1) / GRID;
 
     // 1) Wallpaper on the grid, 2x2 supersamples per cell, straight to float RGB.
-    let place = Placement::new(wp, screen);
     let g = GRID as f32;
     let mut grid = vec![0f32; (gw * gh * 3) as usize];
     for gy in 0..gh {
@@ -72,7 +110,7 @@ fn render_with(wp: &WallpaperPixels, bar: RectF, screen: (i32, i32), o: &LensOpt
             for (ox, oy) in [(0.25, 0.25), (0.75, 0.25), (0.25, 0.75), (0.75, 0.75)] {
                 let px = x0 as f32 + (gx as f32 + ox) * g;
                 let py = y0 as f32 + (gy as f32 + oy) * g;
-                let s = place.sample(wp, px, py);
+                let s = sample(px, py);
                 for c in 0..3 {
                     acc[c] += s[c] * 0.25;
                 }
@@ -136,7 +174,7 @@ fn render_with(wp: &WallpaperPixels, bar: RectF, screen: (i32, i32), o: &LensOpt
             let rounded_depth = -(outside + qx.max(qy).min(0.0) - radius);
             // The dock is flush with the lower monitor edge: only its two upper corners are
             // rounded. Keep the lower half rectangular so no wallpaper pinholes appear there.
-            let depth = if py >= 0.0 {
+            let depth = if flat_bottom && py >= 0.0 {
                 (hx - px.abs()).min(hy - py).max(0.0)
             } else {
                 rounded_depth

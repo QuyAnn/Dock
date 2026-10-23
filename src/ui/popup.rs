@@ -24,6 +24,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::dock::RectF;
+use std::sync::Arc;
+
+use super::liquid::LiquidBitmap;
 use super::renderer::{apply_acrylic, apply_popup_corners, Renderer, POPUP_CORNER_RADIUS};
 use crate::win::dpi;
 
@@ -41,6 +44,9 @@ struct Popup {
     /// Last polled key states. Start as "down" so the click that opened us is ignored.
     mouse_down: bool,
     esc_down: bool,
+    /// Liquid Glass backdrop cut from the wallpaper at this popup's position; None until the
+    /// wallpaper is decoded (plain acrylic panel then).
+    backdrop: Option<Arc<LiquidBitmap>>,
 }
 
 impl Drop for Popup {
@@ -167,6 +173,15 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         pw.anchor = anchor;
         pw.mouse_down = true;
         pw.esc_down = true;
+        // Swapping popups: take the old one off screen first so the grab behind the new one is clean.
+        // SAFETY: our own window; DwmFlush waits for the composition that removes it.
+        unsafe {
+            if windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(pw.hwnd).as_bool() {
+                let _ = ShowWindow(pw.hwnd, SW_HIDE);
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            }
+        }
+        pw.backdrop = super::glass::popup_backdrop(rect, monitor, dpi);
         pw.renderer.resize(width_px, height_px, dpi);
         unsafe {
             let _ = SetWindowPos(
@@ -215,6 +230,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         anchor,
         mouse_down: true,
         esc_down: true,
+        backdrop: super::glass::popup_backdrop(rect, monitor, dpi),
     };
     apply_popup_corners(hwnd);
     apply_acrylic(hwnd, super::glass::PANEL_ACRYLIC_TINT);
@@ -411,13 +427,24 @@ fn paint() {
         if let Some(pw) = g.as_mut() {
             let (w, h) = pw.renderer.size();
             let rect = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
+            let backdrop = pw.backdrop.clone();
             let _ = pw.renderer.begin().and_then(|_| {
-                // .popup: gradient fill (rgba(30,31,36,.62) to rgba(18,18,22,.74)), inset top highlight, 1px border.
-                // Liquid Glass panel over live DWM acrylic: light dim, top highlight, specular rims.
-                super::glass::draw_panel(&mut pw.renderer, rect, RADIUS)?;
+                match &backdrop {
+                    // Same Liquid Glass as the dock: refracted wallpaper, a dim for legible text,
+                    // then rims. Pieces drawn by the painter sample this backdrop too.
+                    Some(bd) => {
+                        let full = RectF { x: 0.0, y: 0.0, w, h };
+                        pw.renderer.draw_bitmap(bd.w, bd.h, &bd.rgba, full)?;
+                        super::glass::draw_panel_tint(&mut pw.renderer, rect, RADIUS)?;
+                        super::glass::set_backdrop(Some(bd.clone()), w, h);
+                    }
+                    // Fallback over live DWM acrylic: light dim, top highlight, specular rims.
+                    None => super::glass::draw_panel(&mut pw.renderer, rect, RADIUS)?,
+                }
                 if let Some(f) = PAINTER.with(Cell::get) {
                     f(&mut pw.renderer, rect);
                 }
+                super::glass::set_backdrop(None, w, h);
                 pw.renderer.end()
             });
         }

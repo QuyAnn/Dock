@@ -318,6 +318,8 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
                         *liquid_shared.liquid.lock().unwrap() = map;
                         have = n > 0;
                         log(&format!("liquid backdrop rendered for {n} monitor(s)"));
+                        // Popups render their own glass from the same wallpaper when they open.
+                        glass::set_wallpaper(wp);
                     }
                     Err(e) => log(&format!("wallpaper load failed: {e}")),
                 }

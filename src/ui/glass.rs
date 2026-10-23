@@ -280,3 +280,155 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     Piece { w, h, rgba: out }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Popup backdrop: the same wallpaper-based Liquid Glass as the dock, cut at the popup's position.
+// ---------------------------------------------------------------------------------------------
+
+static WALLPAPER: std::sync::Mutex<Option<Arc<crate::win::wallpaper::WallpaperPixels>>> = std::sync::Mutex::new(None);
+
+/// Keeps the decoded wallpaper so popups can render their own glass backdrop when they open.
+pub fn set_wallpaper(wp: crate::win::wallpaper::WallpaperPixels) {
+    if let Ok(mut slot) = WALLPAPER.lock() {
+        *slot = Some(Arc::new(wp));
+    }
+}
+
+/// Liquid Glass backdrop for a popup whose window sits at `rect` (screen px) on `monitor`.
+/// None until the wallpaper has been decoded; the popup then falls back to plain acrylic.
+pub fn popup_backdrop(rect: windows::Win32::Foundation::RECT, monitor: windows::Win32::Foundation::RECT, dpi: u32) -> Option<Arc<LiquidBitmap>> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+    // Live frost, as on macOS: grab what is really behind the popup (plus the blur margin), blur and
+    // saturate it. The popup window must not be on screen yet.
+    let dpr = dpi as f32 / 96.0;
+    let margin = ((super::liquid::FROST_LENS.blur * 3.0 + 8.0) * dpr).ceil() as i32;
+    let around = windows::Win32::Foundation::RECT {
+        left: rect.left - margin,
+        top: rect.top - margin,
+        right: rect.right + margin,
+        bottom: rect.bottom + margin,
+    };
+    if let Some(grab) = grab_screen(around) {
+        let r = RectF {
+            x: rect.left as f32,
+            y: rect.top as f32,
+            w: (rect.right - rect.left) as f32,
+            h: (rect.bottom - rect.top) as f32,
+        };
+        return Some(Arc::new(super::liquid::render_frost(&grab, r, dpr)));
+    }
+    let wp = WALLPAPER.lock().ok()?.clone()?;
+    // Same placement rules as the dock bar: a spanned wallpaper is addressed in virtual-screen
+    // coordinates, every other fit mode per monitor.
+    let (origin, screen) = if wp.mode == crate::win::wallpaper::FitMode::Span {
+        // SAFETY: plain metric queries.
+        let (vx, vy, vw, vh) = unsafe {
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            )
+        };
+        ((vx, vy), (vw, vh))
+    } else {
+        ((monitor.left, monitor.top), (monitor.right - monitor.left, monitor.bottom - monitor.top))
+    };
+    let r = RectF {
+        x: (rect.left - origin.0) as f32,
+        y: (rect.top - origin.1) as f32,
+        w: (rect.right - rect.left) as f32,
+        h: (rect.bottom - rect.top) as f32,
+    };
+    Some(Arc::new(super::liquid::render_popup(&wp, r, screen, dpi as f32 / 96.0)))
+}
+
+/// Panel over a Liquid Glass backdrop bitmap: a neutral dim so white text stays legible on bright
+/// wallpaper, then the same highlights and rims as the dock pieces.
+pub fn draw_panel_tint(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    r.fill_rounded_rect_gradient(rect, radius, 0x1C1C_2260, 0x1414_1A74)?;
+    draw_highlights(r, rect, radius, 1.0)
+}
+
+/// A card inside a popup: a Liquid Glass piece when the popup has a wallpaper backdrop, else the
+/// plain translucent `fallback` fill with highlights.
+pub fn draw_card(r: &mut Renderer, rect: RectF, radius: f32, fallback: u32, k: f32) -> Result<()> {
+    if CTX.with(|c| c.borrow().is_some()) {
+        draw_glass(r, rect, radius, Layer::Tile, false)
+    } else {
+        r.fill_rounded_rect(rect, radius, fallback)?;
+        draw_highlights(r, rect, radius, k)
+    }
+}
+
+/// Grabs the composed desktop (everything visible, including other apps) in `rect` (virtual-screen
+/// px), clipped to the virtual screen. None if GDI fails.
+fn grab_screen(rect: windows::Win32::Foundation::RECT) -> Option<super::liquid::ScreenGrab> {
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    };
+    // SAFETY: plain metric queries.
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    let x0 = rect.left.max(vx);
+    let y0 = rect.top.max(vy);
+    let x1 = rect.right.min(vx + vw);
+    let y1 = rect.bottom.min(vy + vh);
+    let (w, h) = (x1 - x0, y1 - y0);
+    if w < 2 || h < 2 {
+        return None;
+    }
+    // SAFETY: every GDI object created here is deselected and released before returning.
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        let old = SelectObject(mem, HGDIOBJ(bmp.0));
+        let copied = BitBlt(mem, 0, 0, w, h, screen, x0, y0, SRCCOPY | CAPTUREBLT).is_ok();
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        let mut bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down rows
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let lines = if copied {
+            GetDIBits(mem, bmp, 0, h as u32, Some(bgra.as_mut_ptr().cast()), &mut bmi, DIB_RGB_COLORS)
+        } else {
+            0
+        };
+        SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        if lines != h {
+            return None;
+        }
+        for px in bgra.chunks_exact_mut(4) {
+            px.swap(0, 2); // BGRA -> RGBA
+            px[3] = 255;
+        }
+        Some(super::liquid::ScreenGrab { x: x0, y: y0, w, h, rgba: bgra })
+    }
+}

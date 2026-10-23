@@ -214,8 +214,12 @@ fn draw_round(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, 
         r.fill_rounded_rect(rect, radius, fade(ACCENT, k))?;
         super::glass::draw_highlights(r, rect, radius, 0.8 * k)?;
     } else {
-        r.fill_rounded_rect(rect, radius, fade(ROUND_BG, k))?;
-        super::glass::draw_highlights(r, rect, radius, k)?;
+        if k >= 0.99 {
+            super::glass::draw_card(r, rect, radius, ROUND_BG, k)?;
+        } else {
+            r.fill_rounded_rect(rect, radius, fade(ROUND_BG, k))?;
+            super::glass::draw_highlights(r, rect, radius, k)?;
+        }
     }
     draw_glyph(r, rect, glyph, size, fade(TEXT, icon_k))
 }
@@ -245,8 +249,7 @@ fn draw_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, rgba: u32)
 /// Liquid-glass module (same material language as the dock tiles): light translucent fill,
 /// inner top highlight and specular rims.
 fn draw_module(r: &mut Renderer, rect: RectF) -> Result<()> {
-    r.fill_rounded_rect(rect, CARD_R, CARD)?;
-    super::glass::draw_highlights(r, rect, CARD_R, 0.9)
+    super::glass::draw_card(r, rect, CARD_R, CARD, 0.9)
 }
 
 /// One `.cc-toggle` row: round button, bold label, sub text.
