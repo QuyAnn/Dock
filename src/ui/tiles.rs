@@ -35,9 +35,23 @@ pub enum DataUpdate {
 impl DataState {
     /// Blocking network and disk reads (git, AI usage, weather). Run on a worker thread.
     pub fn refresh_slow(&mut self, repos: &[PathBuf], git_author: &str, weather_location: &str) {
-        self.apply(DataUpdate::Git(refresh_git(repos, git_author)));
-        self.apply(DataUpdate::Ai(refresh_ai()));
-        self.apply(DataUpdate::Weather(refresh_weather_at(weather_location)));
+        for update in Self::fetch_slow(repos, git_author, weather_location) {
+            self.apply(update);
+        }
+    }
+
+    /// The slow (network/disk) pass as updates, so callers can fetch without holding any lock.
+    pub fn fetch_slow(repos: &[PathBuf], git_author: &str, weather_location: &str) -> [DataUpdate; 3] {
+        [
+            DataUpdate::Git(refresh_git(repos, git_author)),
+            DataUpdate::Ai(refresh_ai()),
+            DataUpdate::Weather(refresh_weather_at(weather_location)),
+        ]
+    }
+
+    /// The current media session as an update. Blocks on WinRT; keep it off the UI thread.
+    pub fn fetch_media() -> DataUpdate {
+        DataUpdate::Media(current_media())
     }
 
     /// Reads the current media session. Blocks on WinRT; keep it off the UI thread.

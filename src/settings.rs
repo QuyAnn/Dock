@@ -106,6 +106,17 @@ pub fn path() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(PathBuf::from).map(|dir| dir.join("SmartDock").join("settings.json"))
 }
 
+/// Reloads the settings only when the file's modified time differs from `*seen` (starts as `None`,
+/// so the first call always loads). Saves the per-second read + JSON parse when nothing changed.
+pub fn load_if_changed(seen: &mut Option<Option<std::time::SystemTime>>) -> Option<Settings> {
+    let modified = path().and_then(|p| std::fs::metadata(p).ok()).and_then(|m| m.modified().ok());
+    if *seen == Some(modified) {
+        return None;
+    }
+    *seen = Some(modified);
+    Some(load())
+}
+
 pub fn load() -> Settings {
     let Some(path) = path() else { return Settings::default() };
     let Ok(text) = std::fs::read_to_string(path) else { return Settings::default() };

@@ -67,9 +67,11 @@ const HOTKEY_TOGGLE: i32 = 1;
 
 /// Data shared with the background refresh thread. Blocking calls run there, never on the UI thread.
 struct Shared {
-    data: Mutex<DataState>,
+    /// `data` and `settings` are swapped copy-on-write: readers take a cheap `Arc` clone
+    /// instead of cloning the whole state on every repaint.
+    data: Mutex<Arc<DataState>>,
     control: Mutex<ControlState>,
-    settings: Mutex<settings::Settings>,
+    settings: Mutex<Arc<settings::Settings>>,
     /// Liquid Glass backdrop per monitor (`rcMonitor` key), rendered off the UI thread.
     liquid: Mutex<HashMap<(i32, i32, i32, i32), Arc<LiquidBitmap>>>,
     /// Set by WM_DISPLAYCHANGE so monitor/virtual-screen geometry is sampled again.
@@ -152,6 +154,8 @@ enum Click {
 
 thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
+    /// Modified time of settings.json at the last reload (see `settings::load_if_changed`).
+    static SETTINGS_SEEN: RefCell<Option<Option<std::time::SystemTime>>> = const { RefCell::new(None) };
     /// Control Center state while that popup is open; `None` means a data popup.
     static CONTROL_VIEW: RefCell<Option<ControlState>> = const { RefCell::new(None) };
     static OPEN: Cell<Option<OpenPopup>> = const { Cell::new(None) };
@@ -333,17 +337,19 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
             }
             // Media every 3 s.
             if tick % 3 == 0 {
-                let mut local = shared.data.lock().unwrap().clone();
-                local.refresh_media();
-                *shared.data.lock().unwrap() = local;
+                let update = DataState::fetch_media();
+                Arc::make_mut(&mut shared.data.lock().unwrap()).apply(update);
             }
             // Git, AI usage and weather every 10 min (first pass runs immediately).
             if tick % 600 == 0 || shared.refresh_slow.swap(false, Ordering::SeqCst) {
                 let current = shared.settings.lock().unwrap().clone();
-                let repos = if current.git_folders.is_empty() { default_repos() } else { current.git_folders };
-                let mut local = shared.data.lock().unwrap().clone();
-                local.refresh_slow(&repos, &current.git_author, &current.weather_location);
-                *shared.data.lock().unwrap() = local;
+                let repos = if current.git_folders.is_empty() { default_repos() } else { current.git_folders.clone() };
+                let updates = DataState::fetch_slow(&repos, &current.git_author, &current.weather_location);
+                let mut guard = shared.data.lock().unwrap();
+                let data = Arc::make_mut(&mut guard);
+                for update in updates {
+                    data.apply(update);
+                }
             }
             tick += 1;
             thread::sleep(Duration::from_secs(1));
@@ -643,9 +649,9 @@ fn run() -> windows::core::Result<()> {
     win::system::watch_volume();
 
     let shared = Arc::new(Shared {
-        data: Mutex::new(DataState::default()),
+        data: Mutex::new(Arc::new(DataState::default())),
         control: Mutex::new(ControlState::read()),
-        settings: Mutex::new(initial_settings.clone()),
+        settings: Mutex::new(Arc::new(initial_settings.clone())),
         liquid: Mutex::new(HashMap::new()),
         refresh_liquid: AtomicBool::new(false),
         refresh_slow: AtomicBool::new(false),
@@ -1387,7 +1393,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
                     let app = slot.as_ref()?;
                     let data = app.shared.data.lock().unwrap().clone();
                     feed_popup(kind, &data, &app.history);
-                    popup_content::set_settings(app.shared.settings.lock().unwrap().clone());
+                    popup_content::set_settings((**app.shared.settings.lock().unwrap()).clone());
                     Some(popup_content::content_height(kind, &data))
                 })
                 .unwrap_or(POPUP_H_DEFAULT);
@@ -1467,7 +1473,7 @@ fn refresh_open_popup() {
         let kind = popup_kind(id);
         feed_popup(kind, &data, &app.history);
         if kind == PopupKind::Settings {
-            popup_content::set_settings(app.shared.settings.lock().unwrap().clone());
+            popup_content::set_settings((**app.shared.settings.lock().unwrap()).clone());
         }
     });
     popup::invalidate();
@@ -1527,9 +1533,10 @@ fn on_popup_click(x: f32, y: f32) {
             APP.with(|a| {
                 let slot = a.borrow();
                 let Some(app) = slot.as_ref() else { return };
-                let mut settings = app.shared.settings.lock().unwrap();
-                appmenu::apply(action, &mut settings);
-                let _ = settings::save(&settings);
+                let mut guard = app.shared.settings.lock().unwrap();
+                let settings = Arc::make_mut(&mut guard);
+                appmenu::apply(action, settings);
+                let _ = settings::save(settings);
             });
             popup::hide();
             OPEN.with(|o| o.set(None));
@@ -1558,7 +1565,8 @@ fn on_popup_click(x: f32, y: f32) {
             APP.with(|a| {
                 let slot = a.borrow();
                 let Some(app) = slot.as_ref() else { return };
-                let mut settings = app.shared.settings.lock().unwrap();
+                let mut guard = app.shared.settings.lock().unwrap();
+                let settings = Arc::make_mut(&mut guard);
                 match action {
                     popup_content::SettingsAction::GlassOpacity(value) => {
                         settings.glass_opacity = value;
@@ -1626,13 +1634,13 @@ fn on_popup_click(x: f32, y: f32) {
                         app.shared.refresh_slow.store(true, Ordering::SeqCst);
                     }
                     popup_content::SettingsAction::OpenConfig => {
-                        let _ = settings::save(&settings);
+                        let _ = settings::save(settings);
                         if let Some(path) = settings::path() {
                             let _ = system::open_path(&path);
                         }
                     }
                 }
-                let _ = settings::save(&settings);
+                let _ = settings::save(settings);
                 popup_content::set_settings(settings.clone());
             });
             popup::invalidate();
@@ -2129,12 +2137,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     APP.with(|a| {
                         if let Ok(mut slot) = a.try_borrow_mut() {
                             if let Some(app) = slot.as_mut() {
-                                let disk_settings = settings::load();
                                 let mut current_settings = app.shared.settings.lock().unwrap();
-                                if *current_settings != disk_settings {
-                                    appbar::set_hidden_mode(disk_settings.taskbar_mode == "hidden");
-                                    *current_settings = disk_settings;
-                                    app.shared.refresh_slow.store(true, Ordering::SeqCst);
+                                if let Some(disk_settings) = SETTINGS_SEEN.with(|s| settings::load_if_changed(&mut s.borrow_mut())) {
+                                    if **current_settings != disk_settings {
+                                        appbar::set_hidden_mode(disk_settings.taskbar_mode == "hidden");
+                                        *current_settings = Arc::new(disk_settings);
+                                        app.shared.refresh_slow.store(true, Ordering::SeqCst);
+                                    }
                                 }
                                 data::usage::tick();
                                 app.apps.pins = pins_of(&current_settings);
