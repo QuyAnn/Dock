@@ -551,9 +551,26 @@ pub fn focus_window(hwnd: isize) {
             let _ = AttachThreadInput(cur_tid, fg_tid, BOOL::from(true));
         }
         let _ = BringWindowToTop(target);
-        let set_ok = SetForegroundWindow(target).as_bool();
+        let mut set_ok = SetForegroundWindow(target).as_bool();
         if attach {
             let _ = AttachThreadInput(cur_tid, fg_tid, BOOL::from(false));
+        }
+        if !set_ok {
+            // Refused (the foreground lock, e.g. while the Start menu or Search host is in front).
+            // A synthetic keystroke counts as user input and lifts the lock for one more try.
+            // F24 is unassigned, so no app reacts to it (an Alt tap would open menu bars).
+            let key = |up: bool| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0x87),
+                        dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                        ..Default::default()
+                    },
+                },
+            };
+            let _ = SendInput(&[key(false), key(true)], std::mem::size_of::<INPUT>() as i32);
+            set_ok = SetForegroundWindow(target).as_bool();
         }
         let mut switched = false;
         if !set_ok || GetForegroundWindow() != target {
@@ -561,6 +578,31 @@ pub fn focus_window(hwnd: isize) {
             switched = true;
         }
         note_foreign_foreground(hwnd);
+        if iconic {
+            // The restore is asynchronous: the app finishes un-minimizing after the calls above and
+            // can end up behind the window that took over when it was minimized. Re-assert the
+            // foreground once it is actually restored.
+            std::thread::spawn(move || {
+                let target = HWND(hwnd as _);
+                for _ in 0..20 {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    if !unsafe { IsIconic(target).as_bool() } {
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(60));
+                // SAFETY: plain Win32 calls on a handle that may be stale; failures are ignored.
+                unsafe {
+                    let before = GetForegroundWindow() == target;
+                    let _ = BringWindowToTop(target);
+                    let ok = SetForegroundWindow(target).as_bool();
+                    crate::log(&format!(
+                        "refocus hwnd={hwnd:#x} fg_before={before} set_fg={ok} fg_is_target={}",
+                        GetForegroundWindow() == target
+                    ));
+                }
+            });
+        }
         crate::log(&format!(
             "focus hwnd={hwnd:#x} iconic={iconic} set_fg={set_ok} switch_fallback={switched} fg_is_target={}",
             GetForegroundWindow() == target
@@ -764,6 +806,9 @@ pub fn launch_exe(exe: &str) {
     }
     let wide: Vec<u16> = std::ffi::OsStr::new(exe).encode_wide().chain(Some(0)).collect();
     unsafe {
+        // The dock never takes focus, so the new process would not be allowed to come to the front
+        // and its window would open behind the apps already on screen.
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
         let r = ShellExecuteW(
             None,
             w!("open"),
