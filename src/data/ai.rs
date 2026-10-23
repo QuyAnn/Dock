@@ -253,7 +253,7 @@ fn codex() -> AiUsage {
             Ok(j) => {
                 if let Some(pct) = j.pointer("/rate_limit/primary_window/used_percent").and_then(Value::as_f64) {
                     let mut windows = vec![AiWindow {
-                        label: "Session".to_owned(),
+                        label: "Session (5h)".to_owned(),
                         used_pct: pct as f32,
                         reset_text: reset_text(j.pointer("/rate_limit/primary_window/reset_at").and_then(to_ms)),
                     }];
@@ -275,19 +275,27 @@ fn codex() -> AiUsage {
         }
     }
 
-    // Fallback: the newest rate-limit snapshot Codex wrote into its own session logs.
+    // Fallback: the newest rate-limit snapshot Codex wrote into its own session logs. A window
+    // whose reset time has passed is stale (its % belongs to the previous window), so it is dropped.
     if let Some((rl, at_ms)) = latest_codex_rate_limits() {
-        if let Some(pct) = rl.pointer("/primary/used_percent").and_then(Value::as_f64) {
-            let reset = rl.pointer("/primary/resets_at").and_then(to_ms).or_else(|| {
-                rl.pointer("/primary/resets_in_seconds")
+        let now = now_ms();
+        let mut windows = Vec::new();
+        for (field, label) in [("/primary", "Session (5h)"), ("/secondary", "Weekly")] {
+            let Some(window) = rl.pointer(field) else { continue };
+            let Some(pct) = window.get("used_percent").and_then(Value::as_f64) else { continue };
+            let reset = window.get("resets_at").and_then(to_ms).or_else(|| {
+                window
+                    .get("resets_in_seconds")
                     .and_then(Value::as_f64)
                     .map(|s| at_ms + (s * 1000.0) as i64)
             });
-            return usage(NAME, vec![AiWindow {
-                label: "Session".to_owned(),
-                used_pct: pct as f32,
-                reset_text: reset_text(reset),
-            }]);
+            if reset.is_some_and(|ms| ms <= now) {
+                continue;
+            }
+            windows.push(AiWindow { label: label.to_owned(), used_pct: pct as f32, reset_text: reset_text(reset) });
+        }
+        if !windows.is_empty() {
+            return usage(NAME, windows);
         }
     }
 
