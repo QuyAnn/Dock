@@ -18,6 +18,10 @@ pub struct TileSettings {
     pub cpu: bool,
     pub ram: bool,
     pub weather: bool,
+    pub focus: bool,
+    pub todo: bool,
+    pub trash: bool,
+    pub downloads: bool,
 }
 
 impl Default for TileSettings {
@@ -32,7 +36,191 @@ impl Default for TileSettings {
             cpu: true,
             ram: true,
             weather: true,
+            focus: false,
+            todo: false,
+            trash: false,
+            downloads: false,
         }
+    }
+}
+
+/// Every widget that can sit on the left or right of the dock, with the Settings key it uses.
+pub const WIDGET_IDS: [&str; 16] =
+    ["git", "claude", "codex", "cursor", "grok", "media", "weather", "cpu", "ram", "focus", "todo", "trash", "downloads", "chevron", "cc", "clock"];
+
+/// Always on: these can be moved but not removed (tray chevron, Wi-Fi/volume button, clock).
+pub fn is_fixed_widget(id: &str) -> bool {
+    matches!(id, "chevron" | "cc" | "clock")
+}
+
+/// Which side of the dock each widget is on, and its order (left to right). Widgets missing
+/// from both lists (older settings files) are added back on their default side by `normalize`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WidgetLayout {
+    pub left: Vec<String>,
+    pub right: Vec<String>,
+}
+
+impl Default for WidgetLayout {
+    fn default() -> Self {
+        let own = |ids: &[&str]| ids.iter().map(|s| (*s).to_owned()).collect();
+        Self { left: own(&["git", "claude", "codex", "cursor", "grok", "weather", "focus", "todo", "trash", "downloads"]), right: own(&["chevron", "cc", "media", "cpu", "ram", "clock"]) }
+    }
+}
+
+impl WidgetLayout {
+    /// Drops unknown and duplicate ids, and appends missing ones to their default side.
+    pub fn normalize(&mut self) {
+        let mut seen = Vec::new();
+        for list in [&mut self.left, &mut self.right] {
+            list.retain(|id| {
+                let ok = WIDGET_IDS.contains(&id.as_str()) && !seen.contains(id);
+                if ok {
+                    seen.push(id.clone());
+                }
+                ok
+            });
+        }
+        let defaults = WidgetLayout::default();
+        for id in WIDGET_IDS {
+            if !seen.iter().any(|s| s == id) {
+                if defaults.right.iter().any(|d| d == id) {
+                    // Fixed buttons keep their usual spot: chevron and Control Center first.
+                    match id {
+                        "chevron" => self.right.insert(0, id.to_owned()),
+                        "cc" => {
+                            let at = usize::from(self.right.first().is_some_and(|s| s == "chevron"));
+                            self.right.insert(at, id.to_owned());
+                        }
+                        _ => self.right.push(id.to_owned()),
+                    }
+                } else {
+                    self.left.push(id.to_owned());
+                }
+            }
+        }
+    }
+
+    pub fn is_left(&self, id: &str) -> bool {
+        self.left.iter().any(|s| s == id)
+    }
+
+
+    /// Puts `id` on `left`/right so it lands at slot `k` among the widgets currently shown on
+    /// that side (`shown`, in order, without `id`); hidden widgets keep their relative place.
+    pub fn move_to(&mut self, id: &str, left: bool, shown: &[&str], k: usize) {
+        self.left.retain(|s| s != id);
+        self.right.retain(|s| s != id);
+        let list = if left { &mut self.left } else { &mut self.right };
+        let pos = |name: &str, list: &Vec<String>| list.iter().position(|s| s == name);
+        let idx = if let Some(next) = shown.get(k).and_then(|n| pos(n, list)) {
+            next
+        } else if let Some(last) = shown.last().and_then(|n| pos(n, list)) {
+            last + 1
+        } else if left {
+            list.len()
+        } else {
+            0
+        };
+        list.insert(idx.min(list.len()), id.to_owned());
+    }
+    /// Moves `id` to `side` (left = true) at `index` within that side (clamped).
+    pub fn place(&mut self, id: &str, left: bool, index: usize) {
+        self.left.retain(|s| s != id);
+        self.right.retain(|s| s != id);
+        let list = if left { &mut self.left } else { &mut self.right };
+        list.insert(index.min(list.len()), id.to_owned());
+    }
+}
+
+impl TileSettings {
+    pub fn is_on(&self, id: &str) -> bool {
+        match id {
+            "git" => self.git,
+            "claude" => self.claude,
+            "codex" => self.codex,
+            "cursor" => self.cursor,
+            "grok" => self.grok,
+            "media" => self.music,
+            "weather" => self.weather,
+            "cpu" => self.cpu,
+            "ram" => self.ram,
+            "focus" => self.focus,
+            "todo" => self.todo,
+            "trash" => self.trash,
+            "downloads" => self.downloads,
+            _ => is_fixed_widget(id),
+        }
+    }
+
+    pub fn set(&mut self, id: &str, on: bool) {
+        match id {
+            "git" => self.git = on,
+            "claude" => self.claude = on,
+            "codex" => self.codex = on,
+            "cursor" => self.cursor = on,
+            "grok" => self.grok = on,
+            "media" => self.music = on,
+            "weather" => self.weather = on,
+            "cpu" => self.cpu = on,
+            "ram" => self.ram = on,
+            "focus" => self.focus = on,
+            "todo" => self.todo = on,
+            "trash" => self.trash = on,
+            "downloads" => self.downloads = on,
+            _ => {}
+        }
+    }
+}
+
+/// Name shown in the widget menus.
+pub fn widget_label(id: &str) -> &'static str {
+    match id {
+        "git" => "Git",
+        "claude" => "Claude",
+        "codex" => "ChatGPT",
+        "cursor" => "Cursor",
+        "grok" => "Grok Bot",
+        "media" => "Nhạc",
+        "weather" => "Thời tiết",
+        "cpu" => "CPU",
+        "ram" => "RAM",
+        "focus" => "Hẹn giờ tập trung",
+        "todo" => "Việc cần làm",
+        "trash" => "Thùng rác",
+        "downloads" => "Tải xuống",
+        "chevron" => "Khay hệ thống",
+        "cc" => "Wi-Fi và âm lượng",
+        "clock" => "Đồng hồ",
+        _ => "",
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn widget_layout_normalize_fills_missing_and_drops_unknown() {
+        let mut l = WidgetLayout { left: vec!["git".into(), "bogus".into(), "git".into()], right: vec![] };
+        l.normalize();
+        assert_eq!(l.left.iter().filter(|s| *s == "git").count(), 1);
+        assert!(!l.left.iter().chain(&l.right).any(|s| s == "bogus"));
+        assert!(l.right.iter().any(|s| s == "media"));
+        for id in WIDGET_IDS {
+            assert_eq!(l.left.iter().chain(&l.right).filter(|s| *s == id).count(), 1, "{id}");
+        }
+    }
+
+    #[test]
+    fn widget_layout_place_moves_between_sides() {
+        let mut l = WidgetLayout::default();
+        l.place("media", true, 1);
+        assert_eq!(l.left[1], "media");
+        assert!(!l.right.iter().any(|s| s == "media"));
+        l.place("git", false, 99);
+        assert_eq!(l.right.last().map(String::as_str), Some("git"));
     }
 }
 
@@ -59,6 +247,8 @@ pub struct Settings {
     /// SmartDock's own Shell_TrayWnd listener (tray icons in the ^ popup). Kill switch.
     pub tray_service: bool,
     pub tiles: TileSettings,
+    /// Side and order of the optional widgets (drag them or use the right-click menu).
+    pub layout: WidgetLayout,
     pub weather_location: String,
     /// "clock" or "tile".
     pub weather_position: String,
@@ -77,6 +267,12 @@ pub struct Settings {
     pub claude_source: String,
     /// Monthly API budget in USD shown next to the Claude spend (chosen in Settings).
     pub claude_monthly_budget: u32,
+    /// "normal" or "compact": compact narrows the widgets.
+    pub widget_size: String,
+    /// "glass", "midnight" or "black": material of the widget tiles.
+    pub dock_style: String,
+    /// Items of the To-do widget.
+    pub todos: Vec<TodoItem>,
 }
 
 impl Default for Settings {
@@ -87,6 +283,7 @@ impl Default for Settings {
             launch_at_startup: false,
             tray_service: true,
             tiles: TileSettings::default(),
+            layout: WidgetLayout::default(),
             weather_location: "Hanoi".to_owned(),
             weather_position: "clock".to_owned(),
             git_folders: Vec::new(),
@@ -98,6 +295,9 @@ impl Default for Settings {
             auto_pin_hidden: Vec::new(),
             claude_source: "login".to_owned(),
             claude_monthly_budget: 100,
+            widget_size: "normal".to_owned(),
+            dock_style: "glass".to_owned(),
+            todos: Vec::new(),
         }
     }
 }
@@ -122,6 +322,7 @@ pub fn load() -> Settings {
     let Ok(text) = std::fs::read_to_string(path) else { return Settings::default() };
     let mut settings: Settings = serde_json::from_str(&text).unwrap_or_default();
     settings.glass_opacity = settings.glass_opacity.min(95);
+    settings.layout.normalize();
     if settings.taskbar_mode != "autohide" && settings.taskbar_mode != "hidden" {
         settings.taskbar_mode = "hidden".to_owned();
     }
@@ -164,5 +365,58 @@ pub fn sync_startup(enabled: bool) {
                 PCWSTR(value_name.as_ptr()),
             );
         }
+    }
+}
+
+impl Settings {
+    /// Whether a widget is drawn on the dock: switched on and, for weather, set to be its own tile.
+    pub fn widget_shown(&self, id: &str) -> bool {
+        self.tiles.is_on(id) && (id != "weather" || self.weather_position == "tile")
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+
+    #[test]
+    fn widget_layout_move_to_slots_among_shown() {
+        let mut l = WidgetLayout::default(); // left: git claude codex cursor grok weather
+        // weather is hidden: shown = git claude codex cursor grok. Drop "media" at slot 2.
+        l.move_to("media", true, &["git", "claude", "codex", "cursor", "grok"], 2);
+        assert_eq!(&l.left[..4], ["git", "claude", "media", "codex"]);
+        // Past the last shown widget: lands right after it, before the hidden weather.
+        l.move_to("cpu", true, &["git", "claude", "media", "codex", "cursor", "grok"], 6);
+        let g = l.left.iter().position(|s| s == "grok").unwrap();
+        assert_eq!(l.left[g + 1], "cpu");
+        // Empty right side: goes first.
+        let mut r = WidgetLayout { left: vec!["git".into()], right: vec![] };
+        r.move_to("ram", false, &[], 0);
+        assert_eq!(r.right, ["ram"]);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TodoItem {
+    pub text: String,
+    pub done: bool,
+}
+
+pub const DOCK_STYLES: [(&str, &str); 3] = [("glass", "Kính"), ("midnight", "Midnight"), ("black", "Đen")];
+
+impl Settings {
+    /// Width factor of the widgets for the chosen size.
+    pub fn widget_scale(&self) -> f32 {
+        if self.widget_size == "compact" { 0.86 } else { 1.0 }
+    }
+
+    pub fn style_label(&self) -> &'static str {
+        DOCK_STYLES.iter().find(|(id, _)| *id == self.dock_style).map_or("Kính", |(_, l)| l)
+    }
+
+    pub fn cycle_style(&mut self) {
+        let i = DOCK_STYLES.iter().position(|(id, _)| *id == self.dock_style).unwrap_or(0);
+        self.dock_style = DOCK_STYLES[(i + 1) % DOCK_STYLES.len()].0.to_owned();
     }
 }

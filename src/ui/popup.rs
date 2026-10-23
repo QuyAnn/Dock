@@ -35,7 +35,7 @@ const MARGIN: f32 = 6.0;
 /// Must equal the DWM corner so the drawn panel and the window clip match exactly.
 const RADIUS: f32 = POPUP_CORNER_RADIUS;
 const TIMER_ID: usize = 1;
-const POLL_MS: u32 = 100;
+const POLL_MS: u32 = 40;
 
 struct Popup {
     hwnd: HWND,

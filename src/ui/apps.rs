@@ -465,7 +465,7 @@ mod tests {
         assert!(shelf.y >= 3.0, "shelf top {}", shelf.y);
         // Rounded bottom corners stay inside the visible bar (the window extends below the screen).
         assert!(shelf.y + shelf.h <= DOCK_H - 3.0, "shelf bottom {shelf:?}");
-        assert!((shelf.y - (DOCK_H - shelf.y - shelf.h)).abs() < 0.01, "shelf not centred: {shelf:?}");
+        assert!(((DOCK_H - shelf.y - shelf.h) - shelf.y - 2.0 * crate::ui::dock::CENTER_RISE).abs() < 0.01, "shelf not raised: {shelf:?}");
         let icon_top = rects[apps].y + ICON_TOP;
         let icon_bottom = icon_top + ICON;
         // A hovered icon grows upward by MAG_MAX but stays inside the bar.
@@ -477,12 +477,12 @@ mod tests {
         let dot_bottom = icon_bottom + DOT_GAP + DOT;
         // At least 1 DIP between the dot and the shelf's bottom rim.
         assert!(dot_bottom <= shelf.y + shelf.h - 1.0, "dot {dot_bottom} touches shelf rim {shelf:?}");
-        // Side tiles are vertically centred too.
+        // Side tiles sit at the same raised height as the cluster.
         for (i, r) in rects.iter().enumerate() {
-            if i == start + 1 {
+            if i >= start && i <= apps {
                 continue;
             }
-            assert!((r.y - (DOCK_H - r.y - r.h)).abs() < 0.01, "tile {i} not centred: {r:?}");
+            assert!(((DOCK_H - r.y - r.h) - r.y - 2.0 * crate::ui::dock::CENTER_RISE).abs() < 0.01, "tile {i} not raised like the cluster: {r:?}");
         }
     }
 

@@ -8,3 +8,4 @@ pub mod system;   // media (SMTC), Core Audio volume/mute, radios, brightness, W
 pub mod wallpaper; // desktop wallpaper path + WIC decode, change poll (Liquid Glass source)
 pub mod traysvc;  // our Shell_TrayWnd listener: learns tray icons, forwards everything to Explorer
 pub mod grokbot;  // Grok Bot desktop app resolve/launch (never reads %USERPROFILE%\.grokbot)
+pub mod shellinfo; // Recycle Bin / Downloads readings, clipboard text, empty bin

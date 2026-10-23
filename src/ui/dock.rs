@@ -10,12 +10,14 @@ use super::liquid::{glass_fill_color, LiquidBitmap, GLASS_SHEEN_TOP};
 use super::renderer::{Align, Renderer, TextStyle};
 use super::svgpath;
 
-/// Bar height in DIPs. 48 leaves a 3-DIP clear margin above and below the 42-DIP centre
+/// Bar height in DIPs. 52 leaves a 5-DIP clear margin above and below the 42-DIP centre
 /// cluster (shelf + 38 px icons + running dots), so the shelf's top rim is never clipped.
-pub const DOCK_H: f32 = 48.0;
+pub const DOCK_H: f32 = 52.0;
 const BAR_RADIUS: f32 = 18.0;
-const TILE_H: f32 = 34.0;
+const TILE_H: f32 = 42.0; // same height as the centre cluster
 const ROW_PAD: f32 = 5.0; // styles.css .dock-row padding: 0 5px
+/// Every tile (widgets and centre cluster) sits this many DIPs above the bar's vertical centre.
+pub const CENTER_RISE: f32 = 2.0;
 const ZONE_GAP: f32 = 5.0; // .zone gap
 const ROW_GAP: f32 = 6.0; // .dock-row gap between zones
 
@@ -28,8 +30,8 @@ const NO_BACKDROP_TOP: u32 = 0x6E68_62FF;
 const NO_BACKDROP_BOTTOM: u32 = 0x5A55_50FF;
 const CLOCK_TOP: u32 = 0xFF5A_3CFF;
 const CLOCK_BOTTOM: u32 = 0xE832_1EFF;
-const HM_EMPTY: u32 = 0xFFFF_FF14; // .hm.l0
-const HM_LEVELS: [u32; 4] = [0x0E44_29FF, 0x006D_32FF, 0x26A6_41FF, 0x39D3_53FF];
+const HM_EMPTY: u32 = 0xFFFF_FF26; // .hm.l0 (a bit lighter: the bar is clear glass)
+const HM_LEVELS: [u32; 4] = [0x1F8F_4EFF, 0x2FB8_63FF, 0x4AD6_7FFF, 0x8BF0_AAFF];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RectF {
@@ -56,6 +58,8 @@ pub struct Icon {
 /// How a tile is drawn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Style {
+    /// AI usage: a big icon plate on the left, then one line per limit (label, bar, reset, percent).
+    Usage,
     /// Rounded card: optional icon square, title (muted, small) above value, optional bottom bar.
     Card,
     /// 34 px card with a circular gauge and the value centered (CPU, RAM).
@@ -105,6 +109,8 @@ pub struct TileView {
     pub status: Option<StatusIcons>,
     /// Tray-overflow chevron; `Some(open)` (points down while the flyout is open).
     pub chevron: Option<bool>,
+    /// `Usage` style: one entry per limit, top to bottom.
+    pub rows: Vec<UsageRow>,
 }
 
 /// State for the dock's Wi-Fi / speaker status icons.
@@ -133,6 +139,7 @@ impl TileView {
             mini: Vec::new(),
             status: None,
             chevron: None,
+            rows: Vec::new(),
         }
     }
 
@@ -144,7 +151,7 @@ impl TileView {
 
 /// Fixed left-tile widths (Dock-Rc: .ai-tile 100px, .music-tile 142px, scaled up a little so
 /// "$52.59/$20.00" and Vietnamese titles fit). Every usage tile shares one width.
-pub const GIT_W: f32 = 118.0;
+pub const GIT_W: f32 = 132.0;
 pub const USAGE_W: f32 = 112.0;
 pub const MEDIA_W: f32 = 200.0;
 
@@ -152,6 +159,8 @@ pub const MEDIA_W: f32 = 200.0;
 pub const CENTER_GAP: f32 = 12.0;
 /// Media keeps at least this width before other left tiles are squeezed.
 const MEDIA_MIN_W: f32 = 150.0;
+/// Provider cards keep at least this width before every tile is scaled down.
+const USAGE_MIN_W: f32 = 140.0;
 
 /// Places tiles in three zones. Returns one rect per tile, in the order: left, center, right.
 ///
@@ -163,11 +172,11 @@ pub fn layout(left: &[Tile], center: &[Tile], right: &[Tile], screen_w: f32) -> 
     let mut out = Vec::with_capacity(left.len() + center.len() + right.len());
     let gaps = |n: usize| ZONE_GAP * n.saturating_sub(1) as f32;
     let zone_w = |tiles: &[Tile]| -> f32 { tiles.iter().map(|t| t.width).sum::<f32>() + gaps(tiles.len()) };
-    let place = |tiles: &[Tile], widths: &[f32], x: f32, out: &mut Vec<RectF>| {
+    let place = |tiles: &[Tile], widths: &[f32], x: f32, rise: f32, out: &mut Vec<RectF>| {
         let mut x = x;
         for (t, &w) in tiles.iter().zip(widths) {
             let h = if t.height > 0.0 { t.height } else { TILE_H };
-            out.push(RectF { x, y: (DOCK_H - h) / 2.0, w, h });
+            out.push(RectF { x, y: (DOCK_H - h) / 2.0 - rise, w, h });
             x += w + ZONE_GAP;
         }
     };
@@ -186,12 +195,12 @@ pub fn layout(left: &[Tile], center: &[Tile], right: &[Tile], screen_w: f32) -> 
     };
 
     let left_widths = side_widths(left, left_max);
-    place(left, &left_widths, ROW_PAD, &mut out);
-    place(center, &center.iter().map(|t| t.width).collect::<Vec<_>>(), center_x, &mut out);
+    place(left, &left_widths, ROW_PAD, CENTER_RISE, &mut out);
+    place(center, &center.iter().map(|t| t.width).collect::<Vec<_>>(), center_x, CENTER_RISE, &mut out);
     // Right packs to the trailing edge (clock / rings stay put).
     let right_widths = side_widths(right, right_max);
     let fitted_right_w: f32 = right_widths.iter().sum::<f32>() + gaps(right.len());
-    place(right, &right_widths, screen_w - ROW_PAD - fitted_right_w, &mut out);
+    place(right, &right_widths, screen_w - ROW_PAD - fitted_right_w, CENTER_RISE, &mut out);
     out
 }
 
@@ -212,6 +221,15 @@ fn side_widths(tiles: &[Tile], max_w: f32) -> Vec<f32> {
         let give = (widths[i] - MEDIA_MIN_W).max(0.0).min(over);
         widths[i] -= give;
         over -= give;
+    }
+    // Provider cards give up width next (down to a readable minimum) so the Git heatmap and the
+    // other fixed widgets keep theirs.
+    for (i, t) in tiles.iter().enumerate() {
+        if over > 0.0 && matches!(t.id, "claude" | "codex" | "cursor" | "grok") {
+            let give = (widths[i] - USAGE_MIN_W).max(0.0).min(over);
+            widths[i] -= give;
+            over -= give;
+        }
     }
     if over > 0.0 {
         let total: f32 = widths.iter().sum();
@@ -246,26 +264,17 @@ pub fn draw_dock(
     // The wallpaper blur is the backdrop. The readable smoky tint must sit above it, not below
     // an opaque bitmap where it would disappear.
     match backdrop {
+        // True transparency: nothing is painted behind the tiles, so no seam or edge can show.
+        _ if super::renderer::dwm_transparent() => {}
+        // The bar itself is invisible: the plain, unblurred wallpaper crop is painted so only the
+        // tiles (which sample the blurred `rgba` in glass.rs) read as glass pieces.
+        Some(b) if !b.plain.is_empty() => r.draw_bitmap(b.w, b.h, &b.plain, bar)?,
         Some(b) => r.draw_bitmap(b.w, b.h, &b.rgba, bar)?,
         // No wallpaper crop yet: the HWND target has no real alpha, so a transparent clear
         // shows as black. Paint a neutral mid-tone glass base instead of a near-black bar.
         None => r.fill_top_rounded_rect_gradient(bar, BAR_RADIUS, NO_BACKDROP_TOP, NO_BACKDROP_BOTTOM)?,
     }
-    // Liquid Glass bar: the refracted wallpaper stays visible. Only a light neutral dim (scaled
-    // from the Glass opacity setting) for legibility, never a dark slab. Flush to the monitor
-    // edge: round only the top corners.
-    let dim_alpha = (opacity_pct.min(95) as u32 * 45 / 100).min(60);
-    r.fill_top_rounded_rect(bar, BAR_RADIUS, 0x1416_1C00 | dim_alpha)?;
-    // Soft inner highlight across the top of the bar.
-    r.fill_top_rounded_rect_gradient(
-        RectF { h: DOCK_H * 0.45, ..bar },
-        BAR_RADIUS,
-        0xFFFF_FF2A,
-        0xFFFF_FF00,
-    )?;
-    // Specular rim: brightest at the top-left, fading to the right.
-    r.stroke_top_rounded_rect_linear(bar, BAR_RADIUS, (0.0, 0.0), 0xFFFF_FFA0, (w * 0.6, DOCK_H), 0xFFFF_FF2E, 1.0)?;
-    let _ = (glass_fill_color(opacity_pct), GLASS_SHEEN_TOP, BAR_BORDER);
+    let _ = (glass_fill_color(opacity_pct), GLASS_SHEEN_TOP, BAR_BORDER, w);
 
     if let Some(shelf) = SHELF.with(Cell::get) {
         draw_shelf(r, shelf)?;
@@ -275,6 +284,7 @@ pub fn draw_dock(
         match t.style {
             Style::Bare => draw_bare(r, t, *rc)?,
             Style::Card => draw_card(r, t, *rc, hovered)?,
+            Style::Usage => draw_usage(r, t, *rc, hovered)?,
             Style::Ring => draw_ring(r, t, *rc, hovered)?,
             Style::Clock => draw_clock(r, t, *rc, hovered)?,
             Style::Git => draw_git(r, t, *rc, hovered)?,
@@ -307,6 +317,8 @@ fn draw_bare(r: &mut Renderer, t: &TileView, rc: RectF) -> Result<()> {
 
 fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
+    // The text blocks were laid out for a 34 DIP tile: centre them in taller ones.
+    let off = (rc.h - 34.0) / 2.0;
     let mut text_x = rc.x + 7.0;
     if t.bg != 0 {
         // .ai-ico: 22 px square, radius 6, colored background with a glyph.
@@ -331,20 +343,20 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
         r.draw_text(&t.title, RectF { x: text_x, y: rc.y, w: text_w, h: rc.h }, 9.5, TEXT, Align::Left)?;
         return Ok(());
     }
-    let title = RectF { x: text_x, y: rc.y + 4.0, w: text_w, h: 11.0 };
+    let title = RectF { x: text_x, y: rc.y + off + 4.0, w: text_w, h: 11.0 };
     r.draw_text(&t.title, title, 8.5, MUTED, Align::Left)?;
     let value_w = if t.sub.is_empty() { text_w } else { text_w * 0.55 };
-    let value = RectF { x: text_x, y: rc.y + 14.0, w: value_w, h: 14.0 };
+    let value = RectF { x: text_x, y: rc.y + off + 14.0, w: value_w, h: 14.0 };
     // Fixed tile width: long values ("$52.59/$20.00") step down a size before ellipsizing.
     let value_px = if t.value.chars().count() as f32 * 11.5 * 0.56 > value_w { 10.0 } else { 11.5 };
     r.draw_text_styled(&t.value, value, value_px, TEXT, Align::Left, TextStyle::Bold)?;
     if !t.sub.is_empty() {
-        let sub = RectF { x: text_x + value_w, y: rc.y + 14.0, w: text_w - value_w, h: 14.0 };
+        let sub = RectF { x: text_x + value_w, y: rc.y + off + 14.0, w: text_w - value_w, h: 14.0 };
         r.draw_text(&t.sub, sub, 8.0, MUTED, Align::Right)?;
     }
     // Extra limits: short stacked bars in the free top-right corner beside the title.
     for (i, (p, c)) in t.mini.iter().enumerate().take(2) {
-        let track = RectF { x: rc.x + rc.w - 7.0 - 28.0, y: rc.y + 5.0 + i as f32 * 4.0, w: 28.0, h: 2.0 };
+        let track = RectF { x: rc.x + rc.w - 7.0 - 28.0, y: rc.y + off + 5.0 + i as f32 * 4.0, w: 28.0, h: 2.0 };
         r.fill_rounded_rect(track, 1.0, RING_TRACK)?;
         let fill_w = track.w * p.clamp(0.0, 1.0);
         if fill_w > 0.0 {
@@ -405,7 +417,8 @@ fn draw_ring(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
 
 fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
-    let time = RectF { x: rc.x + 2.0, y: rc.y + 2.0, w: rc.w - 4.0, h: 15.0 };
+    let off = (rc.h - 34.0) / 2.0;
+    let time = RectF { x: rc.x + 2.0, y: rc.y + off + 2.0, w: rc.w - 4.0, h: 15.0 };
     r.fill_rounded_rect_gradient(time, 5.0, CLOCK_TOP, CLOCK_BOTTOM)?;
     r.draw_text_styled(&t.value, time, 11.0, 0xFFFF_FFFF, Align::Center, TextStyle::Bold)?;
 
@@ -423,30 +436,35 @@ fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
 
 fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
-    // .git-nums: 10 px line of muted numbers, then the heatmap.
-    let nums = RectF { x: rc.x + 7.0, y: rc.y + 3.0, w: rc.w - 14.0, h: 10.0 };
-    r.draw_text(&t.value, nums, 8.5, MUTED, Align::Left)?;
-
-    let cell = 5.0;
-    let gap = 1.5;
-    let rows = 3usize;
-    let top = rc.y + 15.0;
-    let left = rc.x + 7.0;
+    let off = (rc.h - 38.0) / 2.0;
+    // Right: the whole week (7 rows, Monday on top) for the last weeks, newest column at the edge.
+    // Left: today's commits (bold), then the week and streak totals.
+    let rows = 7usize;
+    let cols = (t.cells.len() / rows).max(1);
+    let gap = 1.0;
+    let cell = ((rc.h - 6.0 - (rows - 1) as f32 * gap) / rows as f32).clamp(2.5, 4.5);
+    let grid_w = cols as f32 * cell + (cols - 1) as f32 * gap;
+    let grid_h = rows as f32 * cell + (rows - 1) as f32 * gap;
+    let left = rc.x + rc.w - 7.0 - grid_w;
+    let top = rc.y + (rc.h - grid_h) / 2.0;
     for (i, level) in t.cells.iter().enumerate() {
         let (col, row) = (i / rows, i % rows);
-        let x = left + col as f32 * (cell + gap);
-        let y = top + row as f32 * (cell + gap);
         let color = match level {
             0 => HM_EMPTY,
             l => HM_LEVELS[(*l as usize - 1).min(3)],
         };
-        r.fill_rounded_rect(RectF { x, y, w: cell, h: cell }, 1.5, color)?;
+        let rect = RectF { x: left + col as f32 * (cell + gap), y: top + row as f32 * (cell + gap), w: cell, h: cell };
+        r.fill_rounded_rect(rect, 1.0, color)?;
     }
-    Ok(())
+    let text_w = (left - 6.0 - (rc.x + 8.0)).max(0.0);
+    r.draw_text_styled(&t.title, RectF { x: rc.x + 8.0, y: rc.y + off + 6.0, w: text_w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(&t.value, RectF { x: rc.x + 8.0, y: rc.y + off + 21.0, w: text_w, h: 11.0 }, 8.0, MUTED, Align::Left)
 }
+
 
 fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
+    let off = (rc.h - 34.0) / 2.0;
     let elapsed = {
         static START: OnceLock<Instant> = OnceLock::new();
         START.get_or_init(Instant::now).elapsed().as_secs_f32()
@@ -474,8 +492,8 @@ fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
     let x = rc.x + 65.0;
     let w = (rc.x + rc.w - 7.0 - x).max(0.0);
     // Full strings (Vietnamese diacritics intact); DirectWrite ellipsizes only when they overflow.
-    r.draw_text_styled(&t.title, RectF { x, y: rc.y + 4.0, w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(&t.sub, RectF { x, y: rc.y + 18.0, w, h: 11.0 }, 8.5, MUTED, Align::Left)
+    r.draw_text_styled(&t.title, RectF { x, y: rc.y + off + 4.0, w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(&t.sub, RectF { x, y: rc.y + off + 18.0, w, h: 11.0 }, 8.5, MUTED, Align::Left)
 }
 
 fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
@@ -548,7 +566,7 @@ pub fn shelf_for(first: RectF, last: RectF) -> RectF {
     RectF { x: first.x - pad, y: first.y, w: last.x + last.w - first.x + 2.0 * pad, h: first.h }
 }
 
-const SHELF_PAD: f32 = 5.0;
+const SHELF_PAD: f32 = 7.0;
 const SHELF_RADIUS: f32 = 12.0;
 
 /// One continuous, very light liquid-glass capsule behind the icon group (macOS Tahoe dock).
@@ -592,7 +610,7 @@ mod tests {
 
     #[test]
     fn dock_layout_shelf_snaps_to_device_pixels_with_equal_margins() {
-        let shelf = RectF { x: 650.0, y: 3.0, w: 600.0, h: super::super::apps::CLUSTER_H };
+        let shelf = RectF { x: 650.0, y: (DOCK_H - super::super::apps::CLUSTER_H) / 2.0, w: 600.0, h: super::super::apps::CLUSTER_H };
         for &scale in &[1.0f32, 1.25, 1.5, 1.75, 2.0] {
             let s = snap_to_pixels(shelf, scale);
             let (top, bottom) = (s.y * scale, (s.y + s.h) * scale);
@@ -603,7 +621,7 @@ mod tests {
             let (mt, mb) = (top, bar - bottom);
             assert!((mt - mb).abs() <= 1.0, "scale {scale}: {mt} vs {mb}");
         }
-        assert_eq!(snap_to_pixels(shelf, 1.0).y, 3.0);
+        assert_eq!(snap_to_pixels(shelf, 1.0).y, (DOCK_H - super::super::apps::CLUSTER_H) / 2.0);
     }
 
     #[test]
@@ -642,4 +660,71 @@ mod tests {
             }
         }
     }
+}
+
+/// One limit line of a `Style::Usage` tile.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UsageRow {
+    pub label: String,
+    /// 0..1 fill of the bar.
+    pub frac: f32,
+    /// Bar colour, 0xRRGGBBAA.
+    pub color: u32,
+    /// Reset time or note, right of the bar ("1h 25m", "Wed 28").
+    pub right: String,
+    /// Percentage text at the far right ("39%").
+    pub value: String,
+}
+
+/// Fixed pieces of a usage line, in DIPs.
+const USAGE_LABEL_W: f32 = 32.0;
+const USAGE_RESET_W: f32 = 30.0;
+const USAGE_PCT_W: f32 = 26.0;
+const USAGE_ROW_H: f32 = 11.0;
+const USAGE_ROW_GAP: f32 = 1.5;
+
+/// Provider card in the LumaBar style: icon plate, then label / bar / reset / percent per limit.
+fn draw_usage(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    let side = rc.h - 10.0;
+    let plate = RectF { x: rc.x + 6.0, y: rc.y + (rc.h - side) / 2.0, w: side, h: side };
+    r.fill_rounded_rect(plate, 8.0, if t.bg != 0 { t.bg } else { 0x2A2A_30FF })?;
+    let inset = side * 0.24;
+    let area = RectF { x: plate.x + inset, y: plate.y + inset, w: side - 2.0 * inset, h: side - 2.0 * inset };
+    if let Some(icon) = &t.icon {
+        r.draw_bitmap(icon.w, icon.h, &icon.rgba, area)?;
+    } else if let Some((d, stroke)) = t.glyph {
+        svgpath::draw_path(r, d, area, 24.0, 0xFFFF_FFFF, stroke)?;
+        if t.title == "Cursor" {
+            svgpath::draw_path(r, svgpath::CURSOR_CUBE_INNER, area, 24.0, 0xE8E8_E8FF, Some(1.2))?;
+            svgpath::draw_path(r, svgpath::CURSOR_CUBE_TOP, area, 24.0, 0xE8E8_E8D9, None)?;
+        }
+    }
+    let left = plate.x + plate.w + 7.0;
+    let right = rc.x + rc.w - 7.0;
+    let n = t.rows.len().max(1) as f32;
+    let total = n * USAGE_ROW_H + (n - 1.0) * USAGE_ROW_GAP;
+    let top = rc.y + (rc.h - total) / 2.0;
+    for (i, row) in t.rows.iter().enumerate() {
+        let y = top + i as f32 * (USAGE_ROW_H + USAGE_ROW_GAP);
+        r.draw_text_styled(&row.label, RectF { x: left, y, w: USAGE_LABEL_W, h: USAGE_ROW_H }, 8.5, TEXT, Align::Left, TextStyle::Bold)?;
+        let pct = RectF { x: right - USAGE_PCT_W, y, w: USAGE_PCT_W, h: USAGE_ROW_H };
+        r.draw_text_styled(&row.value, pct, 9.0, TEXT, Align::Right, TextStyle::Bold)?;
+        let mut bar_right = pct.x - 4.0;
+        // Narrow card (dock squeezed): drop the reset text so the bar keeps a usable length.
+        let bar_left = left + USAGE_LABEL_W + 4.0;
+        let room_with_reset = pct.x - 4.0 - USAGE_RESET_W - 4.0 - bar_left;
+        if !row.right.is_empty() && room_with_reset >= 30.0 {
+            let reset = RectF { x: pct.x - 4.0 - USAGE_RESET_W, y, w: USAGE_RESET_W, h: USAGE_ROW_H };
+            r.draw_text(&row.right, reset, 7.5, MUTED, Align::Right)?;
+            bar_right = reset.x - 4.0;
+        }
+        let track = RectF { x: bar_left, y: y + (USAGE_ROW_H - 3.0) / 2.0, w: (bar_right - bar_left).max(8.0), h: 3.0 };
+        r.fill_rounded_rect(track, 1.5, RING_TRACK)?;
+        let fill_w = track.w * row.frac.clamp(0.0, 1.0);
+        if fill_w > 0.0 {
+            r.fill_rounded_rect(RectF { w: fill_w.max(3.0), ..track }, 1.5, row.color)?;
+        }
+    }
+    Ok(())
 }

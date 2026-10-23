@@ -32,10 +32,16 @@ const HM_COLS: usize = 17;
 const HM_ROWS: usize = 7;
 const HM_H: f32 = HM_ROWS as f32 * HM_CELL + (HM_ROWS - 1) as f32 * HM_GAP;
 const SPARK_H: f32 = 40.0;
-const BTN_D: f32 = 38.0;
-const BTN_GAP: f32 = 10.0;
-/// Media buttons sit this far below the top of the body (fixed, so hit testing needs no data).
-const MEDIA_BTN_Y: f32 = SEC_TITLE_H + 109.0;
+const MEDIA_SIDE_D: f32 = 40.0;
+const MEDIA_PLAY_D: f32 = 52.0;
+const MEDIA_GAP: f32 = 18.0;
+/// Play button top, below the top of the body (fixed, so hit testing needs no data).
+const MEDIA_PLAY_Y: f32 = 148.0;
+const WAVE_BARS: usize = 38;
+const WAVE_H: f32 = 44.0;
+const WAVE_BAR_W: f32 = 4.0;
+const WAVE_FROM: u32 = 0xA78B_FAFF;
+const WAVE_TO: u32 = 0xF472_B6FF;
 
 const TEXT: u32 = 0xFFFF_FFE6;
 const MUTED: u32 = 0xFFFF_FF8C; // rgba(255,255,255,.55)
@@ -51,8 +57,6 @@ const WHITE: u32 = 0xFFFF_FFFF;
 const BTN: u32 = 0xFFFF_FF14; // .mctl span, .08
 const BTN_BIG: u32 = 0xFFFF_FFEB; // .mctl span.big, .92
 const BTN_BIG_TEXT: u32 = 0x1111_11FF;
-const WAVE_COLOR: u32 = 0xC7A6_FFFF;
-const WAVE_COLOR_IDLE: u32 = 0xC7A6_FF8C;
 const TODAY: u32 = 0xE832_1EFF; // .month .today
 const GREEN: u32 = 0x3FD2_7FFF;
 const ORANGE: u32 = 0xFFB3_40FF;
@@ -60,7 +64,6 @@ const RED: u32 = 0xFF5D_5DFF;
 const BLUE: u32 = 0x4AA8_FFFF;
 /// Heatmap levels: empty, then 4 greens (.hm.l0..l4).
 const HEAT: [u32; 5] = [0xFFFF_FF14, 0x0E44_29FF, 0x006D_32FF, 0x26A6_41FF, 0x39D3_53FF];
-const WAVE: [f32; 14] = [8.0, 14.0, 22.0, 10.0, 26.0, 16.0, 6.0, 18.0, 28.0, 12.0, 20.0, 8.0, 16.0, 24.0];
 
 const PREV: &str = "\u{E892}";
 const NEXT: &str = "\u{E893}";
@@ -94,6 +97,7 @@ pub enum PopupKind {
     Cpu,
     Ram,
     Settings,
+    Todo,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,11 +249,6 @@ pub fn hit_media_button(x: f32, y: f32, rect: RectF) -> Option<MediaAction> {
         .map(|(_, a)| a)
 }
 
-fn media_buttons(rect: RectF) -> [RectF; 3] {
-    let y = rect.y + HEAD_H + MEDIA_BTN_Y;
-    [0.0, 1.0, 2.0].map(|i| rect_at(rect.x + PAD_X + i * (BTN_D + BTN_GAP), y, BTN_D, BTN_D))
-}
-
 // ---------------------------------------------------------------- drawing context
 
 /// Drawing target. With `r == None` it only advances the layout (dry run for `content_height`).
@@ -361,6 +360,13 @@ fn meta(kind: PopupKind) -> Meta {
         PopupKind::Cpu => Meta { glyph: "◔", color: 0x30A4_6CFF, title: "CPU", badge: None, note: LOCAL_NOTE },
         PopupKind::Ram => Meta { glyph: "◔", color: 0x3E63_DDFF, title: "RAM", badge: None, note: LOCAL_NOTE },
         PopupKind::Settings => Meta { glyph: "⚙", color: 0x6B6B_75FF, title: "Cài đặt SmartDock", badge: None, note: "" },
+        PopupKind::Todo => Meta {
+            glyph: "✓",
+            color: 0x3FD2_7FFF,
+            title: "Việc cần làm",
+            badge: None,
+            note: "Bấm vào việc để đánh dấu xong, bấm dấu × để xoá.",
+        },
     }
 }
 
@@ -544,6 +550,7 @@ fn draw_all(c: &mut Ctx<'_>, kind: PopupKind, data: &DataState) -> Result<f32> {
         }
         PopupKind::Cpu | PopupKind::Ram => draw_system(c, top, kind, &hist)?,
         PopupKind::Settings => draw_settings(c, top, data)?,
+        PopupKind::Todo => draw_todo(c, top)?,
     };
     footer(c, y, m.note)
 }
@@ -725,26 +732,80 @@ fn draw_month(c: &mut Ctx<'_>, y: f32) -> Result<f32> {
     section_end(c, y)
 }
 
-fn draw_media(c: &mut Ctx<'_>, y: f32, m: Option<&Media>) -> Result<f32> {
-    let y = section(c, y, "ĐANG PHÁT")?;
+thread_local! {
+    /// Start of the wave animation clock, and the latest audio peak (0..1) while media is open.
+    static WAVE_START: std::time::Instant = std::time::Instant::now();
+    static MEDIA_PEAK: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
+
+/// Updates the open media popup in place (called ~25x per second): the session state and the
+/// audio level that drives the wave.
+pub fn update_media(media: Option<Media>, peak: f32) {
+    MEDIA_PEAK.with(|p| p.set(peak));
+    CONTENT.with(|c| {
+        if let Some((_, data)) = c.borrow_mut().as_mut() {
+            data.media = media;
+        }
+    });
+}
+
+fn lerp_color(a: u32, b: u32, t: f32) -> u32 {
+    let ch = |shift: u32| {
+        let (x, y) = (((a >> shift) & 0xFF) as f32, ((b >> shift) & 0xFF) as f32);
+        ((x + (y - x) * t).round() as u32) << shift
+    };
+    ch(24) | ch(16) | ch(8) | ch(0)
+}
+
+/// Media buttons: previous, play/pause (bigger), next, centred under the title.
+fn media_buttons(rect: RectF) -> [RectF; 3] {
+    let total = MEDIA_SIDE_D * 2.0 + MEDIA_PLAY_D + MEDIA_GAP * 2.0;
+    let x0 = rect.x + (rect.w - total) / 2.0;
+    let play_y = rect.y + HEAD_H + MEDIA_PLAY_Y;
+    let side_y = play_y + (MEDIA_PLAY_D - MEDIA_SIDE_D) / 2.0;
+    [
+        rect_at(x0, side_y, MEDIA_SIDE_D, MEDIA_SIDE_D),
+        rect_at(x0 + MEDIA_SIDE_D + MEDIA_GAP, play_y, MEDIA_PLAY_D, MEDIA_PLAY_D),
+        rect_at(x0 + MEDIA_SIDE_D + MEDIA_PLAY_D + MEDIA_GAP * 2.0, side_y, MEDIA_SIDE_D, MEDIA_SIDE_D),
+    ]
+}
+
+fn draw_media(c: &mut Ctx<'_>, top: f32, m: Option<&Media>) -> Result<f32> {
     let playing = m.is_some_and(|m| m.playing);
     let (x, w) = (c.inner_x(), c.inner_w());
+    let t = WAVE_START.with(|s| s.elapsed().as_secs_f32());
+    let peak = MEDIA_PEAK.with(|p| p.get()).clamp(0.0, 1.0);
 
-    // .np: wave box (static here, no animation), title, artist, status, then the controls.
-    for (i, full) in WAVE.iter().enumerate() {
-        let h = if playing { *full } else { 4.0 };
-        let color = if playing { WAVE_COLOR } else { WAVE_COLOR_IDLE };
-        c.round(rect_at(x + i as f32 * 4.0, y + 6.0 + (30.0 - h) / 2.0, 2.0, h), 1.0, color)?;
+    // Equalizer: bars follow the audio level while playing, and rest as small dots when paused.
+    let wave_y = top + 16.0;
+    let n = WAVE_BARS;
+    let pitch = w / n as f32;
+    let amp = (0.35 + peak * 1.9).min(1.0);
+    for i in 0..n {
+        let k = i as f32;
+        let env = 0.5 + 0.5 * (std::f32::consts::PI * (k + 0.5) / n as f32).sin();
+        let s = 0.5 + 0.28 * (t * 6.0 + k * 0.7).sin() + 0.22 * (t * 3.7 + k * 1.3).sin();
+        let h = if playing { 5.0 + (WAVE_H - 5.0) * (s * amp * env).clamp(0.0, 1.0) } else { 4.0 };
+        let base = lerp_color(WAVE_FROM, WAVE_TO, k / (n - 1) as f32);
+        let color = if playing { base } else { (base & 0xFFFF_FF00) | 0x70 };
+        c.round(rect_at(x + k * pitch + (pitch - WAVE_BAR_W) / 2.0, wave_y + (WAVE_H - h) / 2.0, WAVE_BAR_W, h), WAVE_BAR_W / 2.0, color)?;
     }
+
     let title = m
         .map(|m| m.title.as_str())
         .filter(|t| !t.is_empty())
         .unwrap_or("Không có ứng dụng nào đang phát");
-    c.text(title, rect_at(x, y + 40.0, w, 20.0), font(15.0, TEXT).bold())?;
-    c.text(m.map_or("", |m| m.artist.as_str()), rect_at(x, y + 64.0, w, 16.0), font(11.0, MUTED))?;
+    c.text(title, rect_at(x, top + 70.0, w, 22.0), font(15.5, TEXT).bold().center())?;
+    c.text(m.map_or("", |m| m.artist.as_str()), rect_at(x, top + 94.0, w, 16.0), font(11.5, MUTED).center())?;
+
+    // Status pill with a coloured dot.
     if m.is_some() {
-        let status = if playing { "Đang phát" } else { "Tạm dừng" };
-        c.text(status, rect_at(x, y + 84.0, w, 13.0), font(9.5, MUTED))?;
+        let (label, dot) = if playing { ("Đang phát", GREEN) } else { ("Tạm dừng", ORANGE) };
+        let pill_w = 24.0 + label.chars().count() as f32 * 5.6;
+        let px = x + (w - pill_w) / 2.0;
+        c.round(rect_at(px, top + 116.0, pill_w, 18.0), 9.0, BADGE_BG)?;
+        c.round(rect_at(px + 8.0, top + 116.0 + 6.0, 6.0, 6.0), 3.0, dot)?;
+        c.text(label, rect_at(px + 18.0, top + 116.0, pill_w - 22.0, 18.0), font(9.5, BADGE_TEXT))?;
     }
 
     // Buttons use the same rects as `hit_media_button`.
@@ -752,9 +813,99 @@ fn draw_media(c: &mut Ctx<'_>, y: f32, m: Option<&Media>) -> Result<f32> {
     let play_glyph = if playing { PAUSE } else { PLAY };
     for (b, glyph, big) in [(prev, PREV, false), (play, play_glyph, true), (next, NEXT, false)] {
         c.round(b, b.w / 2.0, if big { BTN_BIG } else { BTN })?;
-        c.text(glyph, b, font(14.0, if big { BTN_BIG_TEXT } else { TEXT }).icon().center())?;
+        c.text(glyph, b, font(if big { 18.0 } else { 14.0 }, if big { BTN_BIG_TEXT } else { TEXT }).icon().center())?;
     }
-    section_end(c, y + 159.0)
+    section_end(c, top + MEDIA_PLAY_Y + MEDIA_PLAY_D + 16.0)
+}
+
+// ---------------------------------------------------------------- to-do
+
+const TODO_ROW_H: f32 = 32.0;
+const TODO_MAX_SHOWN: usize = 8;
+
+/// Click targets in the To-do popup; indexes are positions in the settings list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TodoAction {
+    Toggle(usize),
+    Delete(usize),
+    AddFromClipboard,
+    ClearDone,
+}
+
+fn todo_state() -> (Vec<crate::settings::TodoItem>, usize) {
+    let items = SETTINGS_STATE.with(|s| s.borrow().todos.clone());
+    let shown = items.len().min(TODO_MAX_SHOWN);
+    (items, shown)
+}
+
+/// Rect of the list row `i` (body top = `top`).
+fn todo_row(top: f32, rect: RectF, i: usize) -> RectF {
+    rect_at(rect.x + 6.0, top + 8.0 + i as f32 * TODO_ROW_H, rect.w - 12.0, TODO_ROW_H)
+}
+
+/// Add / clear buttons below the list.
+fn todo_buttons(top: f32, rect: RectF, shown: usize, any_done: bool) -> (RectF, Option<RectF>) {
+    // An empty list still reserves one row for its hint.
+    let list_h = shown.max(1) as f32 * TODO_ROW_H;
+    let y = top + 8.0 + list_h + 10.0;
+    let add = rect_at(rect.x + 6.0, y, rect.w - 12.0, 32.0);
+    let clear = any_done.then(|| rect_at(rect.x + 6.0, y + 34.0, rect.w - 12.0, 32.0));
+    (add, clear)
+}
+
+pub fn hit_todo(x: f32, y: f32, rect: RectF) -> Option<TodoAction> {
+    let top = rect.y + HEAD_H;
+    let (items, shown) = todo_state();
+    for i in 0..shown {
+        let row = todo_row(top, rect, i);
+        if contains(row, x, y) {
+            return Some(if x >= row.x + row.w - 30.0 { TodoAction::Delete(i) } else { TodoAction::Toggle(i) });
+        }
+    }
+    let (add, clear) = todo_buttons(top, rect, shown, items.iter().any(|t| t.done));
+    if contains(add, x, y) {
+        return Some(TodoAction::AddFromClipboard);
+    }
+    clear.filter(|c| contains(*c, x, y)).map(|_| TodoAction::ClearDone)
+}
+
+fn draw_todo(c: &mut Ctx<'_>, top: f32) -> Result<f32> {
+    let (items, shown) = todo_state();
+    let rect = c.rect;
+    if items.is_empty() {
+        c.text("Chưa có việc nào. Sao chép một dòng chữ rồi bấm nút bên dưới.", rect_at(c.inner_x(), top + 12.0, c.inner_w(), 28.0), font(10.5, EMPTY_TEXT))?;
+    }
+    for (i, item) in items.iter().take(shown).enumerate() {
+        let row = todo_row(top, rect, i);
+        if i % 2 == 1 {
+            c.round(row, 8.0, STRIPE)?;
+        }
+        let ring = rect_at(row.x + 8.0, row.y + 7.0, 18.0, 18.0);
+        if item.done {
+            c.round(ring, 9.0, GREEN)?;
+            c.text("✓", ring, font(11.0, 0x0B1A_10FF).bold().center())?;
+        } else {
+            c.round(ring, 9.0, 0xFFFF_FF55)?;
+            c.round(rect_at(ring.x + 1.5, ring.y + 1.5, 15.0, 15.0), 7.5, 0x1C1E_24FF)?;
+        }
+        let color = if item.done { MUTED } else { TEXT };
+        c.text(&item.text, rect_at(row.x + 34.0, row.y, row.w - 34.0 - 34.0, row.h), font(11.5, color))?;
+        c.text("\u{E711}", rect_at(row.x + row.w - 28.0, row.y, 22.0, row.h), font(10.0, MUTED).icon().center())?;
+    }
+    let (add, clear) = todo_buttons(top, rect, shown, items.iter().any(|t| t.done));
+    c.round(add, 9.0, BTN)?;
+    c.text("＋  Thêm từ clipboard", add, font(11.0, TEXT).center())?;
+    let mut bottom = add.y + add.h;
+    if let Some(clear) = clear {
+        c.round(clear, 9.0, BTN)?;
+        c.text("Xoá việc đã xong", clear, font(11.0, MUTED).center())?;
+        bottom = clear.y + clear.h;
+    }
+    if items.len() > shown {
+        c.text(&format!("+{} việc nữa", items.len() - shown), rect_at(c.inner_x(), bottom + 4.0, c.inner_w(), 14.0), font(9.5, MUTED))?;
+        bottom += 16.0;
+    }
+    section_end(c, bottom + 8.0)
 }
 
 /// CPU or RAM: one usage row, then a sparkline of the sample history.

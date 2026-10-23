@@ -183,13 +183,15 @@ pub fn refresh_git(repos: &[PathBuf], configured_author: &str) -> GitSummary {
     let mut error = None;
 
     let git_available = git(&["--version"], None).is_some();
-    let author = if configured_author.trim().is_empty() {
-        git(&["config", "--global", "user.email"], None)
-            .map(|o| o.trim().to_owned())
-            .unwrap_or_default()
-    } else {
-        configured_author.trim().to_owned()
-    };
+    // Several identities may be given in Settings, separated by ";" or ",".
+    let configured: Vec<String> = configured_author
+        .split([';', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let global_email = git(&["config", "--global", "user.email"], None).map(|o| o.trim().to_owned()).unwrap_or_default();
+    let author = if configured.is_empty() { global_email.clone() } else { configured.join(", ") };
 
     let repo_dirs = if repos.is_empty() {
         discover_repos()
@@ -208,10 +210,25 @@ pub fn refresh_git(repos: &[PathBuf], configured_author: &str) -> GitSummary {
             repos.len()
         ));
     } else {
-        let author_arg = format!("--author={author}");
         let since = format!("--since={DAYS} days ago");
         for repo in &repo_dirs {
-            let args = ["log", "--all", author_arg.as_str(), since.as_str(), "--date=short", "--pretty=format:%ad"];
+            // Without configured identities: the global email plus this repo's own user.email / user.name.
+            let mut ids = configured.clone();
+            if ids.is_empty() {
+                ids.push(global_email.clone());
+                for key in ["user.email", "user.name"] {
+                    if let Some(v) = git(&["config", key], Some(repo.as_path())).map(|o| o.trim().to_owned()) {
+                        if !v.is_empty() && !ids.contains(&v) {
+                            ids.push(v);
+                        }
+                    }
+                }
+            }
+            // Several --author options match any of them.
+            let mut args: Vec<String> = vec!["log".into(), "--all".into()];
+            args.extend(ids.iter().map(|i| format!("--author={i}")));
+            args.extend([since.clone(), "--date=short".into(), "--pretty=format:%ad".into()]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
             for line in git(&args, Some(repo.as_path())).unwrap_or_default().lines() {
                 let day = line.trim();
                 if !day.is_empty() {

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::dock::RectF;
 use super::liquid::LiquidBitmap;
-use super::renderer::{apply_acrylic, Renderer};
+use super::renderer::Renderer;
 
 /// Default Settings > Glass opacity (percent).
 pub const DEFAULT_OPACITY_PCT: u8 = 55;
@@ -23,16 +23,9 @@ pub const PLATE_RADIUS: f32 = 12.0;
 /// Start tile height / app plate edge length, DIP (matches `TILE_H`).
 pub const PLATE_SIZE: f32 = 34.0;
 
-/// Enables acrylic blur on the dock window, tinted by `opacity_pct` (0..=95 effective).
-/// If the API is missing, the window keeps only the CSS fallback.
-pub fn apply_dock_glass(hwnd: HWND, opacity_pct: u8) {
-    let pct = opacity_pct.min(MAX_OPACITY_PCT) as u32;
-    // Scale 0..=100 to 0..=255 with rounding.
-    let alpha = (pct * 255 + 50) / 100;
-    let tint_argb = (alpha << 24) | TINT_RGB;
-    // Returns false on pre-1809 Windows; nothing else to do in that case.
-    let _ = apply_acrylic(hwnd, tint_argb);
-}
+/// The dock bar is invisible (the window is truly transparent), so no acrylic is applied; the
+/// Glass opacity setting only affects the tiles and popups.
+pub fn apply_dock_glass(_hwnd: HWND, _opacity_pct: u8) {}
 
 /// Liquid-glass plate shared by the Start button and centre app icons.
 pub fn draw_liquid_plate(r: &mut Renderer, rect: RectF, radius: f32, hovered: bool) -> Result<()> {
@@ -81,6 +74,18 @@ thread_local! {
     static PIECES: RefCell<HashMap<PieceKey, Arc<Piece>>> = RefCell::new(HashMap::new());
 }
 
+/// Dock style for the tiles: 0 glass, 1 midnight, 2 black.
+static STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_style(id: &str) {
+    let v = match id {
+        "midnight" => 1,
+        "black" => 2,
+        _ => 0,
+    };
+    STYLE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Sets the backdrop that glass pieces sample for the dock being painted. `bar_w`/`bar_h` are
 /// the bar size in DIPs (the backdrop bitmap covers exactly that). Pass None for surfaces with
 /// no wallpaper backdrop (popups use DWM acrylic underneath instead).
@@ -105,6 +110,17 @@ pub fn draw_glass(r: &mut Renderer, rect: RectF, radius: f32, layer: Layer, hove
         Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
         // No backdrop (yet): light neutral frost rather than a dark slab.
         None => r.fill_rounded_rect(rect, radius, if layer == Layer::Plate { 0xB4AA_A04D } else { 0x8C84_7C59 })?,
+    }
+    if layer == Layer::Tile {
+        // Dock style: a tint over the glass (Glass keeps the clear material as is).
+        let tint = match STYLE.load(std::sync::atomic::Ordering::Relaxed) {
+            1 => 0x0A10_2CA6, // midnight: deep navy
+            2 => 0x0000_00C8, // black
+            _ => 0,
+        };
+        if tint != 0 {
+            r.fill_rounded_rect(rect, radius, tint)?;
+        }
     }
     if hovered {
         // Glow: the piece lights up a little; no geometry change.
