@@ -200,9 +200,17 @@ pub fn draw_search_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()
 }
 
 /// Index into `state.windows` for the slot under (x, y).
-pub fn hit_app_index(x: f32, y: f32, rect: RectF, state: &AppsState) -> Option<usize> {
-    let slots = slots(rect, state.windows.len());
-    hit_test(x, y, &slots)
+///
+/// Horizontal only: every x inside the apps tile belongs to the nearest-left slot (the 5-DIP gaps
+/// are split between neighbours), and any height counts, so a click at the very bottom edge of the
+/// screen (where the pointer tends to rest) or between two icons is never swallowed. Callers gate on
+/// the dock's own bounds.
+pub fn hit_app_index(x: f32, _y: f32, rect: RectF, state: &AppsState) -> Option<usize> {
+    if x < rect.x || x >= rect.x + rect.w {
+        return None;
+    }
+    let half_gap = GAP / 2.0;
+    slots(rect, state.windows.len()).iter().position(|s| x >= s.x - half_gap && x < s.x + s.w + half_gap)
 }
 
 /// Slot rect for window index `i`, if it fits.
@@ -508,12 +516,17 @@ mod tests {
                 assert_eq!(hit_app_index(x, y, rect, &state), Some(i), "slot n={n} i={i}");
                 assert_eq!(state.windows[hit_app_index(x, y, rect, &state).unwrap()].hwnd, 100 + i as isize);
             }
-            // The 5-DIP gaps between icons are not part of any slot.
+            // The 5-DIP gaps between icons are split between the neighbours: no dead zone.
             if n > 1 {
                 let s0 = slot_rect(rect, &state, 0).unwrap();
                 assert_eq!(s0.w, ICON);
-                assert_eq!(hit_app_index(s0.x + s0.w + GAP / 2.0, s0.y + s0.h / 2.0, rect, &state), None);
+                let mid_y = s0.y + s0.h / 2.0;
+                assert_eq!(hit_app_index(s0.x + s0.w + GAP / 2.0 - 0.1, mid_y, rect, &state), Some(0));
+                assert_eq!(hit_app_index(s0.x + s0.w + GAP / 2.0, mid_y, rect, &state), Some(1));
             }
+            // Any height counts: the bottom screen edge must not be a dead strip.
+            let s0 = slot_rect(rect, &state, 0).unwrap();
+            assert_eq!(hit_app_index(s0.x + s0.w / 2.0, rect.y + rect.h + 6.0, rect, &state), Some(0));
             // Outside the cluster nothing is hit.
             let y = rect.y + rect.h / 2.0;
             assert_eq!(hit_app_index(rect.x - 1.0, y, rect, &state), None);

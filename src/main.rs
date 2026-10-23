@@ -1190,6 +1190,15 @@ fn near_apps(hwnd: HWND, x: f32) -> bool {
     })
 }
 
+/// Whether a dock-local point (DIP) is on tile `id`. The apps tile takes the dock's full height, not
+/// just its 34-DIP icon row, so clicks near the top/bottom edge still reach the icons.
+fn in_tile(id: &str, r: &RectF, x: f32, y: f32) -> bool {
+    if id == "apps" {
+        return x >= r.x && x < r.x + r.w && (0.0..DOCK_HEIGHT).contains(&y);
+    }
+    dock::hit_test(x, y, &[*r]).is_some()
+}
+
 fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
     thumbnails::hide();
     let anchor = APP.with(|a| {
@@ -1201,7 +1210,7 @@ fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
             let sec = app.secondaries.iter().find(|s| s.hwnd == hwnd)?;
             (&sec.tiles, sec.origin, sec.dpi)
         };
-        let (_, rect) = tiles.iter().find(|(id, r)| *id == "apps" && dock::hit_test(x, y, &[*r]).is_some())?;
+        let (_, rect) = tiles.iter().find(|(id, r)| in_tile(id, r, x, y))?;
         let idx = apps::hit_app_index(x, y, *rect, &app.apps)?;
         let w = &app.apps.windows[idx];
         let group: Vec<_> = apps::group_windows(&app.apps, w).into_iter().cloned().collect();
@@ -1308,7 +1317,7 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
         } else {
             return Click::None;
         };
-        let Some((id, rect)) = tiles.iter().find(|(_, r)| dock::hit_test(x, y, &[*r]).is_some()).copied() else {
+        let Some((id, rect)) = tiles.iter().find(|(id, r)| in_tile(id, r, x, y)).copied() else {
             return Click::None;
         };
         let scale = dpi::scale(dpi_value);
@@ -1321,6 +1330,16 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
         match id {
             "apps" => match apps::hit_app_index(x, y, rect, &app.apps).map(|i| &app.apps.windows[i]) {
                 Some(w) if w.hwnd == 0 => Click::Launch(w.exe.clone()),
+                // Closed since the last refresh: the entry still holds a dead handle, so a pinned app
+                // relaunches (as its launcher would) and an unpinned one just waits for the refresh.
+                // SAFETY: IsWindow on a possibly stale handle just returns false.
+                Some(w) if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(w.hwnd as _)) }.as_bool() => {
+                    if app.apps.pins.iter().any(|(exe, _)| exe.eq_ignore_ascii_case(&w.exe)) {
+                        Click::Launch(w.exe.clone())
+                    } else {
+                        Click::None
+                    }
+                }
                 Some(w) => Click::Activate(w.hwnd),
                 None => Click::None,
             },
@@ -2231,12 +2250,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_LBUTTONDOWN => {
             // Snapshot foreground + Start state before the click can change them.
             tasks::capture_click_state();
+            let (x, y) = client_point(lparam);
+            log(&format!("[{}] down at ({x},{y})", chrono::Local::now().format("%H:%M:%S%.3f")));
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONUP => {
             let (x, y) = client_point(lparam);
             let click = dock_click_on(hwnd, x, y);
-            log(&format!("click at ({x},{y}) -> {}", match &click {
+            log(&format!("[{}] click at ({x},{y}) -> {}", chrono::Local::now().format("%H:%M:%S%.3f"), match &click {
                 Click::None => "none",
                 Click::Activate(_) => "activate",
                 Click::Launch(_) => "launch pinned",
@@ -2246,6 +2267,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::Open(..) => "open popup",
                 Click::TrayOverflow(_) => "tray overflow",
             }));
+            // A click on an icon acts on the app itself; a lingering hover peek must not stay up
+            // and catch the next click (it would focus the window instead of toggling it).
+            if matches!(click, Click::Activate(_) | Click::Launch(_)) {
+                thumbnails::cancel_pending(hwnd);
+                thumbnails::hide();
+            }
             match click {
                 Click::None => tasks::dismiss_start_if_open(),
                 Click::Activate(h) => tasks::activate_window(h),

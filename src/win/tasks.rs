@@ -759,11 +759,12 @@ fn ts() -> String {
 /// Starts a new instance of an exe (or .lnk). Packaged apps go through the shell.
 pub fn launch_exe(exe: &str) {
     if exe.is_empty() || !PathBuf::from(exe).exists() {
+        crate::log(&format!("launch {exe:?}: path missing, nothing started"));
         return;
     }
     let wide: Vec<u16> = std::ffi::OsStr::new(exe).encode_wide().chain(Some(0)).collect();
     unsafe {
-        let _ = ShellExecuteW(
+        let r = ShellExecuteW(
             None,
             w!("open"),
             PCWSTR(wide.as_ptr()),
@@ -771,6 +772,10 @@ pub fn launch_exe(exe: &str) {
             None,
             SW_SHOWNORMAL,
         );
+        // ShellExecute reports failure as a value <= 32.
+        if r.0 as isize <= 32 {
+            crate::log(&format!("launch {exe:?}: ShellExecute failed ({})", r.0 as isize));
+        }
     }
 }
 

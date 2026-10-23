@@ -412,6 +412,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 })
             });
             if let Some(src) = target {
+                crate::log(&format!("peek click -> focus hwnd={src:#x}"));
                 hide();
                 focus_window(src);
             }
