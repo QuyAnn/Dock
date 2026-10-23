@@ -9,6 +9,7 @@ use windows::core::Result;
 
 use super::dock::RectF;
 use super::renderer::{Align, Renderer, TextStyle};
+use super::svgpath;
 use crate::data::git::GitSummary;
 use crate::data::weather::Weather;
 use crate::model::{AiUsage, GitDay, Media};
@@ -112,6 +113,9 @@ pub enum SettingsAction {
     OpenConfig,
     ToggleAutoPin,
     CycleAutoPinCount,
+    ToggleClaudeSource,
+    RefreshUsage,
+    CycleClaudeBudget,
 }
 
 
@@ -214,6 +218,15 @@ pub fn hit_settings(x: f32, y: f32, rect: RectF) -> Option<SettingsAction> {
         let chip = autopin_chip(auto);
         let on = SETTINGS_AUTO_ON.with(Cell::get);
         return Some(if on && contains(chip, x, y) { SettingsAction::CycleAutoPinCount } else { SettingsAction::ToggleAutoPin });
+    }
+    if contains(rect_at(inner_x, top + 485.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::ToggleClaudeSource);
+    }
+    if contains(rect_at(inner_x, top + 523.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::RefreshUsage);
+    }
+    if contains(rect_at(inner_x, top + 561.0, inner_w, 30.0), x, y) {
+        return Some(SettingsAction::CycleClaudeBudget);
     }
     None
 }
@@ -351,11 +364,43 @@ fn meta(kind: PopupKind) -> Meta {
     }
 }
 
+/// Provider logo on its own tile background, the same artwork as the dock tile. False for an unknown provider.
+fn ai_logo(c: &mut Ctx<'_>, x: f32, y: f32, provider: &str) -> Result<bool> {
+    let bg = match provider {
+        "Claude" => 0xD977_57FF,
+        "Codex" => 0x0D0D_0DFF,
+        "Cursor" => 0x1414_14FF,
+        "Grok" => 0x0000_00FF,
+        _ => return Ok(false),
+    };
+    c.round(rect_at(x, y, 24.0, 24.0), 7.0, bg)?;
+    let Some(r) = c.r.as_deref_mut() else { return Ok(true) };
+    let icon = rect_at(x + 4.0, y + 4.0, 16.0, 16.0);
+    match provider {
+        "Claude" => svgpath::draw_path(r, svgpath::CLAUDE_SPARK, icon, 24.0, 0xFFFF_FFFF, None)?,
+        "Codex" => svgpath::draw_path(r, svgpath::CODEX_ORBITS, icon, 24.0, 0xFFFF_FFFF, Some(1.7))?,
+        "Grok" => svgpath::draw_path(r, svgpath::GROK_SLASH, icon, 24.0, 0xFFFF_FFFF, Some(2.0))?,
+        _ => {
+            svgpath::draw_path(r, svgpath::CURSOR_CUBE, icon, 24.0, 0xE8E8_E8FF, Some(1.5))?;
+            svgpath::draw_path(r, svgpath::CURSOR_CUBE_INNER, icon, 24.0, 0xE8E8_E8FF, Some(1.2))?;
+            svgpath::draw_path(r, svgpath::CURSOR_CUBE_TOP, icon, 24.0, 0xE8E8_E8D9, None)?;
+        }
+    }
+    Ok(true)
+}
+
 /// .phead: 24px colored icon, 13.5px title, optional badge at the right edge.
-fn header(c: &mut Ctx<'_>, m: &Meta) -> Result<()> {
+/// The AI popup shows the selected provider's logo instead of the generic glyph.
+fn header(c: &mut Ctx<'_>, m: &Meta, provider: Option<&str>) -> Result<()> {
     let (x, y) = (c.rect.x + PAD_X, c.rect.y + 12.0);
-    c.round(rect_at(x, y, 24.0, 24.0), 7.0, m.color)?;
-    c.text(m.glyph, rect_at(x, y, 24.0, 24.0), font(13.0, WHITE).center())?;
+    let logo_drawn = match provider {
+        Some(name) => ai_logo(c, x, y, name)?,
+        None => false,
+    };
+    if !logo_drawn {
+        c.round(rect_at(x, y, 24.0, 24.0), 7.0, m.color)?;
+        c.text(m.glyph, rect_at(x, y, 24.0, 24.0), font(13.0, WHITE).center())?;
+    }
 
     // Badge width is estimated: the renderer cannot measure text.
     let badge_w = m.badge.as_ref().map(|b| b.chars().count() as f32 * 5.4 + 14.0);
@@ -481,7 +526,11 @@ fn ai_color(v: f32) -> u32 {
 
 fn draw_all(c: &mut Ctx<'_>, kind: PopupKind, data: &DataState) -> Result<f32> {
     let m = meta(kind);
-    header(c, &m)?;
+    let provider = match kind {
+        PopupKind::Ai => AI_PROVIDER.with(|p| *p.borrow()),
+        _ => None,
+    };
+    header(c, &m, provider)?;
     let top = c.rect.y + HEAD_H;
     let hist = history(kind);
     let y = match kind {
@@ -570,10 +619,9 @@ fn draw_ai(c: &mut Ctx<'_>, y: f32, ai: &[AiUsage]) -> Result<f32> {
     let providers = ai.iter().filter(|u| selected.is_none_or(|name| u.name == name));
     let mut row_index = 0usize;
     for u in providers {
-        if u.windows.is_empty() {
+        if u.windows.is_empty() && u.cost_usd.is_none() {
             y = row(c, y, row_index, &u.name, Some(u.reset_text.as_str()), None, None)?;
             row_index += 1;
-            continue;
         }
         for window in &u.windows {
             let value = format!("{:.0}%", window.used_pct);
@@ -587,6 +635,14 @@ fn draw_ai(c: &mut Ctx<'_>, y: f32, ai: &[AiUsage]) -> Result<f32> {
                 Some(value.as_str()),
                 Some(((window.used_pct / 100.0).clamp(0.0, 1.0), ai_color(window.used_pct))),
             )?;
+            row_index += 1;
+        }
+        if let Some(cost) = u.cost_usd {
+            let budget = SETTINGS_STATE.with(|s| s.borrow().claude_monthly_budget).max(1) as f32;
+            let pct = cost as f32 / budget * 100.0;
+            let value = format!("${cost:.2} / ${budget:.0}");
+            let bar = Some(((pct / 100.0).clamp(0.0, 1.0), ai_color(pct)));
+            y = row(c, y, row_index, "Đã dùng tháng này", None, Some(value.as_str()), bar)?;
             row_index += 1;
         }
     }
@@ -821,13 +877,26 @@ fn draw_settings(c: &mut Ctx<'_>, y: f32, data: &DataState) -> Result<f32> {
     )?;
     setting_value(c, rect_at(x, y + 409.0, w, 30.0), "Phím tắt ẩn / hiện", &settings.shortcut)?;
     autopin_row(c, rect_at(x, y + 447.0, w, 30.0), settings.auto_pin, settings.auto_pin_count)?;
+    setting_value(
+        c,
+        rect_at(x, y + 485.0, w, 30.0),
+        "Nguồn hạn mức Claude",
+        if settings.claude_source == "apikey" { "API key · chi phí tháng" } else { "Đăng nhập Claude Code" },
+    )?;
     let git_hint = data
         .git
         .as_ref()
         .and_then(|g| g.error.as_deref())
         .unwrap_or("Bấm Địa điểm hoặc Git / email để sửa settings.json.");
-    c.text(git_hint, rect_at(x, y + 485.0, w, 28.0), font(9.0, MUTED))?;
-    Ok(y + 522.0)
+    setting_value(c, rect_at(x, y + 523.0, w, 30.0), "Hạn mức AI", "Làm mới ngay")?;
+    setting_value(
+        c,
+        rect_at(x, y + 561.0, w, 30.0),
+        "Hạn mức tháng (Claude)",
+        &format!("{} US$", settings.claude_monthly_budget),
+    )?;
+    c.text(git_hint, rect_at(x, y + 599.0, w, 28.0), font(9.0, MUTED))?;
+    Ok(y + 636.0)
 }
 
 thread_local! {

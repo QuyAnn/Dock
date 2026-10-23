@@ -1,9 +1,10 @@
-//! AI usage for Claude, Codex and Cursor, read from the user's own local sign-ins.
+//! AI usage for Claude, Codex, Cursor and Grok Bot, read from the user's own local sign-ins.
 //! Credentials are read at request time only, never logged, cached to disk, or sent anywhere but the provider.
-//! Grok Bot is a desktop app tile (see win::grokbot) — not an AI usage provider.
+//! Grok Bot's tile (see win::grokbot) only launches the app; its usage uses the Cursor sign-in.
 use std::path::{Path, PathBuf};
 use std::ffi::{c_char, c_int, c_uchar, c_void, CStr, CString};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -20,14 +21,23 @@ const CLAUDE_MIN_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// Last successful Claude result, reused within CLAUDE_MIN_INTERVAL.
 static CLAUDE_CACHE: Mutex<Option<(Instant, AiUsage)>> = Mutex::new(None);
 
+/// Settings choice: true reads the rate limits with ANTHROPIC_API_KEY, false uses the Claude Code sign-in.
+static CLAUDE_USE_API_KEY: AtomicBool = AtomicBool::new(false);
+
+/// Switches the Claude source from Settings. Drops the cached result so the next refresh uses the new source.
+pub fn set_claude_source(use_api_key: bool) {
+    CLAUDE_USE_API_KEY.store(use_api_key, Ordering::Relaxed);
+    *CLAUDE_CACHE.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
 /// Usage for each provider. A provider with no data gets `session_pct = NaN`
 /// and a short status (sign-in needed, error, ...) in `reset_text`.
 pub fn refresh_ai() -> Vec<AiUsage> {
-    vec![claude(), codex(), cursor()]
+    vec![claude(), codex(), cursor(), grok()]
 }
 
 fn no_data(name: &str, status: &str) -> AiUsage {
-    AiUsage { name: name.to_owned(), session_pct: f32::NAN, reset_text: status.to_owned(), windows: Vec::new() }
+    AiUsage { name: name.to_owned(), session_pct: f32::NAN, reset_text: status.to_owned(), windows: Vec::new(), cost_usd: None }
 }
 
 fn usage(name: &str, windows: Vec<AiWindow>) -> AiUsage {
@@ -37,6 +47,7 @@ fn usage(name: &str, windows: Vec<AiWindow>) -> AiUsage {
         session_pct: primary.map_or(f32::NAN, |w| w.used_pct),
         reset_text: primary.map_or_else(String::new, |w| w.reset_text.clone()),
         windows,
+        cost_usd: None,
     }
 }
 
@@ -173,9 +184,160 @@ fn send_body(req: ureq::Request, body: &str) -> Result<Value, String> {
     }
 }
 
+// ---------------------------------------------------------------- Grok Bot
+
+/// Calls the usage RPC through the inbox `curl.exe`. The Cursor API answers 403 to the ureq
+/// request while the same request from curl.exe succeeds. The token goes over stdin as a curl
+/// config, so it never appears on the command line.
+fn grok_usage_via_curl(token: &str) -> Result<Value, String> {
+    use std::io::Write;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let root = std::env::var_os("SystemRoot").ok_or_else(|| "curl.exe not found".to_owned())?;
+    let mut child = Command::new(PathBuf::from(root).join("System32").join("curl.exe"))
+        .args([
+            "-sS", "-m", "15", "-K", "-", "-X", "POST", "-d", "{}", "-w", "\n%{http_code}",
+            "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|_| "curl.exe failed to start".to_owned())?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let config = format!(
+            "header = \"Authorization: Bearer {token}\"\nheader = \"Connect-Protocol-Version: 1\"\nheader = \"Content-Type: application/json\"\n"
+        );
+        let _ = stdin.write_all(config.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|_| "curl.exe failed".to_owned())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (body, code) = text.rsplit_once('\n').unwrap_or(("", text.as_ref()));
+    match code.trim() {
+        "200" => serde_json::from_str(body).map_err(|_| "unreadable response".to_owned()),
+        "401" | "403" => Err("sign-in expired, sign in again".to_owned()),
+        "429" => Err("rate limited, retrying later".to_owned()),
+        other => Err(format!("HTTP {other}")),
+    }
+}
+
+/// Grok Bot ("sand") usage. Grok Bot signs in through the Cursor account, so the Cursor access
+/// token from Cursor's own state DB authorizes the same DashboardService on the Cursor API host.
+fn grok() -> AiUsage {
+    const NAME: &str = "Grok";
+    let Some(appdata) = std::env::var_os("APPDATA") else {
+        return no_data(NAME, "sign in to Grok Bot");
+    };
+    let db_path = PathBuf::from(appdata).join("Cursor").join("User").join("globalStorage").join("state.vscdb");
+    if !db_path.is_file() {
+        return no_data(NAME, "sign in to Grok Bot");
+    }
+    let token = match cursor_auth(&db_path) {
+        Ok(rows) => match rows.into_iter().find(|(key, _)| key == "cursorAuth/accessToken") {
+            Some((_, value)) if !value.is_empty() => value,
+            _ => return no_data(NAME, "sign in to Grok Bot"),
+        },
+        Err(e) => {
+            log_provider(NAME, &e);
+            return no_data(NAME, "Grok auth error");
+        }
+    };
+
+    let json = match grok_usage_via_curl(&token) {
+        Ok(json) => json,
+        Err(e) => {
+            log_provider(NAME, &format!("usage endpoint failed: {e}"));
+            return no_data(NAME, &e);
+        }
+    };
+    let Some(pct) = json.get("usagePercent").and_then(Value::as_f64) else {
+        log_provider(NAME, "usage response has no usagePercent");
+        return no_data(NAME, "no usage data");
+    };
+    let reset = json.get("nextResetTimestampUtc").and_then(to_ms);
+    usage(NAME, vec![AiWindow {
+        label: "Plan (chu kỳ)".to_owned(),
+        used_pct: pct as f32,
+        reset_text: reset_text(reset),
+    }])
+}
+
 // ---------------------------------------------------------------- Claude
 
+/// Claude usage. API key mode shows only the month's API spend; login mode shows the sign-in's
+/// limits and adds the spend when an admin key is set.
 fn claude() -> AiUsage {
+    if CLAUDE_USE_API_KEY.load(Ordering::Relaxed) {
+        return match admin_month_cost() {
+            // session_pct must be NaN here: the Default value 0.0 would read as 0% used.
+            Some(cost) => AiUsage {
+                name: "Claude".to_owned(),
+                session_pct: f32::NAN,
+                cost_usd: Some(cost),
+                ..AiUsage::default()
+            },
+            None => no_data("Claude", "no cost data: check ANTHROPIC_ADMIN_KEY"),
+        };
+    }
+    let mut usage = claude_source_usage();
+    usage.cost_usd = admin_month_cost();
+    usage
+}
+
+/// Month-to-date API spend in USD from the Usage and Cost Admin API. Reads ANTHROPIC_ADMIN_KEY, then
+/// ANTHROPIC_ADMIN_KEY_1, and uses the first key that answers. Keys of the same organization report the
+/// same totals, so adding them together would count the spend twice.
+fn admin_month_cost() -> Option<f64> {
+    let keys = ["ANTHROPIC_ADMIN_KEY", "ANTHROPIC_ADMIN_KEY_1"]
+        .into_iter()
+        .filter_map(|var| std::env::var(var).ok().filter(|k| !k.trim().is_empty()).map(|key| (var, key)))
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        log_provider("Claude cost", "no admin key in the environment (ANTHROPIC_ADMIN_KEY)");
+        return None;
+    }
+    keys.into_iter().find_map(|(var, key)| match admin_cost_for(&key) {
+        Ok(total) => Some(total),
+        Err(e) => {
+            log_provider("Claude cost", &format!("{var}: {e}"));
+            None
+        }
+    })
+}
+
+/// Sums the cost report from the first day of this month (UTC). Amounts are USD in cents.
+fn admin_cost_for(key: &str) -> Result<f64, String> {
+    let now = chrono::Utc::now();
+    let start = now.format("%Y-%m-01T00:00:00Z").to_string();
+    let end = (now + chrono::Duration::days(1)).format("%Y-%m-%dT00:00:00Z").to_string();
+    let mut total_cents = 0.0;
+    let mut page: Option<String> = None;
+    for _ in 0..12 {
+        let mut url = format!(
+            "https://api.anthropic.com/v1/organizations/cost_report?starting_at={start}&ending_at={end}&bucket_width=1d&limit=31"
+        );
+        if let Some(next) = &page {
+            url.push_str("&page=");
+            url.push_str(next);
+        }
+        let json = send(agent().get(&url).set("anthropic-version", "2023-06-01").set("x-api-key", key))?;
+        for bucket in json.get("data").and_then(Value::as_array).into_iter().flatten() {
+            for result in bucket.get("results").and_then(Value::as_array).into_iter().flatten() {
+                total_cents += result.get("amount").and_then(Value::as_str).and_then(|a| a.parse::<f64>().ok()).unwrap_or(0.0);
+            }
+        }
+        let has_more = json.get("has_more").and_then(Value::as_bool).unwrap_or(false);
+        match json.get("next_page").and_then(Value::as_str) {
+            Some(next) if has_more => page = Some(next.to_owned()),
+            _ => break,
+        }
+    }
+    Ok(total_cents / 100.0)
+}
+
+fn claude_source_usage() -> AiUsage {
     const NAME: &str = "Claude";
     if let Some((at, usage)) = &*CLAUDE_CACHE.lock().unwrap_or_else(PoisonError::into_inner) {
         if at.elapsed() < CLAUDE_MIN_INTERVAL {
@@ -183,13 +345,11 @@ fn claude() -> AiUsage {
         }
     }
     // Tokens are never refreshed here: rotating Claude Code's refresh token could log it out.
-    let Some(creds) = home().and_then(|h| read_json(&h.join(".claude").join(".credentials.json"))) else {
-        return no_data(NAME, "sign in: run `claude`, then /login");
-    };
-    let Some(oauth) = creds.get("claudeAiOauth") else {
-        return no_data(NAME, "sign in: run `claude`, then /login");
-    };
-    let Some(token) = oauth.get("accessToken").and_then(Value::as_str).filter(|t| !t.is_empty()) else {
+    let oauth = home()
+        .and_then(|h| read_json(&h.join(".claude").join(".credentials.json")))
+        .and_then(|creds| creds.get("claudeAiOauth").cloned());
+    let token = oauth.as_ref().and_then(|o| o.get("accessToken")).and_then(Value::as_str).filter(|t| !t.is_empty());
+    let (Some(oauth), Some(token)) = (oauth.as_ref(), token) else {
         return no_data(NAME, "sign in: run `claude`, then /login");
     };
     if oauth.get("expiresAt").and_then(Value::as_f64).is_some_and(|exp| exp < now_ms() as f64) {

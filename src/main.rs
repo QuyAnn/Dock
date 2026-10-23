@@ -111,6 +111,10 @@ struct App {
     history: History,
     visualizer_running: bool,
     dock_visible: bool,
+    /// True while this session is a remote desktop session: the dock is hidden so it does not cover the remote taskbar.
+    remote_hidden: bool,
+    /// True while a fullscreen RDP client is in front and the dock is hidden for it.
+    rdp_front: bool,
     /// One dock per additional monitor; empty on single-display machines.
     secondaries: Vec<SecondaryDock>,
 }
@@ -134,6 +138,7 @@ enum Click {
     Launch(String),
     Start,
     GrokBot,
+    Search,
     Open(OpenPopup, RectF),
     /// Tray chevron: toggle Windows' own hidden-icons flyout (anchor in physical px).
     TrayOverflow(RectF),
@@ -558,6 +563,7 @@ fn destroy_secondary_hwnds(hwnds: &[HWND]) {
 fn run() -> windows::core::Result<()> {
     log("start");
     let initial_settings = settings::load();
+    data::ai::set_claude_source(initial_settings.claude_source == "apikey");
     let hinst: HINSTANCE = match unsafe { GetModuleHandleW(None) } {
         Ok(h) => h.into(),
         Err(e) => {
@@ -676,6 +682,8 @@ fn run() -> windows::core::Result<()> {
             history: History::default(),
             visualizer_running: false,
             dock_visible: true,
+            remote_hidden: false,
+            rdp_front: false,
             secondaries,
         })
     });
@@ -760,10 +768,14 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
         left,
         // Variant A: 38-DIP Start squircle, thin divider, then the 38-DIP app icons.
         center: if app_count == 0 {
-            vec![Tile { id: "start", width: apps::ICON, height: apps::CLUSTER_H }]
+            vec![
+                Tile { id: "start", width: apps::ICON, height: apps::CLUSTER_H },
+                Tile { id: "search", width: apps::ICON, height: apps::CLUSTER_H },
+            ]
         } else {
             vec![
                 Tile { id: "start", width: apps::ICON, height: apps::CLUSTER_H },
+                Tile { id: "search", width: apps::ICON, height: apps::CLUSTER_H },
                 Tile { id: "sep", width: 1.0, height: 24.0 },
                 Tile { id: "apps", width: apps_w, height: apps::CLUSTER_H },
             ]
@@ -820,6 +832,8 @@ fn ai_view(data: &DataState, name: &str) -> TileView {
             Some((a.session_pct / 100.0).clamp(0.0, 1.0)),
             usage_color(a.session_pct),
         ),
+        // API key mode: the month's spend, the value the tile is for.
+        Some(a) if a.cost_usd.is_some() => (format!("${:.2}", a.cost_usd.unwrap_or_default()), "tháng này".into(), None, 0),
         Some(a) => (short_ai_status(&a.reset_text).into(), String::new(), None, 0),
         None => ("…".into(), String::new(), None, 0),
     };
@@ -870,14 +884,27 @@ fn weather_icon(code: u32) -> &'static str {
     }
 }
 
-fn grok_bot_view() -> TileView {
+/// Grok Bot tile: the app icon, with the Grok usage (from the Cursor sign-in) when it is known.
+fn grok_bot_view(data: &DataState) -> TileView {
     let running = grokbot::is_running();
+    let usage = data.ai.iter().find(|a| a.name == "Grok");
+    let (value, sub, progress, accent) = match usage {
+        Some(a) if !a.session_pct.is_nan() => (
+            format!("{:.0}%", a.session_pct),
+            a.reset_text.clone(),
+            Some((a.session_pct / 100.0).clamp(0.0, 1.0)),
+            usage_color(a.session_pct),
+        ),
+        Some(a) if !a.reset_text.is_empty() => (short_ai_status(&a.reset_text).into(), String::new(), None, 0),
+        _ => (if running { "Đang chạy".into() } else { "Mở".into() }, String::new(), None, 0),
+    };
     let mut view = TileView {
-        progress: None,
-        accent: 0,
+        progress,
+        accent,
         bg: 0x0000_00FF,
+        sub,
         glyph: Some((svgpath::GROK_SLASH, Some(2.0))),
-        ..TileView::card(grokbot::DISPLAY_NAME, if running { "Đang chạy" } else { "Mở" })
+        ..TileView::card(grokbot::DISPLAY_NAME, value)
     };
     if let Some(icon) = grokbot::icon() {
         view.icon = Some(dock::Icon { w: icon.w, h: icon.h, rgba: icon.rgba });
@@ -897,10 +924,17 @@ fn tile_view(
     let now = Local::now();
     match id {
         "git" => tiles::git_tile(data),
-        "claude" => ai_view(data, "Claude"),
+        "claude" => {
+            let mut view = ai_view(data, "Claude");
+            // API key mode: show the budget the spend is measured against.
+            if data.ai.iter().any(|a| a.name == "Claude" && a.cost_usd.is_some()) {
+                view.sub = format!("/ {}$", settings.claude_monthly_budget);
+            }
+            view
+        }
         "codex" => ai_view(data, "Codex"),
         "cursor" => ai_view(data, "Cursor"),
-        "grok" => grok_bot_view(),
+        "grok" => grok_bot_view(data),
         "media" => {
             let mut view = tiles::media_tile(data);
             view.audio_peak = audio_peak;
@@ -924,6 +958,7 @@ fn tile_view(
             ..TileView::card("", "")
         },
         "start" => TileView { style: Style::Start, ..TileView::card("", "") },
+        "search" => TileView { style: Style::Search, ..TileView::card("", "") },
         "sep" => TileView { style: Style::Separator, ..TileView::card("", "") },
         // Ring: short label above the percent (no "CPU 65" single-line overlap).
         "cpu" => TileView {
@@ -1273,9 +1308,10 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
                 None => Click::None,
             },
             "start" => Click::Start,
+            "search" => Click::Search,
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
             "claude" | "codex" | "cursor" => Click::Open(OpenPopup::Data(id), anchor),
-            "grok" => Click::GrokBot,
+            "grok" => Click::Open(OpenPopup::Data("grok"), anchor),
             "media" => Click::Open(OpenPopup::Data("media"), anchor),
             "weather" => Click::Open(OpenPopup::Data("weather"), anchor),
             "clock" => Click::Open(OpenPopup::Data("clock"), anchor),
@@ -1291,7 +1327,7 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
 fn popup_kind(id: &str) -> PopupKind {
     match id {
         "git" => PopupKind::Git,
-        "claude" | "codex" | "cursor" | "ai" => PopupKind::Ai,
+        "claude" | "codex" | "cursor" | "grok" | "ai" => PopupKind::Ai,
         "weather" => PopupKind::Weather,
         "clock" => PopupKind::Clock,
         "cpu" => PopupKind::Cpu,
@@ -1331,6 +1367,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
                 "claude" => Some("Claude"),
                 "codex" => Some("Codex"),
                 "cursor" => Some("Cursor"),
+                "grok" => Some("Grok"),
                 _ => None,
             });
             let height = APP
@@ -1557,6 +1594,25 @@ fn on_popup_click(x: f32, y: f32) {
                             10..=11 => 12,
                             _ => 4,
                         };
+                    }
+                    popup_content::SettingsAction::ToggleClaudeSource => {
+                        settings.claude_source = if settings.claude_source == "apikey" { "login" } else { "apikey" }.to_owned();
+                        data::ai::set_claude_source(settings.claude_source == "apikey");
+                        // Fetch Claude usage from the new source now, not at the next 10-minute pass.
+                        app.shared.refresh_slow.store(true, Ordering::SeqCst);
+                    }
+                    popup_content::SettingsAction::CycleClaudeBudget => {
+                        settings.claude_monthly_budget = match settings.claude_monthly_budget {
+                            0..=49 => 50,
+                            50..=99 => 100,
+                            100..=199 => 200,
+                            200..=499 => 500,
+                            500..=999 => 1000,
+                            _ => 50,
+                        };
+                    }
+                    popup_content::SettingsAction::RefreshUsage => {
+                        app.shared.refresh_slow.store(true, Ordering::SeqCst);
                     }
                     popup_content::SettingsAction::OpenConfig => {
                         let _ = settings::save(&settings);
@@ -1795,6 +1851,14 @@ fn reattach_to_explorer(primary: HWND) {
 /// Explorer re-lay-out its taskbars, which flickers). If misses keep coming while our tray
 /// listener runs, the listener is turned off.
 fn guard_work_area(primary: HWND) {
+    // The dock releases its AppBar on purpose while a fullscreen RDP client is in front (or this
+    // PC is being remoted into). A missing reservation is expected then; repairing it here
+    // re-registers the AppBar every few seconds and makes Explorer re-lay out the taskbar.
+    let released = APP.with(|a| a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.rdp_front || app.remote_hidden)));
+    if released.unwrap_or(false) {
+        WORK_AREA_MISSES.with(|m| m.borrow_mut().clear());
+        return;
+    }
     let docks: Vec<HWND> = APP.with(|a| {
         a.try_borrow()
             .ok()
@@ -1919,6 +1983,40 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     APP.with(|a| {
                         if let Ok(mut slot) = a.try_borrow_mut() {
                             if let Some(app) = slot.as_mut() {
+                                // This PC being remoted into: hide the dock so it does not show on the viewer's screen.
+                                let in_session = GetSystemMetrics(SM_REMOTESESSION) != 0;
+                                if in_session != app.remote_hidden {
+                                    app.remote_hidden = in_session;
+                                    if in_session {
+                                        let _ = ShowWindow(app.hwnd, SW_HIDE);
+                                        for sec in &app.secondaries {
+                                            let _ = ShowWindow(sec.hwnd, SW_HIDE);
+                                        }
+                                        log("dock hidden: this PC is in a remote session");
+                                    } else if app.dock_visible {
+                                        let hidden = app.shared.settings.lock().unwrap().taskbar_mode == "hidden";
+                                        appbar::hide_taskbar(hidden);
+                                        let _ = ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
+                                        for sec in &app.secondaries {
+                                            let _ = ShowWindow(sec.hwnd, SW_SHOWNOACTIVATE);
+                                        }
+                                        log("local session: dock shown");
+                                    }
+                                }
+                                // paints over the remote taskbar. While that window is in front, release the AppBar and
+                                // drop the dock below it; WM_DISPLAYCHANGE registers it again when the window leaves.
+                                let rdp_fullscreen = tasks::foreground_is_fullscreen_rdp();
+                                if rdp_fullscreen != app.rdp_front && !app.remote_hidden {
+                                    app.rdp_front = rdp_fullscreen;
+                                    if rdp_fullscreen {
+                                        appbar::unregister_appbar(app.hwnd);
+                                        let _ = SetWindowPos(app.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                                        log("fullscreen RDP in front: dock below it");
+                                    } else {
+                                        let _ = PostMessageW(app.hwnd, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
+                                        log("dock back on top");
+                                    }
+                                }
                                 let disk_settings = settings::load();
                                 let mut current_settings = app.shared.settings.lock().unwrap();
                                 if *current_settings != disk_settings {
@@ -2013,6 +2111,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::Launch(_) => "launch pinned",
                 Click::Start => "open Start",
                 Click::GrokBot => "grok bot",
+                Click::Search => "search",
                 Click::Open(..) => "open popup",
                 Click::TrayOverflow(_) => "tray overflow",
             }));
@@ -2021,6 +2120,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Click::Activate(h) => tasks::activate_window(h),
                 Click::Launch(exe) => tasks::launch_exe(&exe),
                 Click::Start => tasks::open_start_menu(),
+                Click::Search => tasks::open_search(),
                 Click::GrokBot => grokbot::open_or_focus(),
                 Click::Open(which, anchor) => open_popup(which, anchor),
                 Click::TrayOverflow(a) => {

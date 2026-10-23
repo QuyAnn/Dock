@@ -73,6 +73,10 @@ pub struct Settings {
     pub auto_pin_count: u32,
     /// Auto pins the user removed with Unpin (exe paths); never auto-pinned again.
     pub auto_pin_hidden: Vec<String>,
+    /// Where the Claude usage comes from: "login" (Claude Code sign-in) or "apikey" (ANTHROPIC_API_KEY).
+    pub claude_source: String,
+    /// Monthly API budget in USD shown next to the Claude spend (chosen in Settings).
+    pub claude_monthly_budget: u32,
 }
 
 impl Default for Settings {
@@ -92,6 +96,8 @@ impl Default for Settings {
             auto_pin: true,
             auto_pin_count: 8,
             auto_pin_hidden: Vec::new(),
+            claude_source: "login".to_owned(),
+            claude_monthly_budget: 100,
         }
     }
 }

@@ -269,6 +269,41 @@ pub fn start_icon_rgba() -> Vec<u8> {
     clip_squircle(&out, n)
 }
 
+/// Search icon: a white magnifier (ring and handle, anti-aliased) on a dark slate squircle.
+pub fn search_icon_rgba() -> Vec<u8> {
+    let n = ICON_N as usize;
+    let s = n as f32;
+    let mut out = vec![[0.0f32; 4]; n * n];
+    let (top, bottom) = ([88.0f32, 96.0, 108.0], [34.0f32, 38.0, 46.0]);
+    let (cx, cy, r, ring_w) = (s * 0.44, s * 0.44, s * 0.22, s * 0.075);
+    let (hx0, hy0) = (cx + r * 0.72, cy + r * 0.72);
+    let (hx1, hy1) = (s * 0.78, s * 0.78);
+    let handle_w = s * 0.085;
+    for y in 0..n {
+        let t = (y as f32 + 0.5) / s;
+        for x in 0..n {
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let mut c = [0.0f32; 3];
+            for i in 0..3 {
+                c[i] = (top[i] + (bottom[i] - top[i]) * t) / 255.0;
+            }
+            // Distance from the pixel to the ring's centre line, and to the handle segment.
+            let ring_d = ((px - cx).hypot(py - cy) - r).abs();
+            let ring = (ring_w / 2.0 - ring_d + 0.5).clamp(0.0, 1.0);
+            let (dx, dy) = (hx1 - hx0, hy1 - hy0);
+            let u = (((px - hx0) * dx + (py - hy0) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+            let handle_d = (px - (hx0 + dx * u)).hypot(py - (hy0 + dy * u));
+            let handle = (handle_w / 2.0 - handle_d + 0.5).clamp(0.0, 1.0);
+            let w = ring.max(handle);
+            for i in 0..3 {
+                c[i] = c[i] * (1.0 - w) + w;
+            }
+            out[y * n + x] = [c[0], c[1], c[2], 1.0];
+        }
+    }
+    clip_squircle(&out, n)
+}
+
 /// Soft macOS-style icon shadow: offset `dy` px down, Gaussian `sigma`, `opacity`.
 pub fn soft_shadow(w: u32, h: u32, alpha: &[u8], sigma: f32, opacity: f32, dy: usize) -> (u32, u32, Vec<u8>) {
     shadow_impl(w, h, alpha, sigma, opacity, dy)

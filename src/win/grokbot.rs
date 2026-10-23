@@ -1,8 +1,9 @@
 //! Grok Bot desktop app launcher tile helpers.
 //!
 //! Resolves the installed exe / Start-menu shortcut / running process for icon + open/focus.
-//! The `%USERPROFILE%\.grokbot` folder holds config/daemon state only — never read, open, or
-//! log credential / connection / daemon JSON from that tree.
+//! Grok Bot usage is read by `data::ai::grok()` through the Cursor sign-in Grok Bot uses, so this
+//! module does not read the `%USERPROFILE%\.grokbot` folder. Keep it that way: that folder holds
+//! sealed credentials and daemon state, so never open or log its contents from here.
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

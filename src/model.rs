@@ -28,4 +28,6 @@ pub struct AiUsage {
     pub session_pct: f32,
     pub reset_text: String,
     pub windows: Vec<AiWindow>,
+    /// Month-to-date API spend in USD from the Admin cost report (Claude only).
+    pub cost_usd: Option<f64>,
 }

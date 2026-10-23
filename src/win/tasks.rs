@@ -1016,3 +1016,81 @@ impl Attention {
         self.hwnds.contains(&hwnd)
     }
 }
+
+
+/// Lower-case file name of the foreground window's process, e.g. "msrdc.exe".
+pub fn foreground_exe_name() -> Option<String> {
+    // SAFETY: plain Win32 queries on the foreground HWND; the process handle is closed below.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return None;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(process, Default::default(), PWSTR(buf.as_mut_ptr()), &mut len).is_ok();
+        let _ = CloseHandle(process);
+        if !ok {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        Path::new(&path).file_name().and_then(|n| n.to_str()).map(str::to_ascii_lowercase)
+    }
+}
+
+/// Opens Windows Search with Win+S, the key the system uses, and closes it again with Escape when
+/// its panel is already in front. SmartDock never takes focus, so a second click used to do nothing.
+/// Falls back to the `ms-search:` URI when the keys cannot be sent.
+pub fn open_search() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY;
+    const VK_S: VIRTUAL_KEY = VIRTUAL_KEY(0x53);
+    const VK_ESCAPE: VIRTUAL_KEY = VIRTUAL_KEY(0x1B);
+    let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() },
+        },
+    };
+    let search_open = foreground_exe_name().is_some_and(|name| name.starts_with("searchhost") || name.starts_with("searchapp"));
+    let inputs = if search_open {
+        vec![key(VK_ESCAPE, false), key(VK_ESCAPE, true)]
+    } else {
+        vec![key(VK_LWIN, false), key(VK_S, false), key(VK_S, true), key(VK_LWIN, true)]
+    };
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent != inputs.len() as u32 {
+        crate::log("search: keys not sent, opening ms-search:");
+        let _ = crate::win::system::open_path(Path::new("ms-search:"));
+    }
+}
+
+/// True when the foreground window is an RDP client (mstsc or msrdc) covering its whole monitor.
+/// Fullscreen RDP ignores the taskbar and the dock's reserved strip, so the dock would paint over
+/// the remote taskbar.
+pub fn foreground_is_fullscreen_rdp() -> bool {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    if !foreground_exe_name().is_some_and(|name| matches!(name.as_str(), "mstsc.exe" | "msrdc.exe")) {
+        return false;
+    }
+    // SAFETY: plain Win32 queries on the foreground HWND with correctly sized out-structs.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return false;
+        }
+        let mut window = windows::Win32::Foundation::RECT::default();
+        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window).is_err() {
+            return false;
+        }
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return false;
+        }
+        let m = info.rcMonitor;
+        window.left <= m.left && window.top <= m.top && window.right >= m.right && window.bottom >= m.bottom
+    }
+}

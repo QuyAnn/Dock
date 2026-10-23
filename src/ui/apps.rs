@@ -12,7 +12,7 @@ use windows::core::Result;
 
 use super::dock::{hit_test, RectF};
 use super::renderer::{Align, Renderer, TextStyle};
-use super::squircle::{rounded_rect_alpha, shadow_pad, soft_shadow, squircle_mask, start_icon_rgba, ICON_N};
+use super::squircle::{rounded_rect_alpha, search_icon_rgba, shadow_pad, soft_shadow, squircle_mask, start_icon_rgba, ICON_N};
 use crate::model::WindowEntry;
 use crate::win::icons::{icon_for_window, IconBitmap};
 use crate::win::tasks::{list_windows, Attention};
@@ -181,6 +181,17 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
 pub fn draw_start_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
     static START: OnceLock<AppIcon> = OnceLock::new();
     let icon = START.get_or_init(|| AppIcon::from_composed(start_icon_rgba()));
+    let k = if hovered { 1.0 + MAG_MAX } else { 1.0 };
+    let size = ICON * k;
+    let cx = rc.x + rc.w / 2.0;
+    let bottom = rc.y + ICON_TOP + ICON;
+    draw_icon(r, icon, RectF { x: cx - size / 2.0, y: bottom - size, w: size, h: size })
+}
+
+/// Search tile: the same size and placement as the Start icon.
+pub fn draw_search_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
+    static SEARCH: OnceLock<AppIcon> = OnceLock::new();
+    let icon = SEARCH.get_or_init(|| AppIcon::from_composed(search_icon_rgba()));
     let k = if hovered { 1.0 + MAG_MAX } else { 1.0 };
     let size = ICON * k;
     let cx = rc.x + rc.w / 2.0;

@@ -68,6 +68,8 @@ pub enum Style {
     Media,
     /// Control Center button: value holds Segoe MDL2 glyphs drawn side by side.
     Button,
+    /// Search icon in the centre cluster, next to Start.
+    Search,
     /// Windows logo button that opens Start.
     Start,
     /// Thin vertical divider in the centre cluster (Start | apps).
@@ -279,6 +281,7 @@ pub fn draw_dock(
             Style::Media => draw_media(r, t, *rc, hovered)?,
             Style::Button => draw_button(r, t, *rc, hovered)?,
             Style::Start => draw_start(r, *rc, hovered)?,
+            Style::Search => super::apps::draw_search_icon(r, *rc, hovered)?,
             Style::Separator => draw_separator(r, *rc)?,
         }
     }
