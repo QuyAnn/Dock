@@ -40,6 +40,13 @@ static HIDE_WINDOW: AtomicBool = AtomicBool::new(true);
 static SECONDARY_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Taskbar AppBar state (ABS_*) from before we changed it.
 static ORIGINAL_STATE: AtomicU32 = AtomicU32::new(ABS_ALWAYSONTOP);
+/// True while the docks are released (remote session or fullscreen RDP in front): the taskbar
+/// is then left alone, so nothing re-hides or re-shows it under the remote desktop.
+static DOCK_RELEASED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_dock_released(released: bool) {
+    DOCK_RELEASED.store(released, Ordering::SeqCst);
+}
 
 fn abd(hwnd: HWND, edge: u32, rc: RECT) -> APPBARDATA {
     APPBARDATA {
@@ -220,7 +227,7 @@ unsafe extern "system" fn on_tray_show(
     _thread: u32,
     _time: u32,
 ) {
-    if id_object != OBJID_WINDOW.0 || hwnd.is_invalid() || !APPLIED.load(Ordering::SeqCst) {
+    if id_object != OBJID_WINDOW.0 || hwnd.is_invalid() || !APPLIED.load(Ordering::SeqCst) || DOCK_RELEASED.load(Ordering::SeqCst) {
         return;
     }
     let mut buf = [0u16; 32];
@@ -361,6 +368,9 @@ pub fn ensure_restored_on_exit() {
 /// Re-hides the primary tray (and the secondary trays while our secondary docks exist) if
 /// Explorer re-showed them. Call about every 500 ms and from the show hook.
 pub fn enforce_taskbar_hidden() {
+    if DOCK_RELEASED.load(Ordering::SeqCst) {
+        return;
+    }
     if APPLIED.load(Ordering::SeqCst) && HIDE_WINDOW.load(Ordering::SeqCst) {
         if let Some(h) = primary_tray() {
             // SAFETY: live tray window.

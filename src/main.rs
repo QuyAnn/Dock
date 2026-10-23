@@ -113,8 +113,14 @@ struct App {
     dock_visible: bool,
     /// True while this session is a remote desktop session: the dock is hidden so it does not cover the remote taskbar.
     remote_hidden: bool,
-    /// True while a fullscreen RDP client is in front and the dock is hidden for it.
+    /// True while a fullscreen RDP client is in front (the debounced answer of `update_remote_state`).
     rdp_front: bool,
+    /// The RDP answer seen on the last tick when it differs from `rdp_front`; it must repeat once to flip.
+    rdp_pending: Option<bool>,
+    /// True while the docks are hidden and their AppBars removed (`remote_hidden || rdp_front`).
+    docks_released: bool,
+    /// A display change arrived while the docks were released; they are rebuilt on restore.
+    topology_stale: bool,
     /// One dock per additional monitor; empty on single-display machines.
     secondaries: Vec<SecondaryDock>,
 }
@@ -179,6 +185,8 @@ fn main() {
     // Restore the taskbar on any panic before the default hook prints.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // The GUI build has no console: keep the message in the log so a crash can be traced.
+        log(&format!("PANIC: {info}"));
         appbar::ensure_restored_on_exit();
         default_hook(info);
     }));
@@ -684,6 +692,9 @@ fn run() -> windows::core::Result<()> {
             dock_visible: true,
             remote_hidden: false,
             rdp_front: false,
+            rdp_pending: None,
+            docks_released: false,
+            topology_stale: false,
             secondaries,
         })
     });
@@ -1823,9 +1834,140 @@ fn taskbar_created_msg() -> u32 {
     *MSG_ID.get_or_init(|| unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) })
 }
 
+thread_local! {
+    /// When the docks were last brought back: the guard leaves the reservation alone for a moment.
+    static LAST_RESTORE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// How long after the docks come back the work-area guard does not repair the reservation.
+const RESTORE_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Registers the primary dock's AppBar and places the window on the reserved strip.
+/// Returns the reserved rect, or `None` when Explorer refused the reservation.
+fn attach_primary(app: &mut App) -> Option<RECT> {
+    let dpi_value = dpi::window_dpi(app.hwnd);
+    let dock_h = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
+    let rect = appbar::register_appbar(app.hwnd, AbEdge::Bottom, dock_h).ok()?;
+    let pixel_w = rect.right - rect.left;
+    let window_h = dock_h + dpi::dip_to_px(16.0, dpi_value);
+    // SAFETY: our own dock window; the position is the rect Explorer just reserved.
+    unsafe {
+        let _ = SetWindowPos(app.hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_w, window_h, SWP_NOACTIVATE);
+    }
+    app.origin = (rect.left as f32, rect.top as f32);
+    app.dpi = dpi_value;
+    app.width = dpi::px_to_dip(pixel_w, dpi_value);
+    app.renderer.resize(pixel_w, window_h, dpi_value);
+    Some(rect)
+}
+
+/// Registers an existing secondary dock's AppBar again on its own monitor.
+fn attach_secondary(sec: &SecondaryDock) {
+    let dock_h = dpi::dip_to_px(DOCK_HEIGHT, sec.dpi);
+    let Ok(rect) = appbar::register_appbar_on(sec.hwnd, AbEdge::Bottom, dock_h, sec.monitor) else {
+        log("secondary appbar re-register failed");
+        return;
+    };
+    // SAFETY: our own dock window, placed on the strip Explorer just reserved.
+    unsafe {
+        let _ = SetWindowPos(
+            sec.hwnd,
+            HWND_TOPMOST,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            dock_h + dpi::dip_to_px(16.0, sec.dpi),
+            SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Puts the docks away (`released`: windows hidden, AppBars removed) or brings them back.
+/// Used for a remote session and for a fullscreen RDP client in front, so the dock never sits
+/// over a remote taskbar. Coming back registers the AppBars once; no WM_DISPLAYCHANGE is posted
+/// unless the monitor layout changed meanwhile.
+fn set_docks_released(app: &mut App, released: bool) {
+    app.docks_released = released;
+    appbar::set_dock_released(released);
+    if released {
+        // SAFETY: our own dock windows.
+        unsafe {
+            let _ = ShowWindow(app.hwnd, SW_HIDE);
+            for sec in &app.secondaries {
+                let _ = ShowWindow(sec.hwnd, SW_HIDE);
+            }
+        }
+        appbar::unregister_appbar(app.hwnd);
+        for sec in &app.secondaries {
+            appbar::unregister_appbar(sec.hwnd);
+        }
+        log("docks released: hidden, AppBars removed");
+        return;
+    }
+    if attach_primary(app).is_none() {
+        log("docks: primary AppBar not restored");
+    }
+    for sec in &app.secondaries {
+        attach_secondary(sec);
+    }
+    if app.dock_visible {
+        let hidden = app.shared.settings.lock().unwrap().taskbar_mode == "hidden";
+        appbar::hide_taskbar(hidden);
+        // SAFETY: our own dock windows.
+        unsafe {
+            let _ = ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
+            for sec in &app.secondaries {
+                let _ = ShowWindow(sec.hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
+    }
+    LAST_RESTORE.with(|c| c.set(Some(std::time::Instant::now())));
+    if app.topology_stale {
+        app.topology_stale = false;
+        // The monitors changed while the docks were away: rebuild the secondaries now.
+        // SAFETY: posting to our own primary dock window.
+        unsafe {
+            let _ = PostMessageW(app.hwnd, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
+        }
+    }
+    log("docks restored: AppBars registered, shown");
+}
+
+/// Runs every tick (500 ms). Tracks this PC being remoted into and a fullscreen RDP client in
+/// front (debounced: a new answer must repeat on the next tick), then releases or restores the
+/// docks when the combined state changes.
+fn update_remote_state(app: &mut App) {
+    // SAFETY: plain metric query.
+    let in_session = unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0;
+    if in_session != app.remote_hidden {
+        app.remote_hidden = in_session;
+        log(if in_session { "this PC is in a remote session" } else { "local session again" });
+    }
+    match tasks::foreground_rdp_fullscreen() {
+        // SmartDock itself has focus: keep the previous answer.
+        None => {}
+        Some(now) if now == app.rdp_front => app.rdp_pending = None,
+        Some(now) if app.rdp_pending == Some(now) => {
+            app.rdp_front = now;
+            app.rdp_pending = None;
+            log(if now { "fullscreen RDP in front" } else { "fullscreen RDP left" });
+        }
+        Some(now) => app.rdp_pending = Some(now),
+    }
+    let released = app.remote_hidden || app.rdp_front;
+    if released != app.docks_released {
+        set_docks_released(app, released);
+    }
+}
+
 /// Explorer restarted: tray listener off, taskbars hidden once, AppBars registered with the
 /// new Explorer, then the listener back on (if enabled).
 fn reattach_to_explorer(primary: HWND) {
+    // Released docks hold no AppBar; bringing them back registers them with the new Explorer.
+    if APP.with(|a| a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.docks_released)).unwrap_or(false)) {
+        log("explorer: re-attach skipped while the docks are released");
+        return;
+    }
     let tray_enabled = APP.with(|a| {
         a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.shared.settings.lock().unwrap().tray_service)).unwrap_or(false)
     });
@@ -1851,11 +1993,14 @@ fn reattach_to_explorer(primary: HWND) {
 /// Explorer re-lay-out its taskbars, which flickers). If misses keep coming while our tray
 /// listener runs, the listener is turned off.
 fn guard_work_area(primary: HWND) {
-    // The dock releases its AppBar on purpose while a fullscreen RDP client is in front (or this
-    // PC is being remoted into). A missing reservation is expected then; repairing it here
-    // re-registers the AppBar every few seconds and makes Explorer re-lay out the taskbar.
-    let released = APP.with(|a| a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.rdp_front || app.remote_hidden)));
-    if released.unwrap_or(false) {
+    // The docks release their AppBars on purpose (remote session, fullscreen RDP), and for a moment
+    // after they come back Explorer is still settling. A missing reservation is expected then;
+    // repairing it re-registers the AppBars and makes Explorer re-lay out the taskbar.
+    let released = APP.with(|a| a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.docks_released))).unwrap_or(false);
+    // Right after the docks come back, Explorer often reports the reservation missing for a few
+    // seconds. Repairing it then re-attaches to Explorer, which flickers and has crashed; leave it.
+    let settling = LAST_RESTORE.with(|c| c.get()).is_some_and(|t| t.elapsed() < RESTORE_SETTLE);
+    if released || settling {
         WORK_AREA_MISSES.with(|m| m.borrow_mut().clear());
         return;
     }
@@ -1886,7 +2031,8 @@ fn guard_work_area(primary: HWND) {
     };
     if since(&LAST_REREGISTER) >= 15 {
         LAST_REREGISTER.with(|c| c.set(Some(now)));
-        log("workarea: dock reservation missing; re-registering the AppBars");
+        let since_restore = LAST_RESTORE.with(|c| c.get()).map_or(-1.0, |t| t.elapsed().as_secs_f32());
+        log(&format!("workarea: dock reservation missing ({since_restore:.1} s after the docks came back); re-registering the AppBars"));
         // AppBars must be registered while Explorer owns Shell_TrayWnd, so this also
         // pauses our tray listener around the registration.
         reattach_to_explorer(primary);
@@ -1983,40 +2129,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     APP.with(|a| {
                         if let Ok(mut slot) = a.try_borrow_mut() {
                             if let Some(app) = slot.as_mut() {
-                                // This PC being remoted into: hide the dock so it does not show on the viewer's screen.
-                                let in_session = GetSystemMetrics(SM_REMOTESESSION) != 0;
-                                if in_session != app.remote_hidden {
-                                    app.remote_hidden = in_session;
-                                    if in_session {
-                                        let _ = ShowWindow(app.hwnd, SW_HIDE);
-                                        for sec in &app.secondaries {
-                                            let _ = ShowWindow(sec.hwnd, SW_HIDE);
-                                        }
-                                        log("dock hidden: this PC is in a remote session");
-                                    } else if app.dock_visible {
-                                        let hidden = app.shared.settings.lock().unwrap().taskbar_mode == "hidden";
-                                        appbar::hide_taskbar(hidden);
-                                        let _ = ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
-                                        for sec in &app.secondaries {
-                                            let _ = ShowWindow(sec.hwnd, SW_SHOWNOACTIVATE);
-                                        }
-                                        log("local session: dock shown");
-                                    }
-                                }
-                                // paints over the remote taskbar. While that window is in front, release the AppBar and
-                                // drop the dock below it; WM_DISPLAYCHANGE registers it again when the window leaves.
-                                let rdp_fullscreen = tasks::foreground_is_fullscreen_rdp();
-                                if rdp_fullscreen != app.rdp_front && !app.remote_hidden {
-                                    app.rdp_front = rdp_fullscreen;
-                                    if rdp_fullscreen {
-                                        appbar::unregister_appbar(app.hwnd);
-                                        let _ = SetWindowPos(app.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                                        log("fullscreen RDP in front: dock below it");
-                                    } else {
-                                        let _ = PostMessageW(app.hwnd, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
-                                        log("dock back on top");
-                                    }
-                                }
                                 let disk_settings = settings::load();
                                 let mut current_settings = app.shared.settings.lock().unwrap();
                                 if *current_settings != disk_settings {
@@ -2056,6 +2168,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     reattach_to_explorer(hwnd);
                 }
                 TIMER_GUARD => {
+                    APP.with(|a| {
+                        if let Ok(mut slot) = a.try_borrow_mut() {
+                            if let Some(app) = slot.as_mut() {
+                                update_remote_state(app);
+                            }
+                        }
+                    });
                     appbar::enforce_taskbar_hidden();
                     guard_work_area(hwnd);
                 }
@@ -2074,9 +2193,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     if app.dock_visible {
                         let hidden = app.shared.settings.lock().unwrap().taskbar_mode == "hidden";
                         appbar::hide_taskbar(hidden);
-                        let _ = ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
-                        for sec in &app.secondaries {
-                            let _ = ShowWindow(sec.hwnd, SW_SHOWNOACTIVATE);
+                        // While released, the docks stay hidden; they show when the release ends.
+                        if !app.docks_released {
+                            let _ = ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
+                            for sec in &app.secondaries {
+                                let _ = ShowWindow(sec.hwnd, SW_SHOWNOACTIVATE);
+                            }
                         }
                     } else {
                         let _ = ShowWindow(app.hwnd, SW_HIDE);
@@ -2178,28 +2300,32 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // Only the primary dock owns topology rebuilds; secondary HWNDs also receive this.
             let is_primary = APP.with(|a| a.borrow().as_ref().map(|app| app.hwnd == hwnd).unwrap_or(false));
             if is_primary {
+                // Released docks hold no AppBar and stay hidden: they are rebuilt when they come back.
+                let released = APP.with(|a| {
+                    let mut slot = a.borrow_mut();
+                    slot.as_mut().map(|app| {
+                        if app.docks_released {
+                            app.topology_stale = true;
+                        }
+                        app.docks_released
+                    })
+                });
+                if released == Some(true) {
+                    log("display change while the docks are released: rebuilt when they come back");
+                    return LRESULT(0);
+                }
                 let mut stale = Vec::new();
                 APP.with(|a| {
                     if let Some(app) = a.borrow_mut().as_mut() {
-                        let dpi_value = dpi::window_dpi(hwnd);
-                        let dock_h = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
+                        app.topology_stale = false;
                         // Full re-registration: after an Explorer restart the new Explorer does
                         // not know the old AppBar, so a reposition alone reserves nothing.
                         appbar::unregister_appbar(hwnd);
-                        if let Ok(rect) = appbar::register_appbar(hwnd, AbEdge::Bottom, dock_h) {
-                            let pixel_w = rect.right - rect.left;
-                            let window_h = dock_h + dpi::dip_to_px(16.0, dpi_value);
-                            let _ = SetWindowPos(
-                                hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_w, window_h, SWP_NOACTIVATE,
-                            );
-                            app.origin = (rect.left as f32, rect.top as f32);
-                            app.dpi = dpi_value;
-                            app.width = dpi::px_to_dip(pixel_w, dpi_value);
-                            app.renderer.resize(pixel_w, window_h, dpi_value);
+                        if let Some(rect) = attach_primary(app) {
                             app.shared.refresh_liquid.store(true, Ordering::SeqCst);
                             log(&format!(
-                                "display change: appbar=({},{}..{},{}) dpi={dpi_value}",
-                                rect.left, rect.top, rect.right, rect.bottom
+                                "display change: appbar=({},{}..{},{}) dpi={}",
+                                rect.left, rect.top, rect.right, rect.bottom, app.dpi
                             ));
                             stale = take_secondary_dock_hwnds(&mut app.secondaries);
                         }

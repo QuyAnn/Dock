@@ -1067,30 +1067,42 @@ pub fn open_search() {
     }
 }
 
-/// True when the foreground window is an RDP client (mstsc or msrdc) covering its whole monitor.
-/// Fullscreen RDP ignores the taskbar and the dock's reserved strip, so the dock would paint over
-/// the remote taskbar.
-pub fn foreground_is_fullscreen_rdp() -> bool {
+/// Whether the foreground window is an RDP client (mstsc or msrdc) covering its whole monitor.
+/// `Some(true)` / `Some(false)` is the answer; `None` when SmartDock itself has focus, so the
+/// caller keeps its previous answer. Fullscreen RDP ignores the taskbar and the dock's reserved
+/// strip, so the dock would paint over the remote taskbar.
+pub fn foreground_rdp_fullscreen() -> Option<bool> {
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-    if !foreground_exe_name().is_some_and(|name| matches!(name.as_str(), "mstsc.exe" | "msrdc.exe")) {
-        return false;
-    }
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, GetWindowThreadProcessId};
     // SAFETY: plain Win32 queries on the foreground HWND with correctly sized out-structs.
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
-            return false;
+            return Some(false);
         }
-        let mut window = windows::Win32::Foundation::RECT::default();
-        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut window).is_err() {
-            return false;
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == std::process::id() {
+            return None;
+        }
+        let mut buf = [0u16; 64];
+        let n = GetClassNameW(hwnd, &mut buf);
+        let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+        let is_rdp = class == "TscShellContainerClass"
+            || foreground_exe_name().is_some_and(|name| matches!(name.as_str(), "mstsc.exe" | "msrdc.exe"));
+        if !is_rdp {
+            return Some(false);
+        }
+        let mut window = RECT::default();
+        if GetWindowRect(hwnd, &mut window).is_err() {
+            return Some(false);
         }
         let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-            return false;
+        if !GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            return Some(false);
         }
         let m = info.rcMonitor;
-        window.left <= m.left && window.top <= m.top && window.right >= m.right && window.bottom >= m.bottom
+        Some(window.left <= m.left && window.top <= m.top && window.right >= m.right && window.bottom >= m.bottom)
     }
 }
