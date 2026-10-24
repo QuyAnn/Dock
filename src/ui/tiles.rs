@@ -10,7 +10,7 @@ use super::renderer::Renderer;
 use crate::data::ai::refresh_ai;
 use crate::data::git::{refresh_git, GitSummary};
 use crate::data::weather::{refresh_weather_at, Weather};
-use crate::model::{AiUsage, Media};
+use crate::model::{AiUsage, Media, WidgetStats};
 use crate::win::system::current_media;
 
 /// Commits per week that fill the git tile's progress bar.
@@ -18,6 +18,7 @@ const WEEK_GOAL: f32 = 10.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct DataState {
+    pub widgets: WidgetStats,
     pub git: Option<GitSummary>,
     pub ai: Vec<AiUsage>,
     pub weather: Option<Weather>,
@@ -26,6 +27,7 @@ pub struct DataState {
 
 /// One result from a background refresh.
 pub enum DataUpdate {
+    Widgets(WidgetStats),
     Git(GitSummary),
     Ai(Vec<AiUsage>),
     Weather(Option<Weather>),
@@ -61,6 +63,7 @@ impl DataState {
 
     pub fn apply(&mut self, update: DataUpdate) {
         match update {
+            DataUpdate::Widgets(s) => self.widgets = s,
             DataUpdate::Git(g) => self.git = Some(g),
             DataUpdate::Ai(a) => self.ai = a,
             DataUpdate::Weather(w) => self.weather = w,
@@ -71,6 +74,82 @@ impl DataState {
 
 fn tile(title: &str, value: String, progress: Option<f32>) -> TileView {
     TileView { progress, ..TileView::card(title, value) }
+}
+
+pub fn battery_tile(s: &WidgetStats) -> TileView {
+    let Some(b) = &s.battery else { return TileView::card("PIN", "Không có pin") };
+    let state = if b.charging { "ĐANG SẠC" } else if b.plugged_in { "CẮM ĐIỆN" } else { "DÙNG PIN" };
+    TileView {
+        progress: b.percent.map(|p| p as f32 / 100.0),
+        accent: if b.charging { 0x3FD2_7FFF } else if b.percent.is_some_and(|p| p <= 20) { 0xFF5D_5DFF } else { 0x4AA8_FFFF },
+        ..TileView::card(format!("PIN · {state}"), b.percent.map_or("--".into(), |p| format!("{p}%")))
+    }
+}
+
+pub fn net_tile(s: &WidgetStats) -> TileView {
+    let (down, up) = s.net.map_or(("--".into(), "--".into()), |(d, u)| (crate::data::widgets::speed_text(d), crate::data::widgets::speed_text(u)));
+    TileView { style: Style::Metrics, sub: format!("↑ {up}"), ..TileView::card("TỐC ĐỘ MẠNG", format!("↓ {down}")) }
+}
+
+pub fn disk_tile(s: &WidgetStats) -> TileView {
+    let free = |i: usize| s.disk_free[i].map_or("--".into(), crate::data::widgets::size_text);
+    TileView { style: Style::Metrics, sub: format!("D: {}", free(1)), ..TileView::card("DUNG LƯỢNG TRỐNG", format!("C: {}", free(0))) }
+}
+
+pub fn gpu_tile(s: &WidgetStats) -> TileView {
+    TileView {
+        progress: s.gpu_pct.map(|p| p / 100.0),
+        accent: 0x4AA8_FFFF,
+        ..TileView::card("GPU", s.gpu_pct.map_or("--".into(), |p| format!("{p:.0}%")))
+    }
+}
+
+pub fn timer_tile() -> TileView {
+    let (secs, running) = crate::data::timer::snapshot();
+    TileView::card(if running { "BẤM GIỜ · CHẠY" } else { "BẤM GIỜ · DỪNG" }, crate::data::timer::time_text(secs))
+}
+
+pub fn date_tile(date: chrono::NaiveDate) -> TileView {
+    const DAYS: [&str; 7] = ["CHỦ NHẬT", "THỨ HAI", "THỨ BA", "THỨ TƯ", "THỨ NĂM", "THỨ SÁU", "THỨ BẢY"];
+    TileView::card(DAYS[date.weekday().num_days_from_sunday() as usize], date.format("%d/%m/%Y").to_string())
+}
+
+#[cfg(test)]
+mod widget_tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_tiles_show_live_values_and_unavailable_states() {
+        let mut s = WidgetStats::default();
+        assert_eq!(gpu_tile(&s).value, "--");
+        assert_eq!(net_tile(&s).value, "↓ --");
+        assert_eq!(disk_tile(&s).sub, "D: --");
+        assert_eq!(battery_tile(&s).value, "Không có pin");
+        s.battery = Some(crate::model::Battery { percent: Some(73), charging: true, plugged_in: true });
+        s.net = Some((2048.0, 1024.0));
+        s.disk_free = [Some(1024_u64.pow(3)), None];
+        s.gpu_pct = Some(42.0);
+        let battery = battery_tile(&s);
+        assert_eq!(battery.value, "73%");
+        assert!(battery.title.contains("ĐANG SẠC"));
+        assert_eq!(battery.progress, Some(0.73));
+        assert_eq!(net_tile(&s).value, "↓ 2.0 KB/s");
+        assert_eq!(net_tile(&s).sub, "↑ 1.0 KB/s");
+        assert_eq!(disk_tile(&s).value, "C: 1.0 GB");
+        assert_eq!(gpu_tile(&s).value, "42%");
+        s.battery.as_mut().unwrap().charging = false;
+        assert!(battery_tile(&s).title.contains("CẮM ĐIỆN"));
+        s.battery.as_mut().unwrap().plugged_in = false;
+        assert!(battery_tile(&s).title.contains("DÙNG PIN"));
+    }
+
+    #[test]
+    fn date_tile_uses_vietnamese_weekdays() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 25).unwrap();
+        assert_eq!(date_tile(date).title, "CHỦ NHẬT");
+        assert_eq!(date_tile(date).value, "25/10/2026");
+        assert_eq!(date_tile(date.succ_opt().unwrap()).title, "THỨ HAI");
+    }
 }
 
 /// Git card: today / week / streak numbers and a 16-week mini heatmap (3 rows, Fri-Sun).

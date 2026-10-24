@@ -336,6 +336,15 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
             thread::sleep(Duration::from_millis(if have { 1000 } else { 250 }));
         }
     });
+    let widget_shared = shared.clone();
+    thread::spawn(move || {
+        let mut sampler = data::widgets::Sampler::default();
+        loop {
+            let sample = sampler.read();
+            Arc::make_mut(&mut widget_shared.data.lock().unwrap()).apply(tiles::DataUpdate::Widgets(sample));
+            thread::sleep(Duration::from_secs(1));
+        }
+    });
     thread::spawn(move || {
         let mut tick: u64 = 0;
         loop {
@@ -791,6 +800,12 @@ fn widget_width(id: &str) -> f32 {
         "media" => dock::MEDIA_W,
         "weather" => 100.0,
         "focus" => 84.0,
+        "timer" => 104.0,
+        "battery" => 114.0,
+        "net" => 116.0,
+        "disk" => 124.0,
+        "gpu" => 64.0,
+        "date" => 112.0,
         "todo" => 160.0,
         "downloads" => 150.0,
         "chevron" => 30.0,
@@ -1053,6 +1068,12 @@ fn tile_view(
             view
         }
         "weather" => tiles::weather_tile(data),
+        "battery" => tiles::battery_tile(&data.widgets),
+        "net" => tiles::net_tile(&data.widgets),
+        "disk" => tiles::disk_tile(&data.widgets),
+        "gpu" => tiles::gpu_tile(&data.widgets),
+        "timer" => tiles::timer_tile(),
+        "date" => tiles::date_tile(now.date_naive()),
         "focus" => {
             let f = data::focus::snapshot();
             let (title, accent) = match f.phase {
@@ -1700,11 +1721,13 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
             "media" => Click::Open(OpenPopup::Data("media"), anchor),
             "weather" => Click::Open(OpenPopup::Data("weather"), anchor),
             "clock" => Click::Open(OpenPopup::Data("clock"), anchor),
+            "date" => Click::Open(OpenPopup::Data("clock"), anchor),
             "cpu" => Click::Open(OpenPopup::Data("cpu"), anchor),
             "ram" => Click::Open(OpenPopup::Data("ram"), anchor),
             "cc" => Click::Open(OpenPopup::Control, anchor),
             "chevron" => Click::TrayOverflow(anchor),
             "focus" => Click::Action("focus"),
+            "timer" => Click::Action("timer"),
             "lang" => Click::Action("lang"),
             "trash" => Click::Action("trash"),
             "downloads" => Click::Action("downloads"),
@@ -1718,6 +1741,8 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
 fn run_widget_action(id: &str) {
     match id {
         "focus" => data::focus::toggle(),
+        "timer" => data::timer::toggle(),
+        "timer_reset" => data::timer::reset(),
         "lang" => win::kbd::switch(),
         "focus_reset" => data::focus::reset(),
         "trash" => {
@@ -1922,6 +1947,10 @@ fn open_settings_popup() {
 
 /// Keeps an open data popup live: fresh data and history each second, then a repaint of the popup.
 fn refresh_open_popup() {
+    if OPEN.with(Cell::get) == Some(OpenPopup::Gallery) {
+        popup::invalidate();
+        return;
+    }
     let Some(OpenPopup::Data(id)) = OPEN.with(Cell::get) else { return };
     APP.with(|a| {
         let slot = a.borrow();

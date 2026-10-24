@@ -300,6 +300,7 @@ pub fn open_dock_menu(target: Option<&'static str>, settings: &Settings) -> f32 
         let to = if settings.layout.is_left(id) { "phải" } else { "trái" };
         items.push(MenuItem::Header(widget_label(id)));
         match id {
+            "timer" => items.push(MenuItem::Row(DockMenuAction::Extra("timer_reset"), "Đặt lại bấm giờ".to_owned(), "\u{E777}")),
             "focus" => items.push(MenuItem::Row(DockMenuAction::Extra("focus_reset"), "Đặt lại hẹn giờ".to_owned(), "\u{E777}")),
             "trash" => {
                 items.push(MenuItem::Row(DockMenuAction::Extra("trash"), "Mở thùng rác".to_owned(), "\u{E8B7}"));

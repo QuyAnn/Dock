@@ -30,14 +30,20 @@ const CARD_BG: u32 = 0xFFFF_FF1C;
 pub const CATS: [&str; 7] = ["Tất cả widget", "Đồng hồ", "Năng suất", "Hệ thống", "AI", "Âm nhạc", "Thời tiết"];
 
 /// Every widget with its category index into `CATS`.
-pub const ITEMS: [(&str, usize); 16] = [
+pub const ITEMS: [(&str, usize); 22] = [
     ("clock", 1),
+    ("date", 1),
     ("git", 2),
     ("todo", 2),
     ("focus", 2),
+    ("timer", 2),
     ("downloads", 2),
     ("cpu", 3),
     ("ram", 3),
+    ("battery", 3),
+    ("net", 3),
+    ("disk", 3),
+    ("gpu", 3),
     ("lang", 3),
     ("cc", 3),
     ("chevron", 3),
@@ -48,6 +54,21 @@ pub const ITEMS: [(&str, usize); 16] = [
     ("media", 5),
     ("weather", 6),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gallery_lists_every_widget_once_in_the_right_category() {
+        for id in crate::settings::WIDGET_IDS {
+            assert_eq!(ITEMS.iter().filter(|(name, _)| *name == id).count(), 1, "{id}");
+        }
+        for (id, cat) in [("battery", 3), ("net", 3), ("disk", 3), ("gpu", 3), ("timer", 2), ("date", 1)] {
+            assert!(ITEMS.contains(&(id, cat)));
+        }
+    }
+}
 
 pub struct Entry {
     pub id: &'static str,

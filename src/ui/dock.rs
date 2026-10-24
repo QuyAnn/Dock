@@ -62,6 +62,8 @@ pub enum Style {
     Usage,
     /// Rounded card: optional icon square, title (muted, small) above value, optional bottom bar.
     Card,
+    /// Compact telemetry card: small heading over two full-width data rows.
+    Metrics,
     /// 34 px card with a circular gauge and the value centered (CPU, RAM).
     Ring,
     /// Glass square with one bold centred label (keyboard layout).
@@ -302,6 +304,7 @@ pub fn draw_tile(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Re
         match t.style {
             Style::Bare => draw_bare(r, t, rc)?,
             Style::Card => draw_card(r, t, rc, hovered)?,
+            Style::Metrics => draw_metrics(r, t, rc, hovered)?,
             Style::Usage => draw_usage(r, t, rc, hovered)?,
             Style::Note => draw_note(r, t, rc, hovered)?,
             Style::Label => draw_label(r, t, rc, hovered)?,
@@ -424,6 +427,15 @@ fn draw_card(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result
             r.fill_rounded_rect(fill, 1.25, if t.accent != 0 { t.accent } else { TEXT })?;
         }
     }
+    Ok(())
+}
+
+fn draw_metrics(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    let area = RectF { x: rc.x + 7.0, y: rc.y + (rc.h - 34.0) / 2.0, w: (rc.w - 14.0).max(0.0), h: 10.0 };
+    r.draw_text(&t.title, area, 7.5, MUTED, Align::Left)?;
+    r.draw_text_styled(&t.value, RectF { y: area.y + 10.0, h: 12.0, ..area }, 10.0, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(&t.sub, RectF { y: area.y + 22.0, h: 12.0, ..area }, 10.0, TEXT, Align::Left)?;
     Ok(())
 }
 

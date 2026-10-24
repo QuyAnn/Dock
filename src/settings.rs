@@ -17,6 +17,12 @@ pub struct TileSettings {
     pub music: bool,
     pub cpu: bool,
     pub ram: bool,
+    pub battery: bool,
+    pub net: bool,
+    pub disk: bool,
+    pub gpu: bool,
+    pub timer: bool,
+    pub date: bool,
     pub weather: bool,
     pub focus: bool,
     pub todo: bool,
@@ -36,6 +42,12 @@ impl Default for TileSettings {
             music: true,
             cpu: true,
             ram: true,
+            battery: false,
+            net: false,
+            disk: false,
+            gpu: false,
+            timer: false,
+            date: false,
             weather: true,
             focus: false,
             todo: false,
@@ -47,8 +59,8 @@ impl Default for TileSettings {
 }
 
 /// Every widget that can sit on the left or right of the dock, with the Settings key it uses.
-pub const WIDGET_IDS: [&str; 16] =
-    ["git", "claude", "codex", "cursor", "grok", "media", "weather", "cpu", "ram", "focus", "todo", "downloads", "chevron", "cc", "lang", "clock"];
+pub const WIDGET_IDS: [&str; 22] =
+    ["git", "claude", "codex", "cursor", "grok", "media", "weather", "cpu", "ram", "focus", "todo", "downloads", "chevron", "cc", "lang", "clock", "battery", "net", "disk", "gpu", "timer", "date"];
 
 /// Always on: these can be moved but not removed (tray chevron, Wi-Fi/volume button, clock).
 pub fn is_fixed_widget(id: &str) -> bool {
@@ -67,7 +79,7 @@ pub struct WidgetLayout {
 impl Default for WidgetLayout {
     fn default() -> Self {
         let own = |ids: &[&str]| ids.iter().map(|s| (*s).to_owned()).collect();
-        Self { left: own(&["git", "claude", "codex", "cursor", "grok", "weather", "focus", "todo", "downloads"]), right: own(&["chevron", "cc", "media", "cpu", "ram", "lang", "clock"]) }
+        Self { left: own(&["git", "claude", "codex", "cursor", "grok", "weather", "focus", "todo", "downloads", "timer"]), right: own(&["chevron", "cc", "media", "cpu", "ram", "battery", "net", "disk", "gpu", "lang", "date", "clock"]) }
     }
 }
 
@@ -148,6 +160,12 @@ impl TileSettings {
             "weather" => self.weather,
             "cpu" => self.cpu,
             "ram" => self.ram,
+            "battery" => self.battery,
+            "net" => self.net,
+            "disk" => self.disk,
+            "gpu" => self.gpu,
+            "timer" => self.timer,
+            "date" => self.date,
             "focus" => self.focus,
             "lang" => self.lang,
             "todo" => self.todo,
@@ -168,6 +186,12 @@ impl TileSettings {
             "weather" => self.weather = on,
             "cpu" => self.cpu = on,
             "ram" => self.ram = on,
+            "battery" => self.battery = on,
+            "net" => self.net = on,
+            "disk" => self.disk = on,
+            "gpu" => self.gpu = on,
+            "timer" => self.timer = on,
+            "date" => self.date = on,
             "focus" => self.focus = on,
             "lang" => self.lang = on,
             "todo" => self.todo = on,
@@ -190,6 +214,12 @@ pub fn widget_label(id: &str) -> &'static str {
         "weather" => "Thời tiết",
         "cpu" => "CPU",
         "ram" => "RAM",
+        "battery" => "Pin",
+        "net" => "Tốc độ mạng",
+        "disk" => "Dung lượng trống",
+        "gpu" => "GPU",
+        "timer" => "Bấm giờ",
+        "date" => "Ngày tháng",
         "focus" => "Hẹn giờ tập trung",
         "lang" => "Ngôn ngữ bàn phím",
         "todo" => "Ghi chú",
@@ -205,6 +235,28 @@ pub fn widget_label(id: &str) -> &'static str {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn new_widgets_load_from_old_settings_and_persist_switches_and_positions() {
+        let mut s: Settings = serde_json::from_str(r#"{"tiles":{"cpu":false},"layout":{"left":["git"],"right":["clock"]}}"#).unwrap();
+        s.layout.normalize();
+        for id in ["battery", "net", "disk", "gpu", "timer", "date"] {
+            assert!(!s.widget_shown(id), "{id} defaults off for old settings");
+            assert!(!widget_label(id).is_empty());
+            assert!(!is_fixed_widget(id));
+            s.tiles.set(id, true);
+            assert!(s.widget_shown(id));
+            s.layout.place(id, true, 0);
+        }
+        let loaded: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(loaded, s);
+        assert!(!loaded.tiles.cpu);
+        for id in ["battery", "net", "disk", "gpu", "timer", "date"] {
+            assert!(loaded.layout.is_left(id));
+            s.tiles.set(id, false);
+            assert!(!s.widget_shown(id));
+        }
+    }
 
     #[test]
     fn widget_layout_normalize_fills_missing_and_drops_unknown() {
