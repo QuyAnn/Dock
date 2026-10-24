@@ -9,6 +9,7 @@ pub struct WidgetStats {
     pub net: Option<(f64, f64)>,
     /// Free bytes on C: and D:; None for missing or inaccessible drives.
     pub disk_free: [Option<u64>; 2],
+    pub disk_total: [Option<u64>; 2],
     pub gpu_pct: Option<f32>,
 }
 
@@ -20,7 +21,10 @@ pub struct Battery {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct Media { pub title: String, pub artist: String, pub playing: bool }
+pub struct Media {
+    pub title: String, pub artist: String, pub playing: bool,
+    pub timeline: Option<(f64,f64)>,
+}
 
 #[derive(Clone, Debug)]
 pub struct WindowEntry {

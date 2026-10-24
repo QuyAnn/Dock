@@ -1,6 +1,6 @@
 //! Original SmartDock widgets: shared live dock/gallery views and small interactive popups.
 use std::cell::{Cell, RefCell};
-use chrono::{Datelike, Local, Timelike, Utc};
+use chrono::{Datelike, Local, Utc};
 use windows::core::Result;
 use super::dock::{RectF, Style, TileView};
 use super::renderer::{Align, Renderer, TextStyle};
@@ -20,16 +20,8 @@ fn center(r:&mut Renderer,s:&str,rc:RectF,px:f32,color:u32) -> Result<()> { r.dr
 fn inside(rc:RectF,x:f32,y:f32) -> bool { x>=rc.x && x<rc.x+rc.w && y>=rc.y && y<rc.y+rc.h }
 
 pub fn width(id:&str) -> Option<f32> {
-    Some(match id {
-        "pomodoro" => 148.0, "stopwatch" => 120.0, "notes" => 170.0,
-        "dayprog" | "monthprog" => 110.0, "yearprog" => 190.0,
-        "theme" => 94.0, "brightness" => 114.0, "recyclebin" => 142.0,
-        "screenshot" => 104.0, "recentshots" => 158.0, "search" => 138.0,
-        "worldclock" => 222.0, "analog" => 48.0, "flipclock" => 104.0,
-        "segclock" => 118.0, "daynum" => 54.0, "sun" => 148.0,
-        "hourly" => 234.0, "forecast" => 206.0, "metric" => 138.0,
-        "currency" => 158.0, "screentime" => 144.0, _ => return None,
-    })
+    if !crate::settings::WIDGET_IDS[22..].contains(&id) {return None;}
+    super::widget_design::width(id)
 }
 pub fn has_popup(id:&str) -> bool {
     matches!(id,"stopwatch"|"notes"|"search"|"worldclock"|"brightness"|"recentshots"|"currency"|"screentime"|"sun"|"hourly"|"forecast"|"metric")
@@ -66,7 +58,10 @@ pub fn view(id:&str,d:&DataState,s:&Settings) -> Option<TileView> {
         "daynum" => TileView::card(now.format("%m / %Y").to_string(),now.day().to_string()),
         "sun" => { let value = d.weather.as_ref().and_then(|w| Some(format!("{} ↑  {} ↓",weather_time(w.sunrise?,w),weather_time(w.sunset?,w)))).unwrap_or("Chưa có dữ liệu".into()); TileView::card("MẶT TRỜI",value) }
         "hourly"|"forecast" => TileView::card(if id=="hourly" {"6 GIỜ TỚI"} else {"4 NGÀY TỚI"},if d.weather.is_some() {""} else {"Chưa có dữ liệu"}),
-        "metric" => { let f=finance::snapshot(); TileView {sub:if f.btc_error {"Cũ"} else {"USD"}.into(),..TileView::card("BITCOIN",f.btc.map_or(if f.btc_error {"Lỗi mạng"} else {"Đang tải…"}.into(),|n|format!("${n:.0}")))} }
+        "metric" => { let f=finance::snapshot(); TileView {
+            detail:f.btc_change.map_or("—".into(),|n|format!("{} {:.2}%",if n>=0.0 {"▲"}else{"▼"},n.abs())),
+            accent:if f.btc_change.is_some_and(|n|n<0.0) {0xFF45_3AFF}else{0x29CD_50FF},
+            sub:if f.btc_error {"Cũ"} else {"USD"}.into(),..TileView::card("BITCOIN",f.btc.map_or(if f.btc_error {"Lỗi mạng"} else {"Đang tải…"}.into(),|n|format!("${n:.0}")))} }
         "currency" => { let f=finance::snapshot(); TileView {style:Style::Metrics,
             sub:finance::convert(&f.rates,s.currency_amount,&s.currency_from,&s.currency_to).map_or("Chưa có tỷ giá".into(),|n|format!("{n:.2} {}{}",s.currency_to,if f.rates_error {" · cũ"} else {""})),
             ..TileView::card("ĐỔI TIỀN",format!("{} {}",s.currency_amount,s.currency_from))} }
@@ -77,13 +72,12 @@ pub fn view(id:&str,d:&DataState,s:&Settings) -> Option<TileView> {
     if matches!(id,"pomodoro"|"yearprog"|"worldclock"|"analog"|"flipclock"|"segclock"|"daynum"|"sun"|"hourly"|"forecast"|"recentshots") {
         v.style=Style::Widget;
     }
-    v.extra=id.into(); Some(v)
+    v.extra=id.into(); v.design_id=id.into(); Some(v)
 }
 fn duration_text(secs:f64) -> String { format!("{} giờ {} phút",secs as u64/3600,secs as u64/60%60) }
 fn weather_time(at:i64,w:&crate::data::weather::Weather) -> String {
     chrono::DateTime::from_timestamp(at+w.utc_offset_seconds as i64,0).map_or("--:--".into(),|d|d.format("%H:%M").to_string())
 }
-fn weather_glyph(code:u32) -> &'static str { match code {0=>"☀",1..=3=>"☁",4..=48=>"≋",49..=67|78..=82=>"☂",68..=77|83..=86=>"❄",_=>"ϟ"} }
 
 /// Clock/forecast geometry is drawn from live data attached to the view. Never fetch in paint.
 pub fn enrich(v:&mut TileView,d:&DataState,s:&Settings) {
@@ -97,18 +91,19 @@ pub fn enrich(v:&mut TileView,d:&DataState,s:&Settings) {
                 let mut rows=Vec::new();
                 if v.extra=="hourly" {
                     for h in w.hourly.iter().filter(|h|h.at>=Utc::now().timestamp()).take(6) {
-                        rows.push(super::dock::UsageRow {label:weather_time(h.at,w),value:format!("{:.0}°",h.temp),right:weather_glyph(h.code).into(),frac:0.0,color:BLUE});
+                        rows.push(super::dock::UsageRow {label:weather_time(h.at,w),value:format!("{:.0}°",h.temp),right:h.code.to_string(),frac:0.0,color:BLUE});
                     }
                 } else {
                     let local_date=chrono::DateTime::from_timestamp(Utc::now().timestamp()+w.utc_offset_seconds as i64,0).unwrap().date_naive();
                     for day in w.daily.iter().filter(|day|chrono::NaiveDate::parse_from_str(&day.date,"%Y-%m-%d").is_ok_and(|d|d>local_date)).take(4) {
-                        rows.push(super::dock::UsageRow {label:day.date.get(5..).unwrap_or(&day.date).into(),value:format!("{:.0}/{:.0}°",day.min,day.max),right:weather_glyph(day.code).into(),frac:0.0,color:BLUE});
+                        rows.push(super::dock::UsageRow {label:chrono::NaiveDate::parse_from_str(&day.date,"%Y-%m-%d").map_or(day.date.clone(),|d|d.format("%a").to_string()),value:format!("{:.0}°/{:.0}°",day.max,day.min),right:day.code.to_string(),frac:0.0,color:BLUE});
                     }
                 }
                 v.rows=rows;
                 if v.rows.is_empty() { v.value="Chờ cập nhật".into(); }
             }
         }
+        "screentime" => {v.series=vec![crate::data::screentime::snapshot().ranked().iter().take(6).map(|(_,v)|*v as f32).collect()];}
         "sun" => {
             v.progress=d.weather.as_ref().and_then(|w| {
                 let (rise,set)=(w.sunrise?,w.sunset?);
@@ -120,105 +115,10 @@ pub fn enrich(v:&mut TileView,d:&DataState,s:&Settings) {
 }
 
 pub fn draw(r:&mut Renderer,t:&TileView,rc:RectF,hover:bool) -> Result<()> {
-    super::glass::draw_glass(r,rc,super::glass::GLASS_RADIUS,super::glass::Layer::Tile,hover)?;
-    let now=Local::now();
-    match t.extra.as_str() {
-        "pomodoro" => {
-            let a=rect(rc.x+7.0,rc.y+4.0,rc.w-38.0,11.0);
-            text(r,&t.title,a,7.5,MUTED)?;
-            center(r,&format!("{} {}",t.value,t.sub),rect(a.x,a.y+11.0,a.w,19.0),15.0,WHITE)?;
-            let skip=rect(rc.x+rc.w-29.0,rc.y+8.0,23.0,26.0);
-            r.fill_rounded_rect(skip,7.0,0xFFFF_FF20)?; center(r,"»",skip,19.0,WHITE)?;
-            r.fill_rounded_rect(rect(a.x,rc.y+rc.h-4.0,(rc.w-14.0)*t.progress.unwrap_or(0.0),2.0),1.0,t.accent)?;
-        }
-        "analog" => {
-            let (cx,cy)=(rc.x+rc.w/2.0,rc.y+rc.h/2.0); let radius=rc.w.min(rc.h)*0.40;
-            r.stroke_arc(cx,cy,radius,0.0,360.0,0xFFFF_FF66,1.0)?;
-            for i in 0..12 { let a=(i as f32*30.0-90.0).to_radians();
-                r.stroke_line(cx+a.cos()*(radius-2.0),cy+a.sin()*(radius-2.0),cx+a.cos()*radius,cy+a.sin()*radius,WHITE,1.0)?; }
-            for (angle,length,color,width) in [(now.hour() as f32*30.0+now.minute() as f32/2.0,radius*0.52,WHITE,2.0),
-                (now.minute() as f32*6.0+now.second() as f32/10.0,radius*0.78,WHITE,1.5),(now.second() as f32*6.0,radius*0.82,ORANGE,1.0)] {
-                let a=(angle-90.0).to_radians(); r.stroke_line(cx,cy,cx+a.cos()*length,cy+a.sin()*length,color,width)?;
-            }
-            r.fill_rounded_rect(rect(cx-2.0,cy-2.0,4.0,4.0),2.0,ORANGE)?;
-        }
-        "flipclock" => {
-            let pitch=(rc.w-12.0)/4.0;
-            for (i,ch) in t.value.chars().filter(|c|c.is_ascii_digit()).enumerate() {
-                let cell=rect(rc.x+5.0+i as f32*pitch,rc.y+6.0,pitch-2.0,rc.h-12.0);
-                r.fill_rounded_rect_gradient(cell,4.0,0x333B_49FF,0x171D_28FF)?;
-                center(r,&ch.to_string(),cell,23.0,WHITE)?;
-                r.stroke_line(cell.x,cell.y+cell.h/2.0,cell.x+cell.w,cell.y+cell.h/2.0,0x0000_0090,1.1)?;
-            }
-        }
-        "segclock" => {
-            let pitch=(rc.w-12.0)/5.0;
-            for (i,ch) in t.value.chars().enumerate() {
-                let a=rect(rc.x+6.0+i as f32*pitch,rc.y+9.0,pitch-4.0,rc.h-18.0);
-                if ch==':' { for f in [0.33,0.66] {r.fill_rounded_rect(rect(a.x+a.w/2.0-1.0,a.y+a.h*f,2.5,2.5),1.0,GREEN)?;} }
-                else if let Some(n)=ch.to_digit(10) { draw_digit(r,n as usize,a)?; }
-            }
-        }
-        "daynum" => {
-            let page=rect(rc.x+5.0,rc.y+3.0,rc.w-10.0,rc.h-6.0);
-            r.fill_rounded_rect(page,5.0,0xF4F1_EAFF)?;
-            r.fill_top_rounded_rect(rect(page.x,page.y,page.w,10.0),5.0,0xEB65_64FF)?;
-            center(r,&format!("THÁNG {}",now.month()),rect(page.x,page.y,page.w,10.0),6.0,WHITE)?;
-            center(r,&t.value,rect(page.x,page.y+10.0,page.w,page.h-10.0),22.0,0x2027_32FF)?;
-        }
-        "yearprog" => {
-            let cols=53; let rows=7;
-            let pitch=((rc.w-12.0)/cols as f32).min((rc.h-14.0)/rows as f32);
-            text(r,&format!("{} · {}",now.year(),t.value),rect(rc.x+6.0,rc.y+1.0,rc.w-12.0,10.0),7.0,MUTED)?;
-            for (i,&done) in t.cells.iter().enumerate() {
-                let a=rect(rc.x+6.0+(i/7) as f32*pitch,rc.y+13.0+(i%7) as f32*pitch,(pitch-0.9).max(0.5),(pitch-0.9).max(0.5));
-                r.fill_rounded_rect(a,0.7,if i==now.ordinal0() as usize {ORANGE} else if done>0 {GREEN} else {0xFFFF_FF30})?;
-            }
-        }
-        "worldclock"|"hourly"|"forecast" => {
-            let n=t.rows.len();
-            if n==0 { text(r,&t.value,rect(rc.x+7.0,rc.y,rc.w-14.0,rc.h),10.0,MUTED)?; }
-            else {
-                let pitch=(rc.w-8.0)/n as f32;
-                for (i,row) in t.rows.iter().enumerate() {
-                    let a=rect(rc.x+4.0+i as f32*pitch,rc.y+3.0,pitch,11.0);
-                    center(r,&row.label,a,7.5,MUTED)?;
-                    center(r,&row.value,RectF{y:a.y+10.0,h:16.0,..a},if n>4 {9.0} else {11.0},WHITE)?;
-                    center(r,&row.right,RectF{y:a.y+26.0,h:9.0,..a},8.0,if t.extra=="worldclock" {MUTED} else {ORANGE})?;
-                }
-            }
-        }
-        "recentshots" => {
-            let shots=tools::shots();
-            if shots.is_empty() {text(r,"Chưa có ảnh chụp",rect(rc.x+8.0,rc.y,rc.w-16.0,rc.h),10.0,MUTED)?;}
-            let pitch=(rc.w-12.0)/3.0;
-            for (i,shot) in shots.iter().enumerate() { draw_shot(r,shot,rect(rc.x+5.0+i as f32*pitch,rc.y+5.0,pitch-3.0,rc.h-10.0))?; }
-        }
-        "sun" => {
-            let cx=rc.x+rc.w/2.0; let cy=rc.y+29.0; let rad=22.0;
-            r.stroke_arc(cx,cy,rad,180.0,180.0,0xFFFF_FF50,1.5)?;
-            if let Some(frac)=t.progress {let a=std::f32::consts::PI*(1.0-frac);r.fill_rounded_rect(rect(cx+a.cos()*rad-3.0,cy-a.sin()*rad-3.0,6.0,6.0),3.0,ORANGE)?;}
-            text(r,&t.value,rect(rc.x+6.0,rc.y+30.0,rc.w-12.0,10.0),8.0,MUTED)?;
-        }
-        _=>{}
-    }
-    Ok(())
-}
-fn draw_digit(r:&mut Renderer,n:usize,a:RectF) -> Result<()> {
-    const MASK:[u8;10]=[0x3f,0x06,0x5b,0x4f,0x66,0x6d,0x7d,0x07,0x7f,0x6f];
-    let w=a.w; let h=a.h; let b=1.8;
-    for (i,seg) in [rect(a.x+b,a.y,w-2.0*b,b),rect(a.x+w-b,a.y+b,b,h/2.0-b),
-        rect(a.x+w-b,a.y+h/2.0,b,h/2.0-b),rect(a.x+b,a.y+h-b,w-2.0*b,b),
-        rect(a.x,a.y+h/2.0,b,h/2.0-b),rect(a.x,a.y+b,b,h/2.0-b),rect(a.x+b,a.y+h/2.0-b/2.0,w-2.0*b,b)].iter().enumerate() {
-        r.fill_rounded_rect(*seg,0.6,if MASK[n]&(1<<i)!=0 {GREEN} else {0x62DA_A01A})?;
-    }
-    Ok(())
+    super::widget_design::draw(r,t,rc,hover)
 }
 fn draw_shot(r:&mut Renderer,shot:&tools::Shot,a:RectF) -> Result<()> {
-    r.fill_rounded_rect(a,4.0,0x0000_0050)?;
-    let scale=(a.w/shot.w as f32).min(a.h/shot.h as f32);
-    let (w,h)=(shot.w as f32*scale,shot.h as f32*scale);
-    r.draw_bitmap(shot.w,shot.h,&shot.rgba,rect(a.x+(a.w-w)/2.0,a.y+(a.h-h)/2.0,w,h))
+    r.draw_bitmap_rounded(shot.w,shot.h,&shot.rgba,a,7.0)
 }
 
 #[derive(Debug,PartialEq)]
@@ -391,6 +291,7 @@ pub fn paint_popup(r:&mut Renderer,id:&str,rc:RectF,d:&DataState,s:&Settings) ->
             let stamp=f.btc_at.map_or("Chưa tải thành công".into(),|t|format!("Lần cuối: {}",t.with_timezone(&Local).format("%H:%M:%S")));
             text(r,&stamp,rect(x,y+136.0,w,24.0),10.0,MUTED)?;
             if f.btc_error {text(r,"Lỗi mạng · đang giữ giá cũ",rect(x,y+164.0,w,24.0),10.0,ORANGE)?;}
+            else {text(r,"% thay đổi so với lần tải giá thành công trước.",rect(x,y+164.0,w,24.0),10.0,MUTED)?;}
         }
         "sun"|"hourly"|"forecast"=>{
             if let Some(v)=view(id,d,s) { let mut v=v;enrich(&mut v,d,s);draw(r,&v,rect(x,y+50.0,w,64.0),false)?; }

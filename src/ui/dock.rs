@@ -96,6 +96,11 @@ pub enum Style {
 
 /// Plain values for one tile. Caller fills these from model data.
 pub struct TileView {
+    /// Stable widget identity for the shared dock/gallery visual recipe.
+    pub design_id: String,
+    /// Live chart series, oldest sample first. Never synthesized by the painter.
+    pub series: Vec<Vec<f32>>,
+    pub detail: String,
     pub style: Style,
     pub title: String,
     pub value: String,
@@ -139,6 +144,9 @@ impl TileView {
     /// Card with a title and a value, no extras.
     pub fn card(title: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
+            design_id: String::new(),
+            series: Vec::new(),
+            detail: String::new(),
             style: Style::Card,
             title: title.into(),
             value: value.into(),
@@ -303,6 +311,9 @@ pub fn draw_dock(
 
 /// Draws one tile in its style (the dock bar and the widget gallery previews share this).
 pub fn draw_tile(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+        if super::widget_design::reference(&t.design_id).is_some() {
+            return super::widget_design::draw(r, t, rc, hovered);
+        }
         match t.style {
             Style::Widget => super::more_widgets::draw(r, t, rc, hovered)?,
             Style::Bare => draw_bare(r, t, rc)?,

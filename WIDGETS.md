@@ -1,5 +1,67 @@
 # Widget bổ sung
 
+## Đợt chỉnh giao diện theo ảnh tham chiếu
+
+Đã vẽ lại **44/45 widget** trong dock và gallery bằng Direct2D/DirectWrite.
+`gpu` giữ giao diện cũ vì không có ảnh GPU tương ứng. Không thêm tài sản LumaBar;
+`.design-ref/` vẫn được gitignore và không được ứng dụng đọc/giải mã/đóng gói.
+Ảnh render kiểm tra nằm trong `target/visual-audit/` (96 và 192 DPI, gallery từng nhóm).
+
+| Widget SmartDock | Ảnh mẫu chính (bỏ đuôi `-dark.webp`) |
+| --- | --- |
+| `clock` | `clock`; khi gộp thời tiết: `clock-and-weather`; kiểu rộng: `today` |
+| `date`, `daynum` | `date`, `day-number` |
+| `analog`, `flipclock`, `segclock`, `worldclock` | `analog-classic`, `flip-clock`, `segment-clock`, `world-clock` |
+| `dayprog`, `monthprog`, `yearprog` | `day-progress`, `month-progress`, `year-progress` |
+| `focus`, `pomodoro`, `timer`, `stopwatch` | `pomodoro` (hai bộ tập trung), `timer`, `stopwatch` |
+| `git`, `todo`, `notes`, `downloads` | `github-activity`, `todos`, `notes`, `downloads` |
+| `cpu`, `ram`, `battery`, `net`, `disk` | `cpu`, `ram`, `battery`, `network`, `storage` |
+| `claude`, `codex`, `cursor`, `grok` | `claude-plan-usage`, `chatgpt-usage`, `cursor-usage`, `grok-usage-dark-C-b1PNvn.webp` |
+| `media` | `now-playing` |
+| `weather`, `sun`, `hourly`, `forecast` | `weather`, `sunrise-and-sunset`, `hourly`, `weather-forecast` |
+| `theme`, `brightness`, `recyclebin`, `screenshot`, `recentshots`, `search` | `theme-toggle`, `brightness`, `recycle-bin`, `screenshot-capture`, `recent-screenshots`, `search` |
+| `metric`, `currency`, `screentime` | `metric`, `currency`, `screen-time` |
+| `cc`, `chevron`, `lang` | `quick-toggles`, `tray`, `language-dark-aFiJF-sI.webp` |
+
+Biểu đồ mạng dùng tối đa 48 số đo thật và ngắt chuỗi khi mất dữ liệu; thanh lưu trữ
+dùng dung lượng tổng/trống của ổ C. Đường tiến độ media dùng timeline SMTC nếu có.
+Badge Bitcoin hiển thị thay đổi giữa hai lần tải thành công, chưa có lần trước thì `—`;
+không giả định đây là biến động 24 giờ. Screen Time dùng các tổng thời gian ứng dụng
+đang được theo dõi cục bộ. Popup thời tiết dùng lại cùng bộ vẽ; ảnh chụp popup cũng bo góc.
+Không có ảnh nào trong bộ mẫu thể hiện một popup độc lập để đối chiếu toàn bộ thẻ popup.
+
+Các mẫu **không có widget độc lập tương ứng** trong 45 ID hiện tại:
+
+- `7-days`, `commands`, `day-timeline`, `recently-opened`, `wallpaper-gallery`,
+  `system-stats` (thẻ CPU/RAM gộp), `temperature`.
+- `apps`, `audio-output`, `calendar`: có vùng ứng dụng, âm lượng và lịch trong SmartDock,
+  nhưng không có widget riêng với bố cục/nội dung của các mẫu này.
+- `datafast-chart`, `dodo-chart`, `dodo-payments`, `dub`, `gumroad-chart`, `gumroad`,
+  `lemon-squeezy-chart`, `lemon-squeezy`, `paddle-chart`, `paddle`, `plausible`,
+  `polar-chart`, `polar`, `resend`, `shopify-chart`, `shopify`, `stripe-chart`, `stripe`,
+  `supabase`, `total-revenue`.
+- `deepseek-balance`, `gemini-usage`, `glm-usage`, `opencode-plan-usage`, `opencode-usage`.
+- `gmail`, `instagram`, `leetcode-stats`, `linear`, `stock-chart`, `stock`,
+  `stock-watchlist`, `tiktok`, `x-profile`, `youtube`.
+
+Biến thể của widget đã có, chưa có lựa chọn kiểu riêng: `analog-classic-dark`
+(cả bản dark/light), `analog-minimal`, `claude-usage`, `github`, `github-overview`,
+`now-playing-2`, `now-playing-bar`, `now-playing-mini`, `today-and-forecast`,
+`weather-details`, `weather-status`, `world-clocks`, `world-time`.
+
+Tệp thay đổi trong đợt này: `src/ui/widget_design.rs` (mới), `src/ui/dock.rs`,
+`src/ui/more_widgets.rs`, `src/ui/renderer.rs`, `src/ui/tiles.rs`, `src/ui/mod.rs`,
+`src/main.rs`, `src/model.rs`, `src/data/widgets.rs`, `src/data/finance.rs`,
+`src/win/system.rs`, `WIDGETS.md`.
+
+Kiểm tra: `cargo build` debug thành công; `cargo test`: **58 passed, 0 failed**, gồm 56 test cũ và 2 test mới
+(vẽ 44 widget/gallery ở hai mức DPI; giới hạn/ngắt lịch sử mạng).
+Chưa xác nhận khớp từng pixel: trình xem ảnh gốc làm một phần chữ trắng khó đọc;
+công cụ ghép nền tối bị bộ duyệt tự động từ chối thực thi do lỗi cấu hình 403
+(`codex-auto-review` không khả dụng). Không xử lý lại ảnh tham chiếu qua đường khác.
+
+---
+
 Mở **Thư viện widget…** trong menu chuột phải của dock để xem preview trực tiếp,
 bật/tắt hoặc kéo widget sang vị trí khác. 23 widget mới mặc định tắt; cấu hình cũ
 và widget cũ được giữ lại. Nhãn và mã nguồn dùng UTF-8.

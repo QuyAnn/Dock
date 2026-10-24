@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory1, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory1, ID2D1HwndRenderTarget, ID2D1RenderTarget, ID2D1SolidColorBrush,
     ID2D1StrokeStyle, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
@@ -151,6 +151,8 @@ fn rounded(r: RectF, radius: f32) -> D2D1_ROUNDED_RECT {
 }
 
 pub struct Renderer {
+    #[cfg(test)]
+    test_target: Option<ID2D1RenderTarget>,
     hwnd: HWND,
     pixel_w: u32,
     pixel_h: u32,
@@ -164,9 +166,48 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Offscreen D2D target for visual regression checks; never creates a desktop window.
+    #[cfg(test)]
+    pub fn test_surface(w:u32,h:u32,dpi:u32)->Result<(Self,windows::Win32::Graphics::Imaging::IWICBitmap)> {
+        use windows::Win32::Graphics::Imaging::*;
+        use windows::Win32::System::Com::*;
+        unsafe {
+            let _=CoInitializeEx(None,COINIT_MULTITHREADED);
+            let factory:IWICImagingFactory=CoCreateInstance(&CLSID_WICImagingFactory,None,CLSCTX_INPROC_SERVER)?;
+            let bitmap=factory.CreateBitmap(w,h,&GUID_WICPixelFormat32bppPBGRA,WICBitmapCacheOnLoad)?;
+            let props=D2D1_RENDER_TARGET_PROPERTIES{pixelFormat:D2D1_PIXEL_FORMAT{format:DXGI_FORMAT_B8G8R8A8_UNORM,alphaMode:D2D1_ALPHA_MODE_PREMULTIPLIED},dpiX:dpi as f32,dpiY:dpi as f32,..Default::default()};
+            let rt=d2d_factory()?.CreateWicBitmapRenderTarget(&bitmap,&props)?;
+            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            let brush=rt.CreateSolidColorBrush(&color(0),None)?;
+            let mut r=Self::new(HWND::default(),w as i32,h as i32,dpi);
+            r.test_target=Some(rt);r.brush=Some(brush);
+            Ok((r,bitmap))
+        }
+    }
+
+    #[cfg(test)]
+    pub fn save_test_png(bitmap:&windows::Win32::Graphics::Imaging::IWICBitmap,path:&std::path::Path)->Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Graphics::Imaging::*;
+        use windows::Win32::System::Com::*;
+        use windows::Win32::Foundation::GENERIC_WRITE;
+        let path:Vec<u16>=path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            let factory:IWICImagingFactory=CoCreateInstance(&CLSID_WICImagingFactory,None,CLSCTX_INPROC_SERVER)?;
+            let stream=factory.CreateStream()?;stream.InitializeFromFilename(windows::core::PCWSTR(path.as_ptr()),GENERIC_WRITE.0)?;
+            let encoder=factory.CreateEncoder(&GUID_ContainerFormatPng,std::ptr::null())?;
+            encoder.Initialize(&stream,WICBitmapEncoderNoCache)?;
+            let (mut frame,mut options)=(None,None);encoder.CreateNewFrame(&mut frame,&mut options)?;
+            let frame=frame.expect("WIC frame");frame.Initialize(options.as_ref())?;
+            frame.WriteSource(bitmap,std::ptr::null())?;frame.Commit()?;encoder.Commit()
+        }
+    }
+
     /// Lightweight: no Direct2D resources are created until the first draw.
     pub fn new(hwnd: HWND, pixel_w: i32, pixel_h: i32, dpi: u32) -> Self {
         Self {
+            #[cfg(test)]
+            test_target: None,
             hwnd,
             pixel_w: pixel_w.max(1) as u32,
             pixel_h: pixel_h.max(1) as u32,
@@ -210,7 +251,9 @@ impl Renderer {
         self.target = None;
     }
 
-    fn parts(&mut self) -> Result<(&ID2D1HwndRenderTarget, &ID2D1SolidColorBrush)> {
+    fn parts(&mut self) -> Result<(&ID2D1RenderTarget, &ID2D1SolidColorBrush)> {
+        #[cfg(test)]
+        if let Some(rt)=&self.test_target {return Ok((rt,self.brush.as_ref().expect("test brush")));}
         if self.target.is_none() {
             let factory = d2d_factory()?;
             let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
@@ -239,7 +282,7 @@ impl Renderer {
             self.brush = Some(brush);
         }
         Ok((
-            self.target.as_ref().expect("created above"),
+            &**self.target.as_ref().expect("created above"),
             self.brush.as_ref().expect("created above"),
         ))
     }
@@ -270,6 +313,8 @@ impl Renderer {
 
     /// Ends the frame. If the device was lost, the target is dropped and rebuilt on next `begin`.
     pub fn end(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(rt)=&self.test_target {return unsafe {rt.EndDraw(None,None)};}
         let Some(rt) = self.target.as_ref() else { return Ok(()) };
         // SAFETY: paired with `begin`.
         match unsafe { rt.EndDraw(None, None) } {
@@ -317,6 +362,34 @@ impl Renderer {
         // SAFETY: paired with `push_clip`.
         unsafe { rt.PopAxisAlignedClip() };
         Ok(())
+    }
+
+    /// Anti-aliased rounded mask. Always pops the layer, including on a draw error.
+    pub fn with_rounded_clip(&mut self, rect:RectF, radius:f32, draw:impl FnOnce(&mut Self)->Result<()>) -> Result<()> {
+        use std::mem::ManuallyDrop;
+        use windows::core::Interface;
+        use windows::Foundation::Numerics::Matrix3x2;
+        use windows::Win32::Graphics::Direct2D::{D2D1_LAYER_PARAMETERS, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, ID2D1Layer};
+        let geometry:ID2D1Geometry=unsafe {d2d_factory()?.CreateRoundedRectangleGeometry(&rounded(rect,radius))?.cast()?};
+        let target=self.parts()?.0.clone();
+        let mut params=D2D1_LAYER_PARAMETERS {
+            contentBounds:d2d_rect(rect), geometricMask:ManuallyDrop::new(Some(geometry)),
+            maskAntialiasMode:D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform:Matrix3x2{M11:1.0,M22:1.0,..Default::default()}, opacity:1.0,
+            ..Default::default()
+        };
+        unsafe {target.PushLayer(&params,None::<&ID2D1Layer>);}
+        let result=draw(self);
+        unsafe {target.PopLayer();}
+        unsafe {ManuallyDrop::drop(&mut params.geometricMask);}
+        result
+    }
+
+    /// Aspect-fill a user thumbnail inside a rounded card, without stretching its pixels.
+    pub fn draw_bitmap_rounded(&mut self,w:u32,h:u32,rgba:&[u8],rect:RectF,radius:f32)->Result<()> {
+        let scale=(rect.w/w.max(1) as f32).max(rect.h/h.max(1) as f32);
+        let (dw,dh)=(w as f32*scale,h as f32*scale);
+        self.with_rounded_clip(rect,radius,|r|r.draw_bitmap(w,h,rgba,RectF{x:rect.x+(rect.w-dw)/2.0,y:rect.y+(rect.h-dh)/2.0,w:dw,h:dh}))
     }
 
     pub fn fill_rect(&mut self, rect: RectF, rgba: u32) -> Result<()> {
@@ -467,7 +540,7 @@ impl Renderer {
         &mut self,
         rect: RectF,
         radius: f32,
-        draw: impl FnOnce(&ID2D1HwndRenderTarget, &ID2D1SolidColorBrush, &ID2D1Geometry) -> Result<()>,
+        draw: impl FnOnce(&ID2D1RenderTarget, &ID2D1SolidColorBrush, &ID2D1Geometry) -> Result<()>,
         rgba: u32,
     ) -> Result<()> {
         let r = radius.max(0.0).min(rect.w / 2.0).min(rect.h);
