@@ -17,4 +17,3 @@ pub mod sficons; // macOS SF-Symbols-style Wi-Fi / speaker status icons (D2D geo
 pub mod liquid; // Liquid Glass dock background: blur, saturate, lens refraction (CPU, cached)
 pub mod trayview; // SmartDock's own tray overflow popup (hidden notification icons)
 pub mod more_widgets;
-pub mod widget_design;

@@ -8,8 +8,6 @@ use serde_json::Value;
 pub struct Finance {
     pub btc: Option<f64>,
     pub btc_at: Option<DateTime<Utc>>,
-    /// Percentage change since the previous successful spot quote; None on the first quote.
-    pub btc_change: Option<f64>,
     pub rates: BTreeMap<String, f64>,
     pub rates_at: Option<DateTime<Utc>>,
     pub btc_error: bool,
@@ -34,10 +32,7 @@ pub fn refresh_btc() {
     let value = super::http::agent().get("https://api.coinbase.com/v2/prices/BTC-USD/spot").call().ok()
         .and_then(|r| r.into_json::<Value>().ok()).and_then(|v| parse_btc(&v));
     let mut d = DATA.lock().unwrap_or_else(|e| e.into_inner()); d.btc_error = value.is_none();
-    if let Some(v) = value {
-        d.btc_change=d.btc.map(|previous|(v/previous-1.0)*100.0);
-        d.btc = Some(v); d.btc_at = Some(Utc::now());
-    }
+    if let Some(v) = value { d.btc = Some(v); d.btc_at = Some(Utc::now()); }
 }
 pub fn refresh_rates() {
     let value = super::http::agent().get("https://open.er-api.com/v6/latest/USD").call().ok()

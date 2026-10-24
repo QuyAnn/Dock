@@ -825,12 +825,11 @@ struct Zones {
 /// Provider card size: icon plate plus up to three limit lines (height 0 = the standard widget height).
 const USAGE_TILE_W: f32 = 170.0;
 /// Width of the wide clock style.
-const CLOCK_WIDE_W: f32 = 130.0;
+const CLOCK_WIDE_W: f32 = 136.0;
 const USAGE_TILE_H: f32 = 0.0; // same height as every other widget
 
 /// Dock width of a widget.
 fn widget_width(id: &str) -> f32 {
-    if let Some(width) = ui::widget_design::width(id) { return width; }
     if let Some(width) = ui::more_widgets::width(id) { return width; }
     match id {
         "git" => dock::GIT_W,
@@ -854,15 +853,6 @@ fn widget_width(id: &str) -> f32 {
     }
 }
 
-fn configured_widget_width(id:&str,s:&settings::Settings)->f32 {
-    if id=="clock" {
-        if s.clock_style=="wide" {CLOCK_WIDE_W}
-        else if s.tiles.weather && s.weather_position=="clock" {42.0}
-        else {widget_width(id)}
-    } else if settings::is_fixed_widget(id) {widget_width(id)}
-    else {(widget_width(id)*s.widget_scale()).round()}
-}
-
 fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     // Tight to the drawn slots: padding here would push the visible cluster off the centre.
     let apps_w = apps::cluster_width(app_count);
@@ -876,7 +866,13 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
             .filter(|id| *id != "brightness" || win::widget_tools::brightness().is_some())
             .map(|id| Tile {
                 id,
-                width: configured_widget_width(id,settings),
+                width: if id == "clock" && settings.clock_style == "wide" {
+                    CLOCK_WIDE_W
+                } else if settings::is_fixed_widget(id) {
+                    widget_width(id)
+                } else {
+                    (widget_width(id) * settings.widget_scale()).round()
+                },
                 // The provider cards carry up to three limit lines.
                 height: if matches!(id, "claude" | "codex" | "cursor" | "grok") { USAGE_TILE_H } else { 0.0 },
             })
@@ -1089,26 +1085,6 @@ fn tile_view(
     stats: &Stats,
     audio_peak: f32,
     settings: &settings::Settings,
-) -> TileView {
-    let mut view = tile_view_data(id, data, control, stats, audio_peak, settings);
-    view.design_id = if id == "clock" {
-        if settings.clock_style == "wide" {"clockwide"} else if settings.tiles.weather && settings.weather_position=="clock" {"clockweather"} else {"clock"}
-    } else {id}.into();
-    if id == "todo" {
-        view.title = "Việc cần làm".into();
-        let done = settings.todos.iter().filter(|t| t.done).count();
-        view.value = format!("{done}/{}", settings.todos.len());
-        view.progress = (!settings.todos.is_empty()).then_some(done as f32 / settings.todos.len() as f32);
-    }
-    if id == "net" {
-        view.series = vec![data.net_history.iter().map(|p| p.0).collect(), data.net_history.iter().map(|p| p.1).collect()];
-    }
-    view
-}
-
-fn tile_view_data(
-    id: &str, data: &DataState, control: &ControlState, stats: &Stats,
-    audio_peak: f32, settings: &settings::Settings,
 ) -> TileView {
     if let Some(mut view) = ui::more_widgets::view(id, data, settings) {
         ui::more_widgets::enrich(&mut view, data, settings);
@@ -1797,7 +1773,7 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
             },
             "start" => Click::Start,
             "systemsearch" => Click::Search,
-            "pomodoro" => Click::Action(if x >= rect.x + rect.w * (126.0/134.0) { "pomodoro_skip" } else { "pomodoro" }),
+            "pomodoro" => Click::Action(if x >= rect.x + rect.w - 32.0 { "pomodoro_skip" } else { "pomodoro" }),
             "stopwatch" => Click::Action("stopwatch"),
             "recentshots" => Click::Action(match (((x-rect.x-5.0)/((rect.w-12.0)/3.0)) as usize).min(2) { 0=>"shot0",1=>"shot1",_=>"shot2" }),
             "theme" | "screenshot" | "recyclebin" => Click::Action(id),
@@ -2018,7 +1994,13 @@ fn gallery_entries() -> Vec<ui::gallery::Entry> {
                 name: settings::widget_label(id),
                 cat,
                 view: tile_view(id, &data, &control, &stats, 0.0, &settings),
-                width: configured_widget_width(id,&settings),
+                width: if id == "clock" && settings.clock_style == "wide" {
+                    CLOCK_WIDE_W
+                } else if settings::is_fixed_widget(id) {
+                    widget_width(id)
+                } else {
+                    (widget_width(id) * settings.widget_scale()).round()
+                },
                 on: settings.widget_shown(id),
                 fixed: settings::is_fixed_widget(id),
                 disabled: id == "brightness" && win::widget_tools::brightness().is_none() && !settings.widget_shown(id),

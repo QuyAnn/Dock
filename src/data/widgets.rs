@@ -35,12 +35,10 @@ impl Sampler {
             self.gpu = GpuQuery::open();
             self.gpu_retry = Some(now);
         }
-        let disks = [disk_space(w!("C:\\")), disk_space(w!("D:\\"))];
         WidgetStats {
             battery: battery(),
             net,
-            disk_free: disks.map(|d| d.map(|(free, _)| free)),
-            disk_total: disks.map(|d| d.map(|(_, total)| total)),
+            disk_free: [disk_free(w!("C:\\")), disk_free(w!("D:\\"))],
             gpu_pct: self.gpu.as_mut().and_then(GpuQuery::read),
         }
     }
@@ -58,11 +56,11 @@ fn battery() -> Option<Battery> {
     })
 }
 
-fn disk_space(root: PCWSTR) -> Option<(u64,u64)> {
-    let (mut free, mut total) = (0, 0);
+fn disk_free(root: PCWSTR) -> Option<u64> {
+    let mut free = 0;
     // SAFETY: root is a static terminated path; the output is a valid local.
-    unsafe { GetDiskFreeSpaceExW(root, Some(&mut free), Some(&mut total), None) }.ok()?;
-    Some((free, total))
+    unsafe { GetDiskFreeSpaceExW(root, Some(&mut free), None, None) }.ok()?;
+    Some(free)
 }
 
 fn network_counters() -> Option<Counters> {

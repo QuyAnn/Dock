@@ -117,17 +117,10 @@ pub fn current_media() -> Option<Media> {
     let session = mgr.GetCurrentSession().ok()?;
     let props = session.TryGetMediaPropertiesAsync().ok()?.get().ok()?;
     let playing = session.GetPlaybackInfo().ok()?.PlaybackStatus().ok()? == PlaybackStatus::Playing;
-    let timeline = session.GetTimelineProperties().ok().and_then(|t| {
-        let start=t.StartTime().ok()?.Duration as f64;
-        let duration=(t.EndTime().ok()?.Duration as f64-start)/10_000_000.0;
-        let position=(t.Position().ok()?.Duration as f64-start)/10_000_000.0;
-        (duration>0.0).then_some((position.clamp(0.0,duration),duration))
-    });
     Some(Media {
         title: props.Title().ok()?.to_string(),
         artist: props.Artist().ok()?.to_string(),
         playing,
-        timeline,
     })
 }
 

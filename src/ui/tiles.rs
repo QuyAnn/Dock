@@ -18,7 +18,6 @@ const WEEK_GOAL: f32 = 10.0;
 
 #[derive(Clone, Debug, Default)]
 pub struct DataState {
-    pub net_history: Vec<(f32, f32)>,
     pub widgets: WidgetStats,
     pub git: Option<GitSummary>,
     pub ai: Vec<AiUsage>,
@@ -64,13 +63,7 @@ impl DataState {
 
     pub fn apply(&mut self, update: DataUpdate) {
         match update {
-            DataUpdate::Widgets(s) => {
-                if let Some((down, up)) = s.net {
-                    self.net_history.push((down.max(0.0) as f32, up.max(0.0) as f32));
-                    if self.net_history.len() > 48 { self.net_history.remove(0); }
-                } else { self.net_history.clear(); }
-                self.widgets = s;
-            },
+            DataUpdate::Widgets(s) => self.widgets = s,
             DataUpdate::Git(g) => self.git = Some(g),
             DataUpdate::Ai(a) => self.ai = a,
             DataUpdate::Weather(w) => self.weather = w,
@@ -100,10 +93,7 @@ pub fn net_tile(s: &WidgetStats) -> TileView {
 
 pub fn disk_tile(s: &WidgetStats) -> TileView {
     let free = |i: usize| s.disk_free[i].map_or("--".into(), crate::data::widgets::size_text);
-    TileView { style: Style::Metrics, sub: format!("D: {}", free(1)),
-        progress:s.disk_free[0].zip(s.disk_total[0]).filter(|(_,t)| *t>0).map(|(f,t)|1.0-f as f32/t as f32),
-        detail:s.disk_total[0].map_or(String::new(),crate::data::widgets::size_text),
-        ..TileView::card("DUNG LƯỢNG TRỐNG", format!("C: {}", free(0))) }
+    TileView { style: Style::Metrics, sub: format!("D: {}", free(1)), ..TileView::card("DUNG LƯỢNG TRỐNG", format!("C: {}", free(0))) }
 }
 
 pub fn gpu_tile(s: &WidgetStats) -> TileView {
@@ -170,13 +160,13 @@ pub fn git_tile(d: &DataState) -> TileView {
             // Hint belongs in Settings / Git popup; tile stays a quiet dash + empty grid.
             TileView {
                 style: Style::Git,
-                cells: heat_levels(&g.heatmap, 13, 3),
+                cells: heat_levels(&g.heatmap, 10, 7),
                 ..TileView::card("GIT", "—".to_owned())
             }
         }
         Some(g) => TileView {
             style: Style::Git,
-            cells: heat_levels(&g.heatmap, 13, 3),
+            cells: heat_levels(&g.heatmap, 10, 7),
             ..TileView::card(format!("{} today", g.today), format!("{} week · {} streak", g.week, g.streak))
         },
     }
@@ -217,7 +207,7 @@ pub fn weather_tile(d: &DataState) -> TileView {
         None => "–".to_owned(),
         Some(w) => format!("{}° {}", w.current.temp.round(), weather_text(w.current.code)),
     };
-    TileView { sub:d.weather.as_ref().map_or(String::new(),|w|w.current.code.to_string()), ..tile("THỜI TIẾT", value, None) }
+    tile("THỜI TIẾT", value, None)
 }
 
 pub fn media_tile(d: &DataState) -> TileView {
@@ -227,7 +217,6 @@ pub fn media_tile(d: &DataState) -> TileView {
             title: m.title.clone(),
             sub: m.artist.clone(),
             progress: m.playing.then_some(1.0),
-            mini: m.timeline.map_or(Vec::new(),|(p,d)|vec![((p/d) as f32,0)]),
             ..TileView::card("", "")
         },
         _ => TileView {
