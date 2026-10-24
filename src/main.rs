@@ -55,7 +55,7 @@ use win::{monitors, wallpaper};
 
 const DOCK_HEIGHT: f32 = dock::DOCK_H;
 const POPUP_W: f32 = 320.0;
-const CONTROL_POPUP_W: f32 = 340.0;
+const CONTROL_POPUP_W: f32 = 296.0;
 const SETTINGS_POPUP_W: f32 = 460.0;
 /// Height used when the popup content cannot be measured yet.
 const POPUP_H_DEFAULT: f32 = 260.0;
@@ -137,6 +137,8 @@ enum OpenPopup {
     AppMenu,
     /// Right-click on empty dock area ("Cài đặt SmartDock").
     DockMenu,
+    /// Widget gallery sheet.
+    Gallery,
     /// SmartDock's own tray overflow (hidden notification icons).
     Tray,
 }
@@ -654,6 +656,7 @@ fn run() -> windows::core::Result<()> {
     popup::set_click_handler(on_popup_click);
     popup::set_on_hide(on_popup_hidden);
     popup::set_char_handler(on_popup_char);
+    popup::set_wheel_handler(on_popup_wheel);
     popup::set_drag_handler(on_popup_drag);
     popup::set_tick_handler(on_popup_tick);
     popup::set_rclick_handler(on_popup_rclick);
@@ -791,7 +794,7 @@ fn widget_width(id: &str) -> f32 {
         "todo" => 160.0,
         "downloads" => 150.0,
         "chevron" => 30.0,
-        "cc" => 56.0,
+        "cc" => 78.0,
         "clock" => 64.0,
         "lang" => 42.0,
         _ => 42.0, // cpu / ram: wide enough for a tiny label above the percent inside the ring
@@ -1792,8 +1795,16 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
                 })
                 .unwrap_or(POPUP_H_DEFAULT);
             CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+            glass::set_panel_light(kind == PopupKind::Clock);
             POPUP_H_CUR.with(|h| h.set(height));
-            let width = if kind == PopupKind::Settings { SETTINGS_POPUP_W } else { POPUP_W };
+            let width = match kind {
+                PopupKind::Settings => SETTINGS_POPUP_W,
+                PopupKind::Clock => ui::calendar::WIDTH,
+                _ => POPUP_W,
+            };
+            if kind == PopupKind::Clock {
+                ui::calendar::reset();
+            }
             POPUP_W_CUR.with(|w| w.set(width));
             if popup::show(anchor, width, height as i32).is_ok() {
                 OPEN.with(|o| o.set(Some(which)));
@@ -1801,6 +1812,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
         }
         OpenPopup::Control => {
             let state = APP.with(|a| a.borrow().as_ref().map(|app| app.shared.control.lock().unwrap().clone()));
+            glass::set_panel_light(true);
             CONTROL_VIEW.with(|c| *c.borrow_mut() = state);
             POPUP_W_CUR.with(|w| w.set(CONTROL_POPUP_W));
             if popup::show(anchor, CONTROL_POPUP_W, control_center::HEIGHT as i32).is_ok() {
@@ -1809,6 +1821,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
         }
         OpenPopup::DockMenu => {
             CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+    glass::set_panel_light(false);
             let height = DOCK_MENU_H.with(Cell::get);
             POPUP_H_CUR.with(|h| h.set(height));
             POPUP_W_CUR.with(|w| w.set(appmenu::DOCK_MENU_W));
@@ -1816,8 +1829,10 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
                 OPEN.with(|o| o.set(Some(which)));
             }
         }
+        OpenPopup::Gallery => open_gallery(),
         OpenPopup::Tray => {
             CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+    glass::set_panel_light(false);
             let (w, h) = trayview::open(anchor);
             POPUP_H_CUR.with(|c| c.set(h));
             POPUP_W_CUR.with(|c| c.set(w));
@@ -1828,6 +1843,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
         }
         OpenPopup::AppMenu => {
             CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+    glass::set_panel_light(false);
             let height = appmenu::current()
                 .map(|m| appmenu::content_height(&m))
                 .unwrap_or(180.0);
@@ -1848,6 +1864,51 @@ thread_local! {
 }
 
 /// Shows SmartDock Settings in the popup, anchored where the current popup was opened.
+/// Entries for the widget gallery: every widget with its live preview tile.
+fn gallery_entries() -> Vec<ui::gallery::Entry> {
+    APP.with(|a| {
+        let slot = a.borrow();
+        let Some(app) = slot.as_ref() else { return Vec::new() };
+        let data = app.shared.data.lock().unwrap().clone();
+        let control = app.shared.control.lock().unwrap().clone();
+        let settings = app.shared.settings.lock().unwrap().clone();
+        let stats = app.stats.clone();
+        ui::gallery::ITEMS
+            .iter()
+            .map(|&(id, cat)| ui::gallery::Entry {
+                id,
+                name: settings::widget_label(id),
+                cat,
+                view: tile_view(id, &data, &control, &stats, 0.0, &settings),
+                width: if id == "clock" && settings.clock_style == "wide" {
+                    CLOCK_WIDE_W
+                } else if settings::is_fixed_widget(id) {
+                    widget_width(id)
+                } else {
+                    (widget_width(id) * settings.widget_scale()).round()
+                },
+                on: settings.widget_shown(id),
+                fixed: settings::is_fixed_widget(id),
+            })
+            .collect()
+    })
+}
+
+fn open_gallery() {
+    OPEN.with(|o| o.set(None));
+    appmenu::clear();
+    popup::hide();
+    ui::gallery::reset();
+    CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+    glass::set_panel_light(true);
+    POPUP_W_CUR.with(|w| w.set(ui::gallery::W));
+    POPUP_H_CUR.with(|h| h.set(ui::gallery::H));
+    if popup::show_centered(ui::gallery::W, ui::gallery::H as i32).is_ok() {
+        OPEN.with(|o| o.set(Some(OpenPopup::Gallery)));
+        popup::focus();
+    }
+}
+
 fn open_settings_popup() {
     let anchor = LAST_ANCHOR.with(Cell::get);
     if OPEN.with(Cell::get) == Some(OpenPopup::Data("settings")) {
@@ -1876,6 +1937,11 @@ fn refresh_open_popup() {
 }
 
 fn paint_popup(r: &mut Renderer, rect: RectF) {
+    if OPEN.with(Cell::get) == Some(OpenPopup::Gallery) {
+        let entries = gallery_entries();
+        let _ = ui::gallery::draw(r, rect, &entries);
+        return;
+    }
     if OPEN.with(Cell::get) == Some(OpenPopup::AppMenu) {
         let _ = appmenu::paint(r, rect);
         return;
@@ -1911,6 +1977,9 @@ fn on_popup_click(x: f32, y: f32) {
     let rect = popup_rect();
     if OPEN.with(Cell::get) == Some(OpenPopup::DockMenu) {
         match appmenu::dock_menu_hit(x, y) {
+            Some(appmenu::DockMenuAction::Gallery) => {
+                open_gallery();
+            }
             Some(appmenu::DockMenuAction::Settings) => {
                 log("settings: opened from the dock menu (Cài đặt SmartDock)");
                 open_settings_popup();
@@ -1972,10 +2041,65 @@ fn on_popup_click(x: f32, y: f32) {
                 open_settings_popup();
                 return;
             }
+            if action == control_center::ControlAction::MediaPlayPause {
+                // Flip the icon right away; the next media poll confirms the real state.
+                APP.with(|a| {
+                    if let Ok(slot) = a.try_borrow() {
+                        if let Some(app) = slot.as_ref() {
+                            let mut guard = app.shared.data.lock().unwrap();
+                            if let Some(m) = Arc::make_mut(&mut guard).media.as_mut() {
+                                m.playing = !m.playing;
+                            }
+                        }
+                    }
+                });
+                popup::repaint_now();
+            }
             // Control actions can block (WinRT, COM); run them off the UI thread.
             thread::spawn(move || {
                 let _ = control_center::apply(action);
             });
+        }
+        return;
+    }
+    if OPEN.with(Cell::get) == Some(OpenPopup::Gallery) {
+        let entries = gallery_entries();
+        match ui::gallery::hit(x, y, rect, &entries) {
+            Some(ui::gallery::Action::Close) => {
+                popup::hide();
+                OPEN.with(|o| o.set(None));
+            }
+            Some(ui::gallery::Action::Category(i)) => {
+                ui::gallery::select(i);
+                popup::repaint_now();
+            }
+            Some(ui::gallery::Action::FocusSearch) => {
+                ui::gallery::set_focus(true);
+                popup::focus();
+                popup::repaint_now();
+            }
+            Some(ui::gallery::Action::Toggle(id)) => {
+                let on = entries.iter().find(|e| e.id == id).is_some_and(|e| e.on);
+                APP.with(|a| {
+                    let slot = a.borrow();
+                    let Some(app) = slot.as_ref() else { return };
+                    let mut guard = app.shared.settings.lock().unwrap();
+                    let settings = Arc::make_mut(&mut guard);
+                    let action = if on { appmenu::DockMenuAction::Remove(id) } else { appmenu::DockMenuAction::Add(id) };
+                    appmenu::apply_dock_menu(action, settings);
+                    let _ = settings::save(settings);
+                });
+                popup::repaint_now();
+                repaint();
+            }
+            None => ui::gallery::set_focus(false),
+        }
+        return;
+    }
+    if OPEN.with(Cell::get) == Some(OpenPopup::Data("clock")) {
+        if let Some(action) = ui::calendar::hit(x, y, rect) {
+            ui::calendar::apply(action);
+            popup::repaint_now();
         }
         return;
     }
@@ -2146,6 +2270,13 @@ fn close_tray_popup() {
 
 /// Typed character for the note input; Enter adds the note.
 fn on_popup_char(ch: char) {
+    if OPEN.with(Cell::get) == Some(OpenPopup::Gallery) {
+        if ui::gallery::focused() {
+            ui::gallery::input_char(ch);
+            popup::repaint_now();
+        }
+        return;
+    }
     if OPEN.with(Cell::get) != Some(OpenPopup::Data("todo")) || !popup_content::todo_input_focused() {
         return;
     }
@@ -2181,12 +2312,14 @@ fn on_popup_hidden() {
     OPEN.with(|o| o.set(None));
     thumbnails::set_suppressed(false);
     CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+    glass::set_panel_light(false);
     appmenu::clear();
 }
 
 thread_local! {
     /// Slider being dragged in the Control Center.
     static DRAG_SLIDER: Cell<Option<control_center::Slider>> = const { Cell::new(None) };
+    static CC_MEDIA_SIG: RefCell<Option<(String, bool)>> = const { RefCell::new(None) };
     /// When the last slider drag ended (the 2 s system poll must not snap the knob back).
     static LAST_DRAG_END: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
 }
@@ -2239,6 +2372,50 @@ fn on_popup_drag(phase: popup::DragPhase, x: f32, _y: f32) -> bool {
         log(&format!("control: {:?} set by drag", action));
     }
     true
+}
+
+/// Mouse wheel over a Control Center slider card: volume +-5% / brightness +-5 per notch.
+fn on_popup_wheel(x: f32, y: f32, notches: f32) {
+    if OPEN.with(Cell::get) == Some(OpenPopup::Gallery) {
+        ui::gallery::scroll(notches);
+        popup::repaint_now();
+        return;
+    }
+    let rect = popup_rect();
+    let Some(state) = CONTROL_VIEW.with(|c| c.borrow().clone()) else { return };
+    let Some(slider) = control_center::slider_card_at(x, y, rect) else { return };
+    let action = match slider {
+        control_center::Slider::Volume => {
+            control_center::ControlAction::SetVolume((state.volume + notches * 0.05).clamp(0.0, 1.0))
+        }
+        control_center::Slider::Brightness => {
+            let Some(p) = state.brightness else { return };
+            control_center::ControlAction::SetBrightness((p as f32 + notches * 5.0).clamp(0.0, 100.0).round() as u32)
+        }
+    };
+    CONTROL_VIEW.with(|c| {
+        if let Some(st) = c.borrow_mut().as_mut() {
+            match action {
+                control_center::ControlAction::SetVolume(v) => {
+                    st.volume = v;
+                    st.muted = false;
+                }
+                control_center::ControlAction::SetBrightness(p) => st.brightness = Some(p),
+                _ => {}
+            }
+            let st = st.clone();
+            APP.with(|a| {
+                if let Ok(slot) = a.try_borrow() {
+                    if let Some(app) = slot.as_ref() {
+                        *app.shared.control.lock().unwrap() = st;
+                    }
+                }
+            });
+        }
+    });
+    LAST_DRAG_END.with(|t| t.set(Some(std::time::Instant::now())));
+    live_apply(action);
+    popup::repaint_now();
 }
 
 /// Queues a slider value for the live-apply worker, which applies only the newest value of each
@@ -2337,6 +2514,13 @@ fn on_popup_tick() {
                 }
             });
         }
+    }
+    // Media title / play state changes (this also redraws the play/pause icon after a click).
+    let media_sig = APP.with(|a| {
+        a.try_borrow().ok().and_then(|s| s.as_ref().and_then(|app| app.shared.data.lock().ok()?.media.as_ref().map(|m| (m.title.clone(), m.playing))))
+    });
+    if CC_MEDIA_SIG.with(|s| s.replace(media_sig.clone())) != media_sig {
+        changed = true;
     }
     if changed {
         popup::repaint_now();

@@ -302,6 +302,23 @@ impl Renderer {
         Ok(())
     }
 
+    /// Clips later drawing to `rect` until `pop_clip` (axis aligned, anti-aliased off).
+    pub fn push_clip(&mut self, rect: RectF) -> Result<()> {
+        use windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_ALIASED;
+        let (rt, _) = self.parts()?;
+        let r = d2d_rect(rect);
+        // SAFETY: `r` lives for the call; paired with `pop_clip`.
+        unsafe { rt.PushAxisAlignedClip(&r, D2D1_ANTIALIAS_MODE_ALIASED) };
+        Ok(())
+    }
+
+    pub fn pop_clip(&mut self) -> Result<()> {
+        let (rt, _) = self.parts()?;
+        // SAFETY: paired with `push_clip`.
+        unsafe { rt.PopAxisAlignedClip() };
+        Ok(())
+    }
+
     pub fn fill_rect(&mut self, rect: RectF, rgba: u32) -> Result<()> {
         let (rt, brush) = self.parts()?;
         Self::set_color(brush, rgba);
@@ -740,7 +757,8 @@ pub fn apply_acrylic(hwnd: HWND, tint_argb: u32) -> bool {
             | ((tint_argb & 0xFF) << 16)
             | ((tint_argb >> 16) & 0xFF);
         let mut accent = AccentPolicy {
-            state: ACCENT_ENABLE_ACRYLICBLURBEHIND,
+            // A zero tint turns the accent off (fully transparent popup window).
+            state: if tint_argb == 0 { 0 } else { ACCENT_ENABLE_ACRYLICBLURBEHIND },
             flags: 2, // draw all borders / use gradient color
             gradient: abgr,
             anim_id: 0,
@@ -925,5 +943,17 @@ impl Renderer {
             }
         };
         Ok(())
+    }
+}
+
+/// Undoes `apply_dwm_transparency` on one window (popups switch between a glass panel and
+/// free-floating tiles). Does not touch the global flag the dock uses.
+pub fn reset_dwm_transparency(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+    use windows::Win32::UI::Controls::MARGINS;
+    let m = MARGINS::default();
+    // SAFETY: `m` lives for the call.
+    unsafe {
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
     }
 }

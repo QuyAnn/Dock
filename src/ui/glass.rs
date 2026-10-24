@@ -157,10 +157,28 @@ pub fn draw_highlights(r: &mut Renderer, rect: RectF, radius: f32, k: f32) -> Re
 /// behind stays visible like Liquid Glass.
 pub const PANEL_ACRYLIC_TINT: u32 = 0x4C1E_1E24;
 
+/// True while the Control Center is open: a much lighter, more see-through panel (macOS style).
+static PANEL_LIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn panel_light() -> bool {
+    PANEL_LIGHT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Acrylic tint for the popup window: the light Control Center lets much more of the blurred
+/// desktop through.
+pub fn panel_tint() -> u32 {
+    if panel_light() { 0x2C30_3036 } else { PANEL_ACRYLIC_TINT }
+}
+
+pub fn set_panel_light(on: bool) {
+    PANEL_LIGHT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Floating panel (popups, context menus, window previews) over DWM acrylic: a light neutral
 /// dim for text legibility, then the same highlights and rims as the dock pieces.
 pub fn draw_panel(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
-    r.fill_rounded_rect_gradient(rect, radius, 0x2023_2A70, 0x1618_1E8C)?;
+    let (top, bottom) = if PANEL_LIGHT.load(std::sync::atomic::Ordering::Relaxed) { (0x2023_2A2C, 0x1618_1E3C) } else { (0x2023_2A70, 0x1618_1E8C) };
+    r.fill_rounded_rect_gradient(rect, radius, top, bottom)?;
     draw_highlights(r, rect, radius, 1.0)
 }
 
@@ -361,10 +379,21 @@ pub fn popup_backdrop(rect: windows::Win32::Foundation::RECT, monitor: windows::
     Some(Arc::new(super::liquid::render_popup(&wp, r, screen, dpi as f32 / 96.0)))
 }
 
+/// Whole-popup glass for a fully transparent window: the frosted backdrop cut to a rounded shape
+/// (anti-aliased, any radius), a neutral dim for legibility, then the usual rims.
+pub fn draw_panel_glass(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    match piece_for(rect, radius, Layer::Tile) {
+        Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
+        None => r.fill_rounded_rect(rect, radius, 0x2A2E_36B0)?,
+    }
+    draw_panel_tint(r, rect, radius)
+}
+
 /// Panel over a Liquid Glass backdrop bitmap: a neutral dim so white text stays legible on bright
 /// wallpaper, then the same highlights and rims as the dock pieces.
 pub fn draw_panel_tint(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
-    r.fill_rounded_rect_gradient(rect, radius, 0x1C1C_2260, 0x1414_1A74)?;
+    let (top, bottom) = if PANEL_LIGHT.load(std::sync::atomic::Ordering::Relaxed) { (0x1C1C_2226, 0x1414_1A34) } else { (0x1C1C_2260, 0x1414_1A74) };
+    r.fill_rounded_rect_gradient(rect, radius, top, bottom)?;
     draw_highlights(r, rect, radius, 1.0)
 }
 
