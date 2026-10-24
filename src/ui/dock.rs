@@ -64,6 +64,12 @@ pub enum Style {
     Card,
     /// 34 px card with a circular gauge and the value centered (CPU, RAM).
     Ring,
+    /// Glass square with one bold centred label (keyboard layout).
+    Label,
+    /// Note card: yellow notebook icon, bold title, muted preview line, edit button.
+    Note,
+    /// Wide clock: weekday and date on the left, time and weather on the right.
+    ClockWide,
     /// Red time block above a title/sub row (clock).
     Clock,
     /// Git card: numbers line above a 16x3 mini heatmap (`cells`).
@@ -74,6 +80,8 @@ pub enum Style {
     Button,
     /// Search icon in the centre cluster, next to Start.
     Search,
+    /// Recycle Bin icon at the end of the centre cluster (`progress` set = it holds items).
+    Trash,
     /// Windows logo button that opens Start.
     Start,
     /// Thin vertical divider in the centre cluster (Start | apps).
@@ -111,6 +119,8 @@ pub struct TileView {
     pub chevron: Option<bool>,
     /// `Usage` style: one entry per limit, top to bottom.
     pub rows: Vec<UsageRow>,
+    /// Second line of the wide clock's left block (the date).
+    pub extra: String,
 }
 
 /// State for the dock's Wi-Fi / speaker status icons.
@@ -140,6 +150,7 @@ impl TileView {
             status: None,
             chevron: None,
             rows: Vec::new(),
+            extra: String::new(),
         }
     }
 
@@ -151,7 +162,7 @@ impl TileView {
 
 /// Fixed left-tile widths (Dock-Rc: .ai-tile 100px, .music-tile 142px, scaled up a little so
 /// "$52.59/$20.00" and Vietnamese titles fit). Every usage tile shares one width.
-pub const GIT_W: f32 = 132.0;
+pub const GIT_W: f32 = 152.0;
 pub const USAGE_W: f32 = 112.0;
 pub const MEDIA_W: f32 = 200.0;
 
@@ -285,12 +296,16 @@ pub fn draw_dock(
             Style::Bare => draw_bare(r, t, *rc)?,
             Style::Card => draw_card(r, t, *rc, hovered)?,
             Style::Usage => draw_usage(r, t, *rc, hovered)?,
+            Style::Note => draw_note(r, t, *rc, hovered)?,
+            Style::Label => draw_label(r, t, *rc, hovered)?,
             Style::Ring => draw_ring(r, t, *rc, hovered)?,
             Style::Clock => draw_clock(r, t, *rc, hovered)?,
+            Style::ClockWide => draw_clock_wide(r, t, *rc, hovered)?,
             Style::Git => draw_git(r, t, *rc, hovered)?,
             Style::Media => draw_media(r, t, *rc, hovered)?,
             Style::Button => draw_button(r, t, *rc, hovered)?,
             Style::Start => draw_start(r, *rc, hovered)?,
+            Style::Trash => super::apps::draw_trash_icon(r, *rc, hovered, t.progress.is_some())?,
             Style::Search => super::apps::draw_search_icon(r, *rc, hovered)?,
             Style::Separator => draw_separator(r, *rc)?,
         }
@@ -312,6 +327,36 @@ fn draw_bare(r: &mut Renderer, t: &TileView, rc: RectF) -> Result<()> {
         // Gear: .gear-btn at 45% opacity.
         r.draw_text_styled(&t.value, rc, 12.0, 0xFFFF_FF73, Align::Center, TextStyle::Icon)?;
     }
+    Ok(())
+}
+
+fn draw_label(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    r.draw_text_styled(&t.value, rc, 12.0, TEXT, Align::Center, TextStyle::Bold)?;
+    Ok(())
+}
+
+fn draw_note(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    // Notebook icon: white sheet, yellow header band, faint ruled lines.
+    let s = (rc.h - 12.0).min(30.0);
+    let ico = RectF { x: rc.x + 7.0, y: rc.y + (rc.h - s) / 2.0, w: s, h: s };
+    r.fill_rounded_rect(ico, 6.0, 0xF4F4_F2FF)?;
+    r.fill_rounded_rect(RectF { h: s * 0.3, ..ico }, 6.0, 0xFFC8_0AFF)?;
+    r.fill_rect(RectF { y: ico.y + s * 0.2, h: s * 0.1, ..ico }, 0xFFC8_0AFF)?;
+    for i in 0..3 {
+        let y = ico.y + s * (0.46 + 0.17 * i as f32);
+        r.fill_rect(RectF { x: ico.x + 3.0, y, w: s - 6.0, h: 1.0 }, 0x0000_0026)?;
+    }
+    // Edit button on the right.
+    let b = 22.0;
+    let btn = RectF { x: rc.x + rc.w - 7.0 - b, y: rc.y + (rc.h - b) / 2.0, w: b, h: b };
+    r.fill_rounded_rect(btn, b / 2.0, if hovered { 0xFFFF_FF2E } else { 0xFFFF_FF1A })?;
+    r.draw_text_styled("\u{E70F}", btn, 10.5, TEXT, Align::Center, TextStyle::Icon)?;
+    let x = ico.x + s + 8.0;
+    let w = (btn.x - 6.0 - x).max(0.0);
+    r.draw_text_styled(&t.title, RectF { x, y: rc.y + rc.h / 2.0 - 14.0, w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(&t.sub, RectF { x, y: rc.y + rc.h / 2.0 + 1.0, w, h: 12.0 }, 9.0, MUTED, Align::Left)?;
     Ok(())
 }
 
@@ -598,13 +643,14 @@ mod tests {
     }
 
     fn home_zones(apps: usize) -> (Vec<Tile>, Vec<Tile>, Vec<Tile>) {
-        let left = vec![t("git", GIT_W), t("claude", USAGE_W), t("codex", USAGE_W), t("cursor", USAGE_W), t("grok", USAGE_W), t("media", MEDIA_W)];
+        // Default layout: Media lives on the right side.
+        let left = vec![t("git", GIT_W), t("claude", USAGE_W), t("codex", USAGE_W), t("cursor", USAGE_W), t("grok", USAGE_W)];
         let center = vec![
             Tile { id: "start", width: super::super::apps::ICON, height: super::super::apps::CLUSTER_H },
             Tile { id: "sep", width: 1.0, height: 24.0 },
             Tile { id: "apps", width: super::super::apps::cluster_width(apps), height: super::super::apps::CLUSTER_H },
         ];
-        let right = vec![t("cc", 56.0), t("gear", 22.0), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
+        let right = vec![t("cc", 56.0), t("media", MEDIA_W), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
         (left, center, right)
     }
 
@@ -686,18 +732,24 @@ const USAGE_ROW_GAP: f32 = 1.5;
 /// Provider card in the LumaBar style: icon plate, then label / bar / reset / percent per limit.
 fn draw_usage(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
-    let side = rc.h - 10.0;
+    let side = rc.h - 8.0;
     let plate = RectF { x: rc.x + 6.0, y: rc.y + (rc.h - side) / 2.0, w: side, h: side };
-    r.fill_rounded_rect(plate, 8.0, if t.bg != 0 { t.bg } else { 0x2A2A_30FF })?;
-    let inset = side * 0.24;
+    if t.icon.is_none() {
+        r.fill_rounded_rect(plate, 8.0, if t.bg != 0 { t.bg } else { 0x2A2A_30FF })?;
+    }
+    let inset = side * 0.06;
     let area = RectF { x: plate.x + inset, y: plate.y + inset, w: side - 2.0 * inset, h: side - 2.0 * inset };
     if let Some(icon) = &t.icon {
-        r.draw_bitmap(icon.w, icon.h, &icon.rgba, area)?;
+        // Bitmap logos (Grok Bot) fill the plate area with no backing plate.
+        r.draw_bitmap(icon.w, icon.h, &icon.rgba, plate)?;
     } else if let Some((d, stroke)) = t.glyph {
-        svgpath::draw_path(r, d, area, 24.0, 0xFFFF_FFFF, stroke)?;
         if t.title == "Cursor" {
-            svgpath::draw_path(r, svgpath::CURSOR_CUBE_INNER, area, 24.0, 0xE8E8_E8FF, Some(1.2))?;
-            svgpath::draw_path(r, svgpath::CURSOR_CUBE_TOP, area, 24.0, 0xE8E8_E8D9, None)?;
+            // Cursor's cube: lit top face, mid left face, darker right face.
+            svgpath::draw_path(r, "M12 12 3.5 7.3v9.4L12 21.5Z", area, 24.0, 0xB4B4_B4FF, None)?;
+            svgpath::draw_path(r, "M12 12l8.5-4.7v9.4L12 21.5Z", area, 24.0, 0x7E7E_7EFF, None)?;
+            svgpath::draw_path(r, svgpath::CURSOR_CUBE_TOP, area, 24.0, 0xF4F4_F4FF, None)?;
+        } else {
+            svgpath::draw_path(r, d, area, 24.0, 0xFFFF_FFFF, stroke)?;
         }
     }
     let left = plate.x + plate.w + 7.0;
@@ -725,6 +777,24 @@ fn draw_usage(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
         if fill_w > 0.0 {
             r.fill_rounded_rect(RectF { w: fill_w.max(3.0), ..track }, 1.5, row.color)?;
         }
+    }
+    Ok(())
+}
+
+/// Wide clock: weekday (red caps) over the date, a divider, then the time over the weather.
+fn draw_clock_wide(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    let mid = rc.x + rc.w * 0.52;
+    let left = RectF { x: rc.x + 10.0, y: rc.y, w: mid - rc.x - 16.0, h: rc.h };
+    r.draw_text_styled(&t.title, RectF { y: rc.y + (rc.h - 30.0) / 2.0, h: 11.0, ..left }, 8.5, 0xFF5D_4EFF, Align::Left, TextStyle::Bold)?;
+    r.draw_text_styled(&t.extra, RectF { y: rc.y + (rc.h - 30.0) / 2.0 + 12.0, h: 18.0, ..left }, 13.0, TEXT, Align::Left, TextStyle::Bold)?;
+    r.fill_rect(RectF { x: mid, y: rc.y + 8.0, w: 1.0, h: rc.h - 16.0 }, 0xFFFF_FF26)?;
+    let right = RectF { x: mid + 10.0, y: rc.y, w: rc.x + rc.w - 10.0 - (mid + 10.0), h: rc.h };
+    let two_lines = !t.sub.is_empty();
+    let time_y = if two_lines { rc.y + (rc.h - 32.0) / 2.0 } else { rc.y + (rc.h - 18.0) / 2.0 };
+    r.draw_text_styled(&t.value, RectF { y: time_y, h: 18.0, ..right }, 14.0, TEXT, Align::Left, TextStyle::Bold)?;
+    if two_lines {
+        r.draw_text(&t.sub, RectF { y: time_y + 18.0, h: 13.0, ..right }, 9.5, MUTED, Align::Left)?;
     }
     Ok(())
 }

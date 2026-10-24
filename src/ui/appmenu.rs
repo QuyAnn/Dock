@@ -261,6 +261,10 @@ pub enum DockMenuAction {
     CycleSize,
     /// Next dock material (glass, midnight, black).
     CycleStyle,
+    /// Liquid Glass sheen over the desktop icons on / off.
+    ToggleDesktopGlass,
+    /// Clock widget: compact or wide layout.
+    CycleClock,
     /// A widget-specific action run by `run_widget_action` in main.
     Extra(&'static str),
     /// Show a hidden widget again.
@@ -295,11 +299,17 @@ pub fn open_dock_menu(target: Option<&'static str>, settings: &Settings) -> f32 
         items.push(MenuItem::Header(widget_label(id)));
         match id {
             "focus" => items.push(MenuItem::Row(DockMenuAction::Extra("focus_reset"), "Đặt lại hẹn giờ".to_owned(), "\u{E777}")),
-            "trash" => items.push(MenuItem::Row(DockMenuAction::Extra("trash_empty"), "Dọn thùng rác".to_owned(), "\u{E74D}")),
+            "trash" => {
+                items.push(MenuItem::Row(DockMenuAction::Extra("trash"), "Mở thùng rác".to_owned(), "\u{E8B7}"));
+                items.push(MenuItem::Row(DockMenuAction::Extra("trash_empty"), "Dọn thùng rác".to_owned(), "\u{E74D}"));
+            }
             _ => {}
         }
-        items.push(MenuItem::Row(DockMenuAction::MoveSide(id), format!("Chuyển sang bên {to}"), "\u{E8AB}"));
-        if !crate::settings::is_fixed_widget(id) {
+        // The Recycle Bin is a fixed dock icon, not a widget: nothing to move or remove.
+        if crate::settings::WIDGET_IDS.contains(&id) {
+            items.push(MenuItem::Row(DockMenuAction::MoveSide(id), format!("Chuyển sang bên {to}"), "\u{E8AB}"));
+        }
+        if crate::settings::WIDGET_IDS.contains(&id) && !crate::settings::is_fixed_widget(id) {
             items.push(MenuItem::Row(DockMenuAction::Remove(id), "Gỡ widget".to_owned(), "\u{E74D}"));
         }
         items.push(MenuItem::Divider);
@@ -316,6 +326,10 @@ pub fn open_dock_menu(target: Option<&'static str>, settings: &Settings) -> f32 
     let size = if settings.widget_size == "compact" { "Gọn" } else { "Vừa" };
     items.push(MenuItem::Row(DockMenuAction::CycleSize, format!("Cỡ widget: {size}"), "\u{E8A3}"));
     items.push(MenuItem::Row(DockMenuAction::CycleStyle, format!("Kiểu dock: {}", settings.style_label()), "\u{E771}"));
+    let desk = if settings.desktop_glass { "Bật" } else { "Tắt" };
+    items.push(MenuItem::Row(DockMenuAction::ToggleDesktopGlass, format!("Icon desktop kính: {desk}"), "\u{E7F4}"));
+    let clock = if settings.clock_style == "wide" { "Rộng" } else { "Gọn" };
+    items.push(MenuItem::Row(DockMenuAction::CycleClock, format!("Kiểu đồng hồ: {clock}"), "\u{E823}"));
     items.push(MenuItem::Divider);
     items.push(MenuItem::Row(DockMenuAction::Settings, "Cài đặt SmartDock".to_owned(), "\u{E713}"));
     let h = 12.0 + items.iter().map(item_h).sum::<f32>();
@@ -377,6 +391,10 @@ pub fn apply_dock_menu(action: DockMenuAction, settings: &mut Settings) {
             settings.widget_size = if settings.widget_size == "compact" { "normal" } else { "compact" }.to_owned();
         }
         DockMenuAction::CycleStyle => settings.cycle_style(),
+        DockMenuAction::ToggleDesktopGlass => settings.desktop_glass = !settings.desktop_glass,
+        DockMenuAction::CycleClock => {
+            settings.clock_style = if settings.clock_style == "wide" { "compact" } else { "wide" }.to_owned();
+        }
         DockMenuAction::MoveSide(id) => {
             let to_left = !settings.layout.is_left(id);
             // Joins the new side next to the centre: end of the left list, start of the right one.

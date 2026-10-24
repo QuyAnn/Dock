@@ -22,6 +22,7 @@ pub struct TileSettings {
     pub todo: bool,
     pub trash: bool,
     pub downloads: bool,
+    pub lang: bool,
 }
 
 impl Default for TileSettings {
@@ -40,13 +41,14 @@ impl Default for TileSettings {
             todo: false,
             trash: false,
             downloads: false,
+            lang: true,
         }
     }
 }
 
 /// Every widget that can sit on the left or right of the dock, with the Settings key it uses.
 pub const WIDGET_IDS: [&str; 16] =
-    ["git", "claude", "codex", "cursor", "grok", "media", "weather", "cpu", "ram", "focus", "todo", "trash", "downloads", "chevron", "cc", "clock"];
+    ["git", "claude", "codex", "cursor", "grok", "media", "weather", "cpu", "ram", "focus", "todo", "downloads", "chevron", "cc", "lang", "clock"];
 
 /// Always on: these can be moved but not removed (tray chevron, Wi-Fi/volume button, clock).
 pub fn is_fixed_widget(id: &str) -> bool {
@@ -65,7 +67,7 @@ pub struct WidgetLayout {
 impl Default for WidgetLayout {
     fn default() -> Self {
         let own = |ids: &[&str]| ids.iter().map(|s| (*s).to_owned()).collect();
-        Self { left: own(&["git", "claude", "codex", "cursor", "grok", "weather", "focus", "todo", "trash", "downloads"]), right: own(&["chevron", "cc", "media", "cpu", "ram", "clock"]) }
+        Self { left: own(&["git", "claude", "codex", "cursor", "grok", "weather", "focus", "todo", "downloads"]), right: own(&["chevron", "cc", "media", "cpu", "ram", "lang", "clock"]) }
     }
 }
 
@@ -147,6 +149,7 @@ impl TileSettings {
             "cpu" => self.cpu,
             "ram" => self.ram,
             "focus" => self.focus,
+            "lang" => self.lang,
             "todo" => self.todo,
             "trash" => self.trash,
             "downloads" => self.downloads,
@@ -166,6 +169,7 @@ impl TileSettings {
             "cpu" => self.cpu = on,
             "ram" => self.ram = on,
             "focus" => self.focus = on,
+            "lang" => self.lang = on,
             "todo" => self.todo = on,
             "trash" => self.trash = on,
             "downloads" => self.downloads = on,
@@ -187,7 +191,8 @@ pub fn widget_label(id: &str) -> &'static str {
         "cpu" => "CPU",
         "ram" => "RAM",
         "focus" => "Hẹn giờ tập trung",
-        "todo" => "Việc cần làm",
+        "lang" => "Ngôn ngữ bàn phím",
+        "todo" => "Ghi chú",
         "trash" => "Thùng rác",
         "downloads" => "Tải xuống",
         "chevron" => "Khay hệ thống",
@@ -271,6 +276,10 @@ pub struct Settings {
     pub widget_size: String,
     /// "glass", "midnight" or "black": material of the widget tiles.
     pub dock_style: String,
+    /// Liquid Glass sheen over the desktop icons (a click-through overlay).
+    pub desktop_glass: bool,
+    /// "compact" (red time block) or "wide" (weekday + date, time + weather).
+    pub clock_style: String,
     /// Items of the To-do widget.
     pub todos: Vec<TodoItem>,
 }
@@ -297,6 +306,8 @@ impl Default for Settings {
             claude_monthly_budget: 100,
             widget_size: "normal".to_owned(),
             dock_style: "glass".to_owned(),
+            desktop_glass: false,
+            clock_style: "compact".to_owned(),
             todos: Vec::new(),
         }
     }

@@ -14,12 +14,12 @@ use super::glass;
 use super::renderer::{Align, Renderer};
 use crate::win::traysvc::{self, Action, TrayIcon};
 
-const CELL: f32 = 40.0;
-const ICON: f32 = 24.0;
-const PAD: f32 = 10.0;
-const CAPTION_H: f32 = 26.0;
+const CELL: f32 = 30.0;
+const ICON: f32 = 18.0;
+const PAD: f32 = 7.0;
+const CAPTION_H: f32 = 20.0;
 const MAX_COLS: usize = 6;
-const MIN_W: f32 = 184.0;
+const MIN_W: f32 = 120.0;
 const TEXT: u32 = 0xF1F1_F4FF;
 const TEXT_DIM: u32 = 0xF1F1_F4B0;
 

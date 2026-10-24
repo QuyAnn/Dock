@@ -363,9 +363,9 @@ fn meta(kind: PopupKind) -> Meta {
         PopupKind::Todo => Meta {
             glyph: "✓",
             color: 0x3FD2_7FFF,
-            title: "Việc cần làm",
+            title: "Ghi chú",
             badge: None,
-            note: "Bấm vào việc để đánh dấu xong, bấm dấu × để xoá.",
+            note: "Bấm vào ghi chú để đánh dấu, bấm dấu × để xoá.",
         },
     }
 }
@@ -829,6 +829,7 @@ pub enum TodoAction {
     Toggle(usize),
     Delete(usize),
     AddFromClipboard,
+    FocusInput,
     ClearDone,
 }
 
@@ -843,14 +844,49 @@ fn todo_row(top: f32, rect: RectF, i: usize) -> RectF {
     rect_at(rect.x + 6.0, top + 8.0 + i as f32 * TODO_ROW_H, rect.w - 12.0, TODO_ROW_H)
 }
 
-/// Add / clear buttons below the list.
-fn todo_buttons(top: f32, rect: RectF, shown: usize, any_done: bool) -> (RectF, Option<RectF>) {
+thread_local! {
+    /// Text typed into the note input, and whether the input has keyboard focus.
+    static TODO_INPUT: RefCell<String> = const { RefCell::new(String::new()) };
+    static TODO_FOCUS: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn todo_input_focused() -> bool {
+    TODO_FOCUS.with(Cell::get)
+}
+
+pub fn todo_input_set_focus(on: bool) {
+    TODO_FOCUS.with(|f| f.set(on));
+}
+
+/// Feeds one typed character to the note input. Returns the finished note on Enter.
+pub fn todo_input_char(ch: char) -> Option<String> {
+    TODO_INPUT.with(|t| {
+        let mut t = t.borrow_mut();
+        match ch {
+            '\u{8}' => {
+                t.pop();
+            }
+            '\r' | '\n' => {
+                let text = t.trim().to_owned();
+                t.clear();
+                return (!text.is_empty()).then_some(text);
+            }
+            c if !c.is_control() && t.chars().count() < 200 => t.push(c),
+            _ => {}
+        }
+        None
+    })
+}
+
+/// Input box, add-from-clipboard and clear buttons below the list.
+fn todo_buttons(top: f32, rect: RectF, shown: usize, any_done: bool) -> (RectF, RectF, Option<RectF>) {
     // An empty list still reserves one row for its hint.
     let list_h = shown.max(1) as f32 * TODO_ROW_H;
     let y = top + 8.0 + list_h + 10.0;
-    let add = rect_at(rect.x + 6.0, y, rect.w - 12.0, 32.0);
-    let clear = any_done.then(|| rect_at(rect.x + 6.0, y + 34.0, rect.w - 12.0, 32.0));
-    (add, clear)
+    let input = rect_at(rect.x + 6.0, y, rect.w - 12.0, 32.0);
+    let add = rect_at(rect.x + 6.0, y + 38.0, rect.w - 12.0, 32.0);
+    let clear = any_done.then(|| rect_at(rect.x + 6.0, y + 38.0 + 34.0, rect.w - 12.0, 32.0));
+    (input, add, clear)
 }
 
 pub fn hit_todo(x: f32, y: f32, rect: RectF) -> Option<TodoAction> {
@@ -862,7 +898,10 @@ pub fn hit_todo(x: f32, y: f32, rect: RectF) -> Option<TodoAction> {
             return Some(if x >= row.x + row.w - 30.0 { TodoAction::Delete(i) } else { TodoAction::Toggle(i) });
         }
     }
-    let (add, clear) = todo_buttons(top, rect, shown, items.iter().any(|t| t.done));
+    let (input, add, clear) = todo_buttons(top, rect, shown, items.iter().any(|t| t.done));
+    if contains(input, x, y) {
+        return Some(TodoAction::FocusInput);
+    }
     if contains(add, x, y) {
         return Some(TodoAction::AddFromClipboard);
     }
@@ -892,7 +931,21 @@ fn draw_todo(c: &mut Ctx<'_>, top: f32) -> Result<f32> {
         c.text(&item.text, rect_at(row.x + 34.0, row.y, row.w - 34.0 - 34.0, row.h), font(11.5, color))?;
         c.text("\u{E711}", rect_at(row.x + row.w - 28.0, row.y, 22.0, row.h), font(10.0, MUTED).icon().center())?;
     }
-    let (add, clear) = todo_buttons(top, rect, shown, items.iter().any(|t| t.done));
+    let (input, add, clear) = todo_buttons(top, rect, shown, items.iter().any(|t| t.done));
+    let focused = todo_input_focused();
+    c.round(input, 9.0, if focused { 0xFFFF_FF55 } else { 0xFFFF_FF22 })?;
+    c.round(rect_at(input.x + 1.0, input.y + 1.0, input.w - 2.0, input.h - 2.0), 8.0, 0x1A1C_22FF)?;
+    let typed = TODO_INPUT.with(|t| t.borrow().clone());
+    let text_area = rect_at(input.x + 10.0, input.y, input.w - 20.0, input.h);
+    if typed.is_empty() && !focused {
+        c.text("Nhập ghi chú rồi nhấn Enter…", text_area, font(11.0, MUTED))?;
+    } else {
+        // Show the tail of long text so the caret end stays visible.
+        let chars: Vec<char> = typed.chars().collect();
+        let tail: String = chars[chars.len().saturating_sub(34)..].iter().collect();
+        let shown_text = if focused { format!("{tail}|") } else { tail };
+        c.text(&shown_text, text_area, font(11.5, TEXT))?;
+    }
     c.round(add, 9.0, BTN)?;
     c.text("＋  Thêm từ clipboard", add, font(11.0, TEXT).center())?;
     let mut bottom = add.y + add.h;

@@ -12,7 +12,7 @@ use windows::core::Result;
 
 use super::dock::{hit_test, RectF};
 use super::renderer::{Align, Renderer, TextStyle};
-use super::squircle::{rounded_rect_alpha, search_icon_rgba, shadow_pad, soft_shadow, squircle_mask, start_icon_rgba, ICON_N};
+use super::squircle::{rounded_rect_alpha, shadow_pad, soft_shadow, squircle_mask, ICON_N};
 use crate::model::WindowEntry;
 use crate::win::icons::{icon_for_window, IconBitmap};
 use crate::win::tasks::{list_windows, Attention};
@@ -177,26 +177,55 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
     Ok(())
 }
 
-/// The dock's Start button: white Windows logo on a blue squircle, same size/shadow as the apps.
-pub fn draw_start_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
-    static START: OnceLock<AppIcon> = OnceLock::new();
-    let icon = START.get_or_init(|| AppIcon::from_composed(start_icon_rgba()));
-    let k = if hovered { 1.0 + MAG_MAX } else { 1.0 };
-    let size = ICON * k;
+/// Plate rect of the Start / Search button: same size and bottom line as an app icon, growing
+/// like one when hovered.
+fn button_plate(rc: RectF, hovered: bool) -> RectF {
+    let size = ICON * if hovered { 1.0 + MAG_MAX } else { 1.0 };
     let cx = rc.x + rc.w / 2.0;
     let bottom = rc.y + ICON_TOP + ICON;
-    draw_icon(r, icon, RectF { x: cx - size / 2.0, y: bottom - size, w: size, h: size })
+    RectF { x: cx - size / 2.0, y: bottom - size, w: size, h: size }
 }
 
-/// Search tile: the same size and placement as the Start icon.
+const BUTTON_RADIUS: f32 = ICON * ICON_GLASS_RADIUS;
+
+/// The dock's Start button in Liquid Glass: a refracting glass plate with a blue tint and the
+/// four-pane Windows logo in white.
+pub fn draw_start_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
+    use crate::ui::glass::{draw_glass, draw_highlights, Layer};
+    let plate = button_plate(rc, hovered);
+    draw_glass(r, plate, BUTTON_RADIUS, Layer::Plate, hovered)?;
+    // Blue tint, deeper at the bottom, then the rims again so they stay crisp on top of it.
+    r.fill_rounded_rect_gradient(plate, BUTTON_RADIUS, 0x4DA8_FFC4, 0x0A62_E6D2)?;
+    draw_highlights(r, plate, BUTTON_RADIUS, if hovered { 1.35 } else { 1.0 })?;
+    // Windows logo: four panes with a thin gap, centred.
+    let logo = plate.w * 0.52;
+    let gap = logo * 0.12;
+    let pane = (logo - gap) / 2.0;
+    let (x0, y0) = (plate.x + (plate.w - logo) / 2.0, plate.y + (plate.h - logo) / 2.0);
+    for (dx, dy) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+        let p = RectF { x: x0 + dx * (pane + gap), y: y0 + dy * (pane + gap), w: pane, h: pane };
+        r.fill_rounded_rect_gradient(p, pane * 0.16, 0xFFFF_FFFF, 0xE6F2_FFE6)?;
+    }
+    Ok(())
+}
+
+/// Search button in Liquid Glass: a clear glass plate with a white magnifier.
 pub fn draw_search_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
-    static SEARCH: OnceLock<AppIcon> = OnceLock::new();
-    let icon = SEARCH.get_or_init(|| AppIcon::from_composed(search_icon_rgba()));
-    let k = if hovered { 1.0 + MAG_MAX } else { 1.0 };
-    let size = ICON * k;
-    let cx = rc.x + rc.w / 2.0;
-    let bottom = rc.y + ICON_TOP + ICON;
-    draw_icon(r, icon, RectF { x: cx - size / 2.0, y: bottom - size, w: size, h: size })
+    use crate::ui::glass::{draw_glass, Layer};
+    let plate = button_plate(rc, hovered);
+    draw_glass(r, plate, BUTTON_RADIUS, Layer::Plate, hovered)?;
+    // A faint cool dim keeps the white glyph readable on bright wallpapers.
+    r.fill_rounded_rect(plate, BUTTON_RADIUS, 0x1018_2A38)?;
+    let inset = plate.w * 0.2;
+    let area = RectF { x: plate.x + inset, y: plate.y + inset, w: plate.w - 2.0 * inset, h: plate.h - 2.0 * inset };
+    crate::ui::svgpath::draw_path(
+        r,
+        "M4.3 10.5a6.2 6.2 0 1 0 12.4 0a6.2 6.2 0 1 0 -12.4 0z M15.2 15.2L20.5 20.5",
+        area,
+        24.0,
+        0xFFFF_FFF2,
+        Some(2.4),
+    )
 }
 
 /// Index into `state.windows` for the slot under (x, y).
@@ -285,17 +314,38 @@ fn magnify(cx: f32, pointer: Option<f32>) -> f32 {
 }
 
 /// Full-bleed squircle icon with its soft shadow; no plate behind it.
+/// Liquid Glass finish over a composed icon: a glossy top sheen, a faint inner bottom shade
+/// and the specular rims, so every app icon reads as the same glass material as the plates.
+fn glass_finish(r: &mut Renderer, ico: RectF) -> Result<()> {
+    let radius = ico.w * ICON_GLASS_RADIUS;
+    // Gloss: white fading out over the upper half.
+    r.fill_rounded_rect_linear(
+        ico,
+        radius,
+        (ico.x, ico.y),
+        0xFFFF_FF3A,
+        (ico.x, ico.y + ico.h * 0.55),
+        0xFFFF_FF00,
+    )?;
+    crate::ui::glass::draw_highlights(r, ico, radius, 1.0)
+}
+
 fn draw_icon(r: &mut Renderer, icon: &AppIcon, ico: RectF) -> Result<()> {
     draw_shadow(r, &icon.shadow, icon.w, ico)?;
-    r.draw_bitmap(icon.w, icon.h, &icon.rgba, ico)
+    r.draw_bitmap(icon.w, icon.h, &icon.rgba, ico)?;
+    glass_finish(r, ico)
 }
+
+/// Corner radius of the glass finish, as a share of the icon size (matches the composed squircle).
+const ICON_GLASS_RADIUS: f32 = 0.24;
 
 /// Gradient squircle-ish tile with the uppercase initial, used until the icon is loaded.
 fn draw_fallback(r: &mut Renderer, ico: RectF, label: &str) -> Result<()> {
     draw_shadow(r, fallback_shadow(), FALLBACK_SRC, ico)?;
     let k = ico.w / ICON;
     r.fill_rounded_rect_gradient(ico, FALLBACK_RADIUS * ico.w, FALLBACK_TOP, FALLBACK_BOTTOM)?;
-    r.draw_text_styled(label, ico, FALLBACK_FONT * k, WHITE, Align::Center, TextStyle::Bold)
+    r.draw_text_styled(label, ico, FALLBACK_FONT * k, WHITE, Align::Center, TextStyle::Bold)?;
+    glass_finish(r, ico)
 }
 
 /// Source size used for the fallback shadow bitmap.
@@ -584,4 +634,25 @@ mod icon_tests {
         let c = ((ICON_N / 2 * ICON_N + ICON_N / 2) * 4) as usize;
         assert_eq!(out[c + 3], 255, "centre is opaque (backing)");
     }
+}
+
+/// Recycle Bin icon: a neutral glass plate, a faint round well and an outlined bin; when the
+/// bin holds items the two slats inside show.
+pub fn draw_trash_icon(r: &mut Renderer, rc: RectF, hovered: bool, full: bool) -> Result<()> {
+    use crate::ui::glass::{draw_glass, Layer};
+    let plate = button_plate(rc, hovered);
+    draw_glass(r, plate, BUTTON_RADIUS, Layer::Plate, hovered)?;
+    r.fill_rounded_rect(plate, BUTTON_RADIUS, 0x1018_2A38)?;
+    // Round well behind the glyph.
+    let well_d = plate.w * 0.68;
+    let well = RectF { x: plate.x + (plate.w - well_d) / 2.0, y: plate.y + (plate.h - well_d) / 2.0, w: well_d, h: well_d };
+    r.fill_rounded_rect(well, well_d / 2.0, 0xFFFF_FF18)?;
+    let inset = plate.w * 0.27;
+    let area = RectF { x: plate.x + inset, y: plate.y + inset, w: plate.w - 2.0 * inset, h: plate.h - 2.0 * inset };
+    let d = if full {
+        "M4 7h16 M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2 M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12 M10 11v6 M14 11v6"
+    } else {
+        "M4 7h16 M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2 M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"
+    };
+    crate::ui::svgpath::draw_path(r, d, area, 24.0, 0xFFFF_FFD6, Some(1.8))
 }

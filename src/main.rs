@@ -119,6 +119,9 @@ struct App {
     rdp_front: bool,
     /// The RDP answer seen on the last tick when it differs from `rdp_front`; it must repeat once to flip.
     rdp_pending: Option<bool>,
+    /// Monitors whose dock is hidden because a fullscreen window covers them.
+    fs_hidden: Vec<isize>,
+    fs_pending: Option<Vec<isize>>,
     /// True while the docks are hidden and their AppBars removed (`remote_hidden || rdp_front`).
     docks_released: bool,
     /// A display change arrived while the docks were released; they are rebuilt on restore.
@@ -650,6 +653,7 @@ fn run() -> windows::core::Result<()> {
     popup::set_painter(paint_popup);
     popup::set_click_handler(on_popup_click);
     popup::set_on_hide(on_popup_hidden);
+    popup::set_char_handler(on_popup_char);
     popup::set_drag_handler(on_popup_drag);
     popup::set_tick_handler(on_popup_tick);
     popup::set_rclick_handler(on_popup_rclick);
@@ -706,6 +710,8 @@ fn run() -> windows::core::Result<()> {
             remote_hidden: false,
             rdp_front: false,
             rdp_pending: None,
+            fs_hidden: Vec::new(),
+            fs_pending: None,
             docks_released: false,
             topology_stale: false,
             secondaries,
@@ -770,6 +776,8 @@ struct Zones {
 
 /// Provider card size: icon plate plus up to three limit lines (height 0 = the standard widget height).
 const USAGE_TILE_W: f32 = 170.0;
+/// Width of the wide clock style.
+const CLOCK_WIDE_W: f32 = 136.0;
 const USAGE_TILE_H: f32 = 0.0; // same height as every other widget
 
 /// Dock width of a widget.
@@ -780,12 +788,12 @@ fn widget_width(id: &str) -> f32 {
         "media" => dock::MEDIA_W,
         "weather" => 100.0,
         "focus" => 84.0,
-        "todo" => 104.0,
-        "trash" => 92.0,
+        "todo" => 160.0,
         "downloads" => 150.0,
         "chevron" => 30.0,
         "cc" => 56.0,
         "clock" => 64.0,
+        "lang" => 42.0,
         _ => 42.0, // cpu / ram: wide enough for a tiny label above the percent inside the ring
     }
 }
@@ -802,7 +810,13 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
             .filter(|id| settings.widget_shown(id))
             .map(|id| Tile {
                 id,
-                width: if settings::is_fixed_widget(id) { widget_width(id) } else { (widget_width(id) * settings.widget_scale()).round() },
+                width: if id == "clock" && settings.clock_style == "wide" {
+                    CLOCK_WIDE_W
+                } else if settings::is_fixed_widget(id) {
+                    widget_width(id)
+                } else {
+                    (widget_width(id) * settings.widget_scale()).round()
+                },
                 // The provider cards carry up to three limit lines.
                 height: if matches!(id, "claude" | "codex" | "cursor" | "grok") { USAGE_TILE_H } else { 0.0 },
             })
@@ -812,19 +826,18 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
     let right = widgets(&settings.layout.right);
     Zones {
         left,
-        // Variant A: 38-DIP Start squircle, thin divider, then the 38-DIP app icons.
-        center: if app_count == 0 {
-            vec![
-                Tile { id: "start", width: apps::ICON, height: apps::CLUSTER_H },
-                Tile { id: "search", width: apps::ICON, height: apps::CLUSTER_H },
-            ]
-        } else {
-            vec![
-                Tile { id: "start", width: apps::ICON, height: apps::CLUSTER_H },
-                Tile { id: "search", width: apps::ICON, height: apps::CLUSTER_H },
-                Tile { id: "sep", width: 1.0, height: 24.0 },
-                Tile { id: "apps", width: apps_w, height: apps::CLUSTER_H },
-            ]
+        // Variant A: Start squircle, Search, thin divider, then the app icons; the Recycle Bin
+        // closes the cluster after a second divider (like macOS).
+        center: {
+            let cell = |id| Tile { id, width: apps::ICON, height: apps::CLUSTER_H };
+            let mut center = vec![cell("start"), cell("search")];
+            if app_count > 0 {
+                center.push(Tile { id: "sep", width: 1.0, height: 24.0 });
+                center.push(Tile { id: "apps", width: apps_w, height: apps::CLUSTER_H });
+            }
+            center.push(Tile { id: "sep2", width: 1.0, height: 24.0 });
+            center.push(cell("trash"));
+            center
         },
         right,
     }
@@ -1052,24 +1065,17 @@ fn tile_view(
             }
         }
         "todo" => {
-            let total = settings.todos.len();
-            let done = settings.todos.iter().filter(|t| t.done).count();
-            let (value, progress) = if total == 0 {
-                ("Trống".to_owned(), None)
-            } else {
-                (format!("{} còn lại", total - done), Some(done as f32 / total as f32))
-            };
-            TileView { progress, accent: 0x3FD2_7FFF, ..TileView::card("VIỆC CẦN LÀM", value) }
+            let latest = settings.todos.iter().rev().find(|t| !t.done).or(settings.todos.last());
+            let sub = latest.map_or("Chưa có ghi chú".to_owned(), |t| t.text.clone());
+            TileView { style: Style::Note, sub, ..TileView::card("Ghi chú", "") }
         }
-        "trash" => {
-            let info = win::shellinfo::info();
-            let (value, sub) = if info.bin_items == 0 {
-                ("Trống".to_owned(), String::new())
-            } else {
-                (format!("{} mục", info.bin_items), win::shellinfo::human_size(info.bin_bytes))
-            };
-            TileView { sub, ..TileView::card("THÙNG RÁC", value) }
-        }
+        // Recycle Bin: a dock icon at the end of the centre cluster (full when it holds items).
+        "trash" => TileView {
+            style: Style::Trash,
+            progress: (win::shellinfo::info().bin_items > 0).then_some(1.0),
+            ..TileView::card("", "")
+        },
+        "sep2" => TileView { style: Style::Separator, ..TileView::card("", "") },
         "downloads" => {
             let info = win::shellinfo::info();
             match info.latest {
@@ -1106,6 +1112,7 @@ fn tile_view(
             accent: gauge_color(stats.cpu_pct),
             ..TileView::card("CPU", format!("{:.0}", stats.cpu_pct))
         },
+        "lang" => TileView { style: Style::Label, ..TileView::card("", win::kbd::label()) },
         "ram" => {
             let pct = if stats.ram_total_mb > 0 { stats.ram_used_mb as f32 * 100.0 / stats.ram_total_mb as f32 } else { 0.0 };
             TileView {
@@ -1126,6 +1133,15 @@ fn tile_view(
             } else {
                 String::new()
             };
+            if settings.clock_style == "wide" {
+                const WEEKDAYS: [&str; 7] = ["CHỦ NHẬT", "THỨ HAI", "THỨ BA", "THỨ TƯ", "THỨ NĂM", "THỨ SÁU", "THỨ BẢY"];
+                return TileView {
+                    style: Style::ClockWide,
+                    sub,
+                    extra: now.format("%d/%m").to_string(),
+                    ..TileView::card(WEEKDAYS[now.weekday().num_days_from_sunday() as usize], now.format("%H:%M").to_string())
+                };
+            }
             TileView {
                 style: Style::Clock,
                 sub,
@@ -1151,6 +1167,7 @@ fn paint_surface(
     backdrop: Option<&Arc<LiquidBitmap>>,
 ) {
     glass::set_style(&settings.dock_style);
+    win::deskglass::set_enabled(settings.desktop_glass);
     let zones = layout_tiles(apps_state.windows.len(), settings);
     let rects = dock::layout(&zones.left, &zones.center, &zones.right, width);
     let defs: Vec<&Tile> = zones.left.iter().chain(&zones.center).chain(&zones.right).collect();
@@ -1377,7 +1394,7 @@ fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
         let target = tiles
             .iter()
             .find(|(id, r)| in_tile(id, r, x, y))
-            .and_then(|(id, _)| settings::WIDGET_IDS.iter().copied().find(|w| w == id));
+            .and_then(|(id, _)| if *id == "trash" { Some("trash") } else { settings::WIDGET_IDS.iter().copied().find(|w| w == id) });
         let settings = app.shared.settings.lock().ok()?.clone();
         DOCK_MENU_H.with(|h| h.set(appmenu::open_dock_menu(target, &settings)));
         let scale = dpi::scale(dpi_value);
@@ -1435,6 +1452,74 @@ fn pins_of(settings: &settings::Settings) -> Vec<(String, String)> {
     pins
 }
 
+// ---------- volume on the speaker of the Wi-Fi / volume button: wheel and drag ----------
+
+/// Share of the volume range per wheel notch, and per pixel of horizontal drag.
+const VOLUME_WHEEL_STEP: f32 = 0.05;
+const VOLUME_PER_DIP: f32 = 0.008;
+/// Speaker part of the button starts this far (DIP) from its left edge (after the Wi-Fi fan).
+const SPEAKER_X: f32 = 24.0;
+
+thread_local! {
+    /// Volume drag in progress: (pointer x at press, volume at press, moved far enough yet).
+    static VOL_DRAG: Cell<Option<(f32, f32, bool)>> = const { Cell::new(None) };
+}
+
+fn on_speaker(tiles: &TileRects, x: f32, y: f32) -> bool {
+    tiles.iter().any(|(id, r)| *id == "cc" && in_tile(id, r, x, y) && x >= r.x + SPEAKER_X)
+}
+
+fn current_volume() -> f32 {
+    APP.with(|a| {
+        let slot = a.try_borrow().ok()?;
+        let v = slot.as_ref()?.shared.control.lock().ok()?.volume;
+        Some(v)
+    })
+    .unwrap_or(0.5)
+}
+
+/// Sets the master volume now: the dock's own state first (the icon follows immediately), the
+/// system value through the coalescing worker.
+fn set_volume_live(v: f32) {
+    let v = v.clamp(0.0, 1.0);
+    APP.with(|a| {
+        if let Ok(slot) = a.try_borrow() {
+            if let Some(app) = slot.as_ref() {
+                let mut c = app.shared.control.lock().unwrap();
+                c.volume = v;
+                if v > 0.0 {
+                    c.muted = false;
+                }
+            }
+        }
+    });
+    if v > 0.0 {
+        let _ = win::system::set_mute(false);
+    }
+    live_apply(control_center::ControlAction::SetVolume(v));
+    repaint();
+}
+
+/// Wheel over the speaker: +/- 5% per notch.
+fn volume_wheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
+    use windows::Win32::Foundation::POINT;
+    let mut pt = POINT { x: (lparam.0 & 0xffff) as i16 as i32, y: ((lparam.0 >> 16) & 0xffff) as i16 as i32 };
+    // SAFETY: `pt` is a valid local; `hwnd` is our window.
+    unsafe {
+        let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+    }
+    let (x, y) = client_point(LPARAM(((pt.y as isize) << 16) | (pt.x as isize & 0xffff)));
+    let Some(tiles) = dock_tiles_of(hwnd) else { return false };
+    if !on_speaker(&tiles, x, y) {
+        return false;
+    }
+    let notches = ((wparam.0 >> 16) as i16) as f32 / 120.0;
+    let target = current_volume() + notches * VOLUME_WHEEL_STEP;
+    log(&format!("volume wheel: {:.0}% -> {:.0}%", current_volume() * 100.0, target.clamp(0.0, 1.0) * 100.0));
+    set_volume_live(target);
+    true
+}
+
 // ---------- drag a widget to another place (or the other side) ----------
 
 struct Drag {
@@ -1473,7 +1558,7 @@ fn widget_id_at(tiles: &TileRects, x: f32, y: f32) -> Option<&'static str> {
 
 /// x of the middle of the centre cluster; widgets left of it are on the left side.
 fn center_mid(tiles: &TileRects) -> f32 {
-    let centre = tiles.iter().filter(|(id, _)| matches!(*id, "start" | "search" | "sep" | "apps"));
+    let centre = tiles.iter().filter(|(id, _)| matches!(*id, "start" | "search" | "sep" | "apps" | "sep2" | "trash"));
     let (lo, hi) = centre.fold((f32::MAX, f32::MIN), |(lo, hi), (_, r)| (lo.min(r.x), hi.max(r.x + r.w)));
     if lo > hi { 0.0 } else { (lo + hi) / 2.0 }
 }
@@ -1617,6 +1702,7 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
             "cc" => Click::Open(OpenPopup::Control, anchor),
             "chevron" => Click::TrayOverflow(anchor),
             "focus" => Click::Action("focus"),
+            "lang" => Click::Action("lang"),
             "trash" => Click::Action("trash"),
             "downloads" => Click::Action("downloads"),
             "todo" => Click::Open(OpenPopup::Data("todo"), anchor),
@@ -1629,6 +1715,7 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
 fn run_widget_action(id: &str) {
     match id {
         "focus" => data::focus::toggle(),
+        "lang" => win::kbd::switch(),
         "focus_reset" => data::focus::reset(),
         "trash" => {
             let _ = system::open_path(std::path::Path::new("shell:RecycleBinFolder"));
@@ -1894,6 +1981,12 @@ fn on_popup_click(x: f32, y: f32) {
     }
     if OPEN.with(Cell::get) == Some(OpenPopup::Data("todo")) {
         if let Some(action) = popup_content::hit_todo(x, y, rect) {
+            if action == popup_content::TodoAction::FocusInput {
+                popup_content::todo_input_set_focus(true);
+                popup::focus();
+                popup::repaint_now();
+                return;
+            }
             use popup_content::TodoAction;
             APP.with(|a| {
                 let slot = a.borrow();
@@ -1917,6 +2010,7 @@ fn on_popup_click(x: f32, y: f32) {
                         }
                     }
                     TodoAction::ClearDone => settings.todos.retain(|t| !t.done),
+                    TodoAction::FocusInput => {}
                 }
                 let _ = settings::save(settings);
                 popup_content::set_settings(settings.clone());
@@ -2050,7 +2144,36 @@ fn close_tray_popup() {
     repaint();
 }
 
+/// Typed character for the note input; Enter adds the note.
+fn on_popup_char(ch: char) {
+    if OPEN.with(Cell::get) != Some(OpenPopup::Data("todo")) || !popup_content::todo_input_focused() {
+        return;
+    }
+    match popup_content::todo_input_char(ch) {
+        Some(text) => {
+            APP.with(|a| {
+                let slot = a.borrow();
+                let Some(app) = slot.as_ref() else { return };
+                let mut guard = app.shared.settings.lock().unwrap();
+                let settings = Arc::make_mut(&mut guard);
+                settings.todos.push(settings::TodoItem { text, done: false });
+                let _ = settings::save(settings);
+                popup_content::set_settings(settings.clone());
+            });
+            // The list grew: reopen at the new height, keeping the input focused.
+            let anchor = LAST_ANCHOR.with(Cell::get);
+            OPEN.with(|o| o.set(None));
+            open_popup(OpenPopup::Data("todo"), anchor);
+            popup_content::todo_input_set_focus(true);
+            popup::focus();
+            popup::repaint_now();
+        }
+        None => popup::repaint_now(),
+    }
+}
+
 fn on_popup_hidden() {
+    popup_content::todo_input_set_focus(false);
     if OPEN.with(Cell::get) == Some(OpenPopup::Tray) {
         trayview::closed();
         repaint();
@@ -2334,6 +2457,23 @@ fn set_docks_released(app: &mut App, released: bool) {
     log("docks restored: AppBars registered, shown");
 }
 
+/// Hides the dock on the monitor a fullscreen window covers and shows the others.
+fn apply_fullscreen_hiding(app: &App) {
+    if app.docks_released {
+        return;
+    }
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    for hwnd in std::iter::once(app.hwnd).chain(app.secondaries.iter().map(|s| s.hwnd)) {
+        // SAFETY: our own dock windows.
+        unsafe {
+            let on = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST).0 as isize;
+            let hide = app.fs_hidden.contains(&on) || !app.dock_visible;
+            log(&format!("fullscreen: dock {:?} on monitor {on:#x} hide={hide} (fullscreen monitors {:x?})", hwnd.0, app.fs_hidden));
+            let _ = ShowWindow(hwnd, if hide { SW_HIDE } else { SW_SHOWNOACTIVATE });
+        }
+    }
+}
+
 /// Runs every tick (500 ms). Tracks this PC being remoted into and a fullscreen RDP client in
 /// front (debounced: a new answer must repeat on the next tick), then releases or restores the
 /// docks when the combined state changes.
@@ -2354,6 +2494,27 @@ fn update_remote_state(app: &mut App) {
             log(if now { "fullscreen RDP in front" } else { "fullscreen RDP left" });
         }
         Some(now) => app.rdp_pending = Some(now),
+    }
+    // Fullscreen windows (game, video, F11 browser) on any monitor: hide only that monitor's
+    // dock. A new answer must repeat on the next tick (debounce).
+    let now = tasks::fullscreen_monitors();
+    if now == app.fs_hidden {
+        app.fs_pending = None;
+    } else if app.fs_pending.as_ref() == Some(&now) {
+        app.fs_pending = None;
+        app.fs_hidden = now;
+        apply_fullscreen_hiding(app);
+        log(&format!("fullscreen monitors: {}", app.fs_hidden.len()));
+        if app.fs_hidden.is_empty() && app.topology_stale && !app.docks_released {
+            app.topology_stale = false;
+            LAST_RESTORE.with(|c| c.set(Some(std::time::Instant::now())));
+            // SAFETY: posting to our own primary dock window.
+            unsafe {
+                let _ = PostMessageW(app.hwnd, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
+            }
+        }
+    } else {
+        app.fs_pending = Some(now);
     }
     let released = app.remote_hidden || app.rdp_front;
     if released != app.docks_released {
@@ -2397,7 +2558,7 @@ fn guard_work_area(primary: HWND) {
     // The docks release their AppBars on purpose (remote session, fullscreen RDP), and for a moment
     // after they come back Explorer is still settling. A missing reservation is expected then;
     // repairing it re-registers the AppBars and makes Explorer re-lay out the taskbar.
-    let released = APP.with(|a| a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.docks_released))).unwrap_or(false);
+    let released = APP.with(|a| a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.docks_released || !app.fs_hidden.is_empty()))).unwrap_or(false);
     // Right after the docks come back, Explorer often reports the reservation missing for a few
     // seconds. Repairing it then re-attaches to Explorer, which flickers and has crashed; leave it.
     let settling = LAST_RESTORE.with(|c| c.get()).is_some_and(|t| t.elapsed() < RESTORE_SETTLE);
@@ -2632,7 +2793,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             tasks::capture_click_state();
             let (x, y) = client_point(lparam);
             log(&format!("[{}] down at ({x},{y})", chrono::Local::now().format("%H:%M:%S%.3f")));
-            if let Some(id) = dock_tiles_of(hwnd).and_then(|t| widget_id_at(&t, x, y)) {
+            let tiles_now = dock_tiles_of(hwnd);
+            if tiles_now.as_ref().is_some_and(|t| on_speaker(t, x, y)) {
+                // Dragging sideways on the speaker changes the volume; a plain click still opens the panel.
+                VOL_DRAG.with(|d| d.set(Some((x, current_volume(), false))));
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
+            } else if let Some(id) = tiles_now.and_then(|t| widget_id_at(&t, x, y)) {
                 DRAG.with(|d| *d.borrow_mut() = Some(Drag { id, start_x: x, active: false }));
                 let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
             }
@@ -2641,7 +2807,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_LBUTTONUP => {
             let (x, y) = client_point(lparam);
             // Finish the drag first: releasing the capture sends WM_CAPTURECHANGED, which cancels one.
-            let dragged = drag_finish(hwnd, x);
+            let vol_dragged = VOL_DRAG.with(|d| d.take()).is_some_and(|(_, _, moved)| moved);
+            let dragged = drag_finish(hwnd, x) || vol_dragged;
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
             if dragged {
                 return LRESULT(0);
@@ -2689,6 +2856,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_MOUSEMOVE => {
             let (x, y) = client_point(lparam);
+            if let Some((x0, v0, moved)) = VOL_DRAG.with(Cell::get) {
+                if wparam.0 & 1 == 0 {
+                    VOL_DRAG.with(|d| d.set(None));
+                } else {
+                    let moved = moved || (x - x0).abs() > DRAG_THRESHOLD;
+                    VOL_DRAG.with(|d| d.set(Some((x0, v0, moved))));
+                    if moved {
+                        set_volume_live(v0 + (x - x0) * VOLUME_PER_DIP);
+                        return LRESULT(0);
+                    }
+                }
+            }
             if drag_mouse_move(hwnd, x, wparam.0 & 1 != 0) {
                 return LRESULT(0);
             }
@@ -2718,7 +2897,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             // skipped by mouse input and clicks reached the desktop instead.
             LRESULT(HTCLIENT as isize)
         }
+        WM_MOUSEWHEEL => {
+            if volume_wheel(hwnd, wparam, lparam) {
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_CAPTURECHANGED => {
+            VOL_DRAG.with(|d| d.set(None));
             // Capture taken away mid-drag (Alt+Tab, another popup): drop the drag without applying it.
             if DRAG.with(|d| d.borrow_mut().take()).is_some_and(|d| d.active) {
                 DROP.with(|d| d.set(None));
@@ -2736,6 +2922,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
+            // A sent WM_DISPLAYCHANGE can arrive while a timer handler holds APP (its own
+            // ShowWindow calls pump sent messages): handle it again once that has finished.
+            if APP.with(|a| a.try_borrow().is_err()) {
+                unsafe {
+                    let _ = PostMessageW(hwnd, WM_DISPLAYCHANGE, wparam, lparam);
+                }
+                return LRESULT(0);
+            }
             // Only the primary dock owns topology rebuilds; secondary HWNDs also receive this.
             let is_primary = APP.with(|a| a.borrow().as_ref().map(|app| app.hwnd == hwnd).unwrap_or(false));
             if is_primary {
@@ -2743,10 +2937,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 let released = APP.with(|a| {
                     let mut slot = a.borrow_mut();
                     slot.as_mut().map(|app| {
-                        if app.docks_released {
+                        // A fullscreen game switching modes fires bursts of these: rebuild after it ends.
+                        let hold = app.docks_released || !app.fs_hidden.is_empty();
+                        if hold {
                             app.topology_stale = true;
                         }
-                        app.docks_released
+                        hold
                     })
                 });
                 if released == Some(true) {

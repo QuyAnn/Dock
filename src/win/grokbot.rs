@@ -127,10 +127,60 @@ pub fn running_hwnd() -> Option<isize> {
 }
 
 /// App icon for the tile (exe / shortcut / running process). Falls back to None for the SVG glyph.
+/// Box-filtered down to 64 px once: drawing the 256 px source at ~30 px directly looks soft.
 pub fn icon() -> Option<IconBitmap> {
+    static SMALL: std::sync::OnceLock<IconBitmap> = std::sync::OnceLock::new();
+    if let Some(hit) = SMALL.get() {
+        return Some(hit.clone());
+    }
     let path = resolve_path()?;
     let s = path.to_string_lossy();
-    icon_for_exe(&s, "", "")
+    let big = icon_for_exe(&s, "", "")?;
+    let small = box_downscale(&big, 64, 0.03);
+    Some(SMALL.get_or_init(|| small).clone())
+}
+
+/// Crops the icon's own dark frame (`crop` = fraction per side), area-averages it down to
+/// `target` px (premultiplied) and rounds the corners.
+fn box_downscale(src: &IconBitmap, target: u32, crop: f32) -> IconBitmap {
+    let (sw, sh) = (src.w as f32, src.h as f32);
+    let (x0, y0) = (sw * crop, sh * crop);
+    let (cw, ch) = (sw * (1.0 - 2.0 * crop), sh * (1.0 - 2.0 * crop));
+    let t = target as usize;
+    let radius = target as f32 * 0.24;
+    let mut out = vec![0u8; t * t * 4];
+    for y in 0..t {
+        for x in 0..t {
+            let (ax, bx) = (x0 + cw * x as f32 / t as f32, x0 + cw * (x + 1) as f32 / t as f32);
+            let (ay, by) = (y0 + ch * y as f32 / t as f32, y0 + ch * (y + 1) as f32 / t as f32);
+            let mut acc = [0f32; 4];
+            let mut n = 0f32;
+            for j in ay.floor() as usize..(by.ceil() as usize).min(src.h as usize) {
+                for i in ax.floor() as usize..(bx.ceil() as usize).min(src.w as usize) {
+                    let p = (j * src.w as usize + i) * 4;
+                    let a = src.rgba[p + 3] as f32;
+                    for c in 0..3 {
+                        acc[c] += src.rgba[p + c] as f32 * a;
+                    }
+                    acc[3] += a;
+                    n += 1.0;
+                }
+            }
+            // Rounded-corner coverage of this pixel centre.
+            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+            let dx = (radius - px).max(px - (target as f32 - radius)).max(0.0);
+            let dy = (radius - py).max(py - (target as f32 - radius)).max(0.0);
+            let cover = (radius + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+            let o = (y * t + x) * 4;
+            if acc[3] > 0.0 {
+                for c in 0..3 {
+                    out[o + c] = (acc[c] / acc[3]).round() as u8;
+                }
+                out[o + 3] = (acc[3] / n.max(1.0) * cover).round() as u8;
+            }
+        }
+    }
+    IconBitmap { w: target, h: target, rgba: out }
 }
 
 /// Opens Grok Bot if needed, otherwise focuses an existing window.
