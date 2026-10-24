@@ -1156,3 +1156,69 @@ pub fn foreground_rdp_fullscreen() -> Option<bool> {
         Some(window.left <= m.left && window.top <= m.top && window.right >= m.right && window.bottom >= m.bottom)
     }
 }
+
+/// Monitors (HMONITOR as isize, sorted) whose topmost real window covers the whole screen: a
+/// fullscreen game, video or presentation, even when it is not the foreground window (it may
+/// sit on a second monitor while the user works on the first).
+pub fn fullscreen_monitors() -> Vec<isize> {
+    use windows::Win32::Foundation::{BOOL, RECT};
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    };
+
+    struct Acc {
+        decided: Vec<(isize, bool)>,
+    }
+
+    unsafe extern "system" fn each(hwnd: HWND, lp: LPARAM) -> BOOL {
+        // SAFETY: `lp` is the `&mut Acc` passed by `fullscreen_monitors`, alive for the whole call.
+        let acc = unsafe { &mut *(lp.0 as *mut Acc) };
+        unsafe {
+            if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            let mut cloaked = 0u32;
+            let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut _, 4);
+            if cloaked != 0 || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 {
+                return BOOL(1);
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == std::process::id() {
+                return BOOL(1);
+            }
+            let mut window = RECT::default();
+            if GetWindowRect(hwnd, &mut window).is_err() || window.right <= window.left || window.bottom <= window.top {
+                return BOOL(1);
+            }
+            let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
+            if mon.is_invalid() || acc.decided.iter().any(|(m, _)| *m == mon.0 as isize) {
+                return BOOL(1);
+            }
+            let mut buf = [0u16; 64];
+            let n = GetClassNameW(hwnd, &mut buf);
+            let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+            let shell = matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd");
+            let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+            let full = !shell
+                && GetMonitorInfoW(mon, &mut info).as_bool()
+                && window.left <= info.rcMonitor.left
+                && window.top <= info.rcMonitor.top
+                && window.right >= info.rcMonitor.right
+                && window.bottom >= info.rcMonitor.bottom;
+            acc.decided.push((mon.0 as isize, full));
+        }
+        BOOL(1)
+    }
+
+    let mut acc = Acc { decided: Vec::new() };
+    // SAFETY: the callback only runs during this call and `acc` outlives it.
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&mut acc as *mut Acc as isize));
+    }
+    let mut full: Vec<isize> = acc.decided.into_iter().filter_map(|(m, f)| f.then_some(m)).collect();
+    full.sort_unstable();
+    full
+}

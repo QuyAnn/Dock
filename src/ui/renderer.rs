@@ -630,6 +630,49 @@ fn fingerprint(data: &[u8]) -> u64 {
     h
 }
 
+/// Set once a window's frame was extended over its whole client area, so DWM honours the
+/// per-pixel alpha of the Direct2D target (a cleared pixel then shows the desktop through).
+static DWM_TRANSPARENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Lets a WS_POPUP window be truly transparent where nothing is drawn.
+pub fn apply_dwm_transparency(hwnd: HWND) -> bool {
+    use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+    use windows::Win32::UI::Controls::MARGINS;
+    let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+    // SAFETY: `m` lives for the call.
+    let ok = unsafe { DwmExtendFrameIntoClientArea(hwnd, &m) }.is_ok();
+    if ok {
+        DWM_TRANSPARENT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    ok
+}
+
+/// Dock windows: square corners and no DWM border line, so nothing outlines the empty bar.
+pub fn apply_dock_no_chrome(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::DWMWCP_DONOTROUND;
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    // SAFETY: documented attributes with u32 payloads.
+    unsafe {
+        let pref: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&pref as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&DWMWA_COLOR_NONE as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+}
+
+pub fn dwm_transparent() -> bool {
+    DWM_TRANSPARENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Asks the Windows 11 compositor for anti-aliased rounded corners.
 pub fn apply_dwm_rounding(hwnd: HWND) -> bool {
     unsafe {

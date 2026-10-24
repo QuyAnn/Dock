@@ -19,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect,
     KillTimer, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -35,7 +35,7 @@ const MARGIN: f32 = 6.0;
 /// Must equal the DWM corner so the drawn panel and the window clip match exactly.
 const RADIUS: f32 = POPUP_CORNER_RADIUS;
 const TIMER_ID: usize = 1;
-const POLL_MS: u32 = 100;
+const POLL_MS: u32 = 40;
 
 struct Popup {
     hwnd: HWND,
@@ -70,6 +70,8 @@ thread_local! {
     /// True between a captured mouse-down and its mouse-up.
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
     static LAST_POS: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
+    static CHAR: Cell<Option<fn(char)>> = const { Cell::new(None) };
+    static HIGH: Cell<u16> = const { Cell::new(0) };
 }
 
 /// Phase of a captured drag inside the popup (sliders).
@@ -89,6 +91,23 @@ pub fn set_drag_handler(f: fn(DragPhase, f32, f32) -> bool) {
 /// Receives right clicks (button up) inside the popup, in client DIPs.
 pub fn set_rclick_handler(f: fn(f32, f32)) {
     RCLICK.with(|c| c.set(Some(f)));
+}
+
+/// Receives typed characters (WM_CHAR) while the popup holds keyboard focus.
+pub fn set_char_handler(f: fn(char)) {
+    CHAR.with(|c| c.set(Some(f)));
+}
+
+/// Gives the popup keyboard focus (it never takes it on click). Used by text inputs.
+pub fn focus() {
+    let hwnd = POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|pw| pw.hwnd)));
+    if let Some(hwnd) = hwnd {
+        // SAFETY: hwnd is our live popup; the dock process owns the foreground when the user clicks it.
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(hwnd);
+        }
+    }
 }
 
 /// Pointer position in popup client DIPs while it is over the visible popup.
@@ -396,6 +415,22 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             if let Some(f) = CLICK.with(Cell::get) {
                 f(x, y);
+            }
+            LRESULT(0)
+        }
+        WM_CHAR => {
+            let unit = wp.0 as u16;
+            let ch = if (0xD800..0xDC00).contains(&unit) {
+                HIGH.with(|h| h.set(unit));
+                None
+            } else if (0xDC00..0xE000).contains(&unit) {
+                let hi = HIGH.with(|h| h.replace(0));
+                char::decode_utf16([hi, unit]).next().and_then(|r| r.ok())
+            } else {
+                char::from_u32(unit as u32)
+            };
+            if let (Some(ch), Some(f)) = (ch, CHAR.with(Cell::get)) {
+                f(ch);
             }
             LRESULT(0)
         }

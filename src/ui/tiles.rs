@@ -81,14 +81,14 @@ pub fn git_tile(d: &DataState) -> TileView {
             // Hint belongs in Settings / Git popup; tile stays a quiet dash + empty grid.
             TileView {
                 style: Style::Git,
-                cells: heat_levels(&g.heatmap, 16, 3),
+                cells: heat_levels(&g.heatmap, 10, 7),
                 ..TileView::card("GIT", "—".to_owned())
             }
         }
         Some(g) => TileView {
             style: Style::Git,
-            cells: heat_levels(&g.heatmap, 16, 3),
-            ..TileView::card("GIT", format!("{} today  {} week  {} streak", g.today, g.week, g.streak))
+            cells: heat_levels(&g.heatmap, 10, 7),
+            ..TileView::card(format!("{} today", g.today), format!("{} week · {} streak", g.week, g.streak))
         },
     }
 }

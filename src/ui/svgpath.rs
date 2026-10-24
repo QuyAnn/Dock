@@ -36,7 +36,7 @@ pub const CURSOR_CUBE_INNER: &str = "M12 2.5v9.5l8.5 4.7M12 12 3.5 16.7";
 pub const CURSOR_CUBE_TOP: &str = "M12 12 20.5 7.3 12 2.5 3.5 7.3Z";
 
 /// Grok: diagonal slash plus two arcs (stroke 2).
-pub const GROK_SLASH: &str = "M5 19 19 5M9.5 5.5A7 7 0 0 1 18.5 14.5M14.5 18.5A7 7 0 0 1 5.5 9.5";
+pub const GROK_SLASH: &str = "M4.5 19.5 20 4M9.5 5.2A7.6 7.6 0 0 1 18.8 14.5M14.5 18.8A7.6 7.6 0 0 1 5.2 9.5";
 
 type P = (f32, f32);
 

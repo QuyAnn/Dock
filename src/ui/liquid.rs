@@ -33,6 +33,9 @@ pub struct LiquidBitmap {
     pub w: u32,
     pub h: u32,
     pub rgba: Vec<u8>,
+    /// Unblurred wallpaper crop of the same size, fully opaque. Painted as the bar itself so the
+    /// dock looks transparent between the tiles. Empty for popup backdrops.
+    pub plain: Vec<u8>,
 }
 
 /// Blur grid step in physical px. The blur runs on this grid; the lens samples it bilinearly.
@@ -45,7 +48,16 @@ pub fn render_liquid(wallpaper: &WallpaperPixels, bar: RectF, screen: (i32, i32)
     // The bar spans the whole dock height, so its height over DOCK_H is the device scale.
     let dpr = (bar.h / DOCK_H).clamp(1.0, MAX_DPR);
     let place = Placement::new(wallpaper, screen);
-    render_with(&|x, y| place.sample(wallpaper, x, y), bar, &DOCK_LENS, dpr, true)
+    let mut bitmap = render_with(&|x, y| place.sample(wallpaper, x, y), bar, &DOCK_LENS, dpr, true);
+    let mut plain = Vec::with_capacity((bitmap.w * bitmap.h * 4) as usize);
+    for y in 0..bitmap.h {
+        for x in 0..bitmap.w {
+            let c = place.sample(wallpaper, bar.x + x as f32 + 0.5, bar.y + y as f32 + 0.5);
+            plain.extend_from_slice(&[to_u8(c[0]), to_u8(c[1]), to_u8(c[2]), 255]);
+        }
+    }
+    bitmap.plain = plain;
+    bitmap
 }
 
 /// Frosted material for floating popups, macOS style: a wide blur of whatever is behind, boosted
@@ -209,7 +221,7 @@ fn render_with(
             out[o4 + 3] = (cov * 255.0 + 0.5) as u8;
         }
     }
-    LiquidBitmap { w: bw, h: bh, rgba: out }
+    LiquidBitmap { w: bw, h: bh, rgba: out, plain: Vec::new() }
 }
 
 /// Wallpaper placement on the display, per Windows fit mode (same math as `placement` in glass.ts).
