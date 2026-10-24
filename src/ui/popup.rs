@@ -19,7 +19,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowRect,
     KillTimer, RegisterClassExW, SetTimer, SetWindowPos, ShowWindow, HWND_TOPMOST, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, WM_CAPTURECHANGED, WM_CHAR, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -27,13 +27,12 @@ use super::dock::RectF;
 use std::sync::Arc;
 
 use super::liquid::LiquidBitmap;
-use super::renderer::{apply_acrylic, apply_popup_corners, Renderer, POPUP_CORNER_RADIUS};
+use super::renderer::{apply_acrylic, Renderer};
 use crate::win::dpi;
 
 const GAP: f32 = 8.0;
 const MARGIN: f32 = 6.0;
 /// Must equal the DWM corner so the drawn panel and the window clip match exactly.
-const RADIUS: f32 = POPUP_CORNER_RADIUS;
 const TIMER_ID: usize = 1;
 const POLL_MS: u32 = 40;
 
@@ -71,6 +70,8 @@ thread_local! {
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
     static LAST_POS: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
     static CHAR: Cell<Option<fn(char)>> = const { Cell::new(None) };
+    static WHEEL: Cell<Option<fn(f32, f32, f32)>> = const { Cell::new(None) };
+    static CENTERED: Cell<bool> = const { Cell::new(false) };
     static HIGH: Cell<u16> = const { Cell::new(0) };
 }
 
@@ -96,6 +97,11 @@ pub fn set_rclick_handler(f: fn(f32, f32)) {
 /// Receives typed characters (WM_CHAR) while the popup holds keyboard focus.
 pub fn set_char_handler(f: fn(char)) {
     CHAR.with(|c| c.set(Some(f)));
+}
+
+/// Receives mouse-wheel notches over the popup: (x, y) in client DIPs, positive = wheel up.
+pub fn set_wheel_handler(f: fn(f32, f32, f32)) {
+    WHEEL.with(|c| c.set(Some(f)));
 }
 
 /// Gives the popup keyboard focus (it never takes it on click). Used by text inputs.
@@ -176,6 +182,15 @@ pub fn set_on_hide(f: fn()) {
     ON_HIDE.with(|c| c.set(Some(f)));
 }
 
+/// Opens the popup centred on the primary monitor (the widget gallery).
+pub fn show_centered(width: f32, height: i32) -> Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+    // SAFETY: plain metric queries.
+    let (sw, sh) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+    CENTERED.with(|c| c.set(true));
+    show(RectF { x: sw as f32 / 2.0, y: sh as f32 / 2.0, w: 0.0, h: 0.0 }, width, height)
+}
+
 /// Opens the popup above (or below, if the anchor is in the top half) `anchor`, centered on it.
 /// `anchor` and the result are in screen coordinates. Replaces any open popup.
 pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
@@ -183,7 +198,11 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
     let width_px = dpi::dip_to_px(width, dpi);
     let height_px = dpi::dip_to_px(height as f32, dpi);
     let monitor = monitor_rect(anchor);
-    let rect = popup_rect_for(anchor, width_px, height_px, dpi, monitor);
+    let mut rect = popup_rect_for(anchor, width_px, height_px, dpi, monitor);
+    if CENTERED.with(|c| c.replace(false)) {
+        let (cx, cy) = ((monitor.left + monitor.right) / 2, (monitor.top + monitor.bottom) / 2);
+        rect = RECT { left: cx - width_px / 2, top: cy - height_px / 2, right: cx + (width_px + 1) / 2, bottom: cy + (height_px + 1) / 2 };
+    }
 
     register_class();
     let reused = POPUP.with(|p| {
@@ -213,8 +232,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
                 SWP_NOACTIVATE,
             );
         }
-        apply_popup_corners(pw.hwnd);
-        apply_acrylic(pw.hwnd, super::glass::PANEL_ACRYLIC_TINT);
+        style_window(pw.hwnd);
         unsafe {
             let _ = ShowWindow(pw.hwnd, SW_SHOWNOACTIVATE);
             SetTimer(pw.hwnd, TIMER_ID, POLL_MS, None);
@@ -251,8 +269,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         esc_down: true,
         backdrop: super::glass::popup_backdrop(rect, monitor, dpi),
     };
-    apply_popup_corners(hwnd);
-    apply_acrylic(hwnd, super::glass::PANEL_ACRYLIC_TINT);
+    style_window(hwnd);
     POPUP.with(|p| *p.borrow_mut() = Some(pw));
 
     // SAFETY: hwnd is a live window owned by POPUP.
@@ -261,6 +278,15 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         SetTimer(hwnd, TIMER_ID, POLL_MS, None);
     }
     Ok(())
+}
+
+/// Frame style of the popup window.
+fn style_window(hwnd: HWND) {
+    // Fully transparent window: the panel (frosted backdrop, rounded corners, rims) is drawn by
+    // `paint`, so its corners can have any radius and stay anti-aliased.
+    apply_acrylic(hwnd, 0);
+    super::renderer::apply_dwm_transparency(hwnd);
+    super::renderer::apply_dock_no_chrome(hwnd);
 }
 
 fn monitor_rect(anchor: RectF) -> RECT {
@@ -418,6 +444,23 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             }
             LRESULT(0)
         }
+        WM_MOUSEWHEEL => {
+            // The wheel message carries screen coordinates; convert to popup client DIPs.
+            let mut pt = POINT { x: (lp.0 & 0xffff) as i16 as i32, y: ((lp.0 >> 16) & 0xffff) as i16 as i32 };
+            let mut rc = RECT::default();
+            // SAFETY: valid out-param; hwnd is our popup.
+            unsafe {
+                let _ = GetWindowRect(hwnd, &mut rc);
+            }
+            pt.x -= rc.left;
+            pt.y -= rc.top;
+            let dpi = POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|p| p.renderer.dpi())).unwrap_or(96));
+            let notches = ((wp.0 >> 16) as i16) as f32 / 120.0;
+            if let Some(f) = WHEEL.with(Cell::get) {
+                f(dpi::px_to_dip(pt.x, dpi), dpi::px_to_dip(pt.y, dpi), notches);
+            }
+            LRESULT(0)
+        }
         WM_CHAR => {
             let unit = wp.0 as u16;
             let ch = if (0xD800..0xDC00).contains(&unit) {
@@ -463,18 +506,16 @@ fn paint() {
             let (w, h) = pw.renderer.size();
             let rect = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
             let backdrop = pw.backdrop.clone();
-            let _ = pw.renderer.begin().and_then(|_| {
+            let res = pw.renderer.begin().and_then(|_| {
+                // Apple-style continuous-looking corners: the window is fully transparent and the
+                // panel is drawn (anti-aliased) with its own radius.
+                let radius = if super::glass::panel_light() { 24.0 } else { 14.0 };
                 match &backdrop {
-                    // Same Liquid Glass as the dock: refracted wallpaper, a dim for legible text,
-                    // then rims. Pieces drawn by the painter sample this backdrop too.
                     Some(bd) => {
-                        let full = RectF { x: 0.0, y: 0.0, w, h };
-                        pw.renderer.draw_bitmap(bd.w, bd.h, &bd.rgba, full)?;
-                        super::glass::draw_panel_tint(&mut pw.renderer, rect, RADIUS)?;
                         super::glass::set_backdrop(Some(bd.clone()), w, h);
+                        super::glass::draw_panel_glass(&mut pw.renderer, rect, radius)?;
                     }
-                    // Fallback over live DWM acrylic: light dim, top highlight, specular rims.
-                    None => super::glass::draw_panel(&mut pw.renderer, rect, RADIUS)?,
+                    None => super::glass::draw_panel(&mut pw.renderer, rect, radius)?,
                 }
                 if let Some(f) = PAINTER.with(Cell::get) {
                     f(&mut pw.renderer, rect);
@@ -482,6 +523,9 @@ fn paint() {
                 super::glass::set_backdrop(None, w, h);
                 pw.renderer.end()
             });
+            if let Err(e) = res {
+                crate::log(&format!("popup paint failed: {e}"));
+            }
         }
     });
 }

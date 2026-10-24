@@ -57,6 +57,8 @@ pub enum ControlAction {
     MediaNext,
     /// Gear in the Control Center: opens SmartDock's own Settings popup (UI thread).
     OpenSmartDockSettings,
+    /// Bottom shortcut: opens a URI such as calculator: or ms-screenclip:.
+    Launch(&'static str),
 }
 
 /// Runs the system call for `action`. Blocking. Toggles re-read the live radio/mute state
@@ -87,37 +89,43 @@ pub fn apply(action: ControlAction) -> Result<()> {
         ControlAction::MediaNext => system::media_control(MediaAction::Next),
         // Handled on the UI thread by the caller (it swaps the popup to Settings).
         ControlAction::OpenSmartDockSettings => Ok(()),
+        ControlAction::Launch(uri) => system::open_settings(uri),
     }
 }
 
 // ---------- layout (DIPs, relative to the panel rect) ----------
 // .cc: padding 9, gap 8. .cc-grid: 1.35fr / 1fr. Every card has a 1 px border, included in the offsets.
 
-/// Total panel height: main controls + brightness + volume + now playing.
-pub const HEIGHT: f32 = 356.0;
-const PAD: f32 = 9.0;
-const GAP: f32 = 8.0;
-const ROW1_H: f32 = 80.0;
-const CAP_H: f32 = 65.0; // .cc-cap
-const MEDIA_H: f32 = 56.0;
-const CARD_R: f32 = 14.0;
-const ROUND: f32 = 28.0; // .cc-round
-const CAP_INSET: f32 = 11.0; // 1 px border + 10 px padding
-const SLIDER_H: f32 = 22.0; // .cc-slider
-const THUMB: f32 = 22.0;
+// ---------- layout (DIPs, relative to the panel rect) ----------
+// macOS 26 style: big rounded glass tiles, stadium pills, thick slider capsules.
 
-// Colors 0xRRGGBBAA, from the CSS alphas.
-const CARD: u32 = 0xFFFF_FF17; // rgba(255,255,255,.09)
-const ROUND_BG: u32 = 0xFFFF_FF24; // rgba(255,255,255,.14)
+/// Total panel height.
+pub const HEIGHT: f32 = 454.0;
+const PAD: f32 = 12.0;
+const GAP: f32 = 10.0;
+const TILE_H: f32 = 58.0;
+const BOTTOM_H: f32 = 52.0;
+const MEDIA_H: f32 = 2.0 * TILE_H + GAP;
+const SLIDER_CARD_H: f32 = 58.0;
+const TILE_R: f32 = 26.0;
+const CARD_R: f32 = 20.0;
+const ROUND: f32 = 38.0; // icon circle inside a tile
+const CAP_INSET: f32 = 14.0;
+const END_W: f32 = 22.0; // icon slots at both ends of a slider
+const SLIDER_H: f32 = 16.0;
+const THUMB: f32 = 16.0;
+const TRACK_H: f32 = 6.0;
+
+// Colors 0xRRGGBBAA.
+const CARD: u32 = 0xFFFF_FF24;
+const ROUND_BG: u32 = 0xFFFF_FF2E;
 const WHITE: u32 = 0xFFFF_FFFF;
 const ACCENT: u32 = 0x0A84_FFFF; // macOS system blue #0A84FF
 const TEXT: u32 = 0xFFFF_FFFF;
-const SUB: u32 = 0xFFFF_FF99; // opacity .6
-const NA: u32 = 0xFFFF_FF8C; // opacity .55
-const SQ_TEXT: u32 = 0xFFFF_FFF2; // opacity .95
-const TRACK: u32 = 0xFFFF_FF29; // rgba(255,255,255,.16)
-const FILL: u32 = 0xFFFF_FFEB; // rgba(255,255,255,.92)
-const GLYPH_DARK: u32 = 0x5555_55FF; // #555 slider icon
+const SUB: u32 = 0xFFFF_FFA6;
+const TRACK: u32 = 0xFFFF_FF33;
+const FILL: u32 = 0xFFFF_FFF2;
+const GLYPH_DARK: u32 = 0x5555_55FF;
 
 // Segoe MDL2 Assets codepoints.
 const GLYPH_BT: &str = "\u{E702}";
@@ -125,72 +133,88 @@ const GLYPH_BRIGHTNESS: &str = "\u{E706}";
 const GLYPH_NETWORK: &str = "\u{E968}";
 const GLYPH_MOON: &str = "\u{E708}";
 const GLYPH_GEAR: &str = "\u{E713}";
+const GLYPH_CALC: &str = "\u{E8EF}";
+const GLYPH_CAMERA: &str = "\u{E722}";
+const GLYPH_CLOCK: &str = "\u{E916}";
+const GLYPH_DISPLAY: &str = "\u{E7F4}";
+
+/// Bottom shortcut circles: glyph and the URI they open.
+const SHORTCUTS: [(&str, &str); 4] = [
+    (GLYPH_CALC, "calculator:"),
+    (GLYPH_CAMERA, "ms-screenclip:"),
+    (GLYPH_CLOCK, "ms-clock:"),
+    (GLYPH_GEAR, "ms-settings:"),
+];
 
 struct Layout {
-    conn: RectF,
-    wifi: RectF, // toggle row (round button + label)
+    wifi: RectF,
+    /// Bluetooth toggle (round button under the Wi-Fi tile).
     bluetooth: RectF,
-    net: RectF,   // Mạng square
-    sound: RectF, // Âm thanh square
+    /// Network settings (round button next to Bluetooth).
+    net: RectF,
+    media: RectF,
     dark: RectF,
+    sound: RectF,
+    display: RectF,
     brightness: RectF,
     volume: RectF,
-    media: RectF,
+    shortcuts: [RectF; 4],
+    settings: RectF,
 }
 
 fn layout(rect: RectF) -> Layout {
     let x0 = rect.x + PAD;
     let w = rect.w - 2.0 * PAD;
-    let cols = w - GAP;
-    let left_w = cols * 1.35 / 2.35;
-    let right_w = cols - left_w;
-    let right_x = x0 + left_w + GAP;
-    let row_y = rect.y + PAD;
-    // .cc-conn padding 8 6 8 8 plus border: toggles start at +9 and +43.
-    let toggle_w = left_w - 16.0;
-    let toggle = |y: f32| RectF { x: x0 + 9.0, y, w: toggle_w, h: ROUND };
-    let sq_w = (right_w - GAP) / 2.0;
-    let cap1 = row_y + ROW1_H + GAP;
-    let cap2 = cap1 + CAP_H + GAP;
-    let media = cap2 + CAP_H + GAP;
-    let dark = media + MEDIA_H + GAP;
+    let col = (w - GAP) / 2.0;
+    let right_x = x0 + col + GAP;
+    let small = (col - GAP) / 2.0;
+    let y1 = rect.y + PAD;
+    let y1b = y1 + TILE_H + GAP;
+    let y2 = y1 + MEDIA_H + GAP;
+    let y3 = y2 + TILE_H + GAP;
+    let y4 = y3 + SLIDER_CARD_H + GAP;
+    let y5 = y4 + SLIDER_CARD_H + GAP;
+    let y6 = y5 + BOTTOM_H + GAP;
+    let step = (w - BOTTOM_H) / 3.0;
     Layout {
-        conn: RectF { x: x0, y: row_y, w: left_w, h: ROW1_H },
-        wifi: toggle(row_y + 9.0),
-        bluetooth: toggle(row_y + 9.0 + ROUND + 6.0),
-        dark: RectF { x: x0, y: dark, w, h: 40.0 },
-        net: RectF { x: right_x, y: row_y, w: sq_w, h: ROW1_H },
-        sound: RectF { x: right_x + sq_w + GAP, y: row_y, w: sq_w, h: ROW1_H },
-        brightness: RectF { x: x0, y: cap1, w, h: CAP_H },
-        volume: RectF { x: x0, y: cap2, w, h: CAP_H },
-        media: RectF { x: x0, y: media, w, h: MEDIA_H },
+        wifi: RectF { x: x0, y: y1, w: col, h: TILE_H },
+        bluetooth: RectF { x: x0, y: y1b, w: small, h: TILE_H },
+        net: RectF { x: x0 + small + GAP, y: y1b, w: small, h: TILE_H },
+        media: RectF { x: right_x, y: y1, w: col, h: MEDIA_H },
+        dark: RectF { x: x0, y: y2, w: col, h: TILE_H },
+        sound: RectF { x: right_x, y: y2, w: small, h: TILE_H },
+        display: RectF { x: right_x + small + GAP, y: y2, w: small, h: TILE_H },
+        brightness: RectF { x: x0, y: y3, w, h: SLIDER_CARD_H },
+        volume: RectF { x: x0, y: y4, w, h: SLIDER_CARD_H },
+        shortcuts: [0.0, 1.0, 2.0, 3.0].map(|i| RectF { x: x0 + i * step, y: y5, w: BOTTOM_H, h: BOTTOM_H }),
+        settings: RectF { x: rect.x + (rect.w - 150.0) / 2.0, y: y6, w: 150.0, h: 28.0 },
     }
 }
 
-/// Gear button (SmartDock Settings) at the right end of the dark-mode module.
-fn gear_of(dark: RectF) -> RectF {
-    RectF { x: dark.x + dark.w - 7.0 - 28.0, y: dark.y + 6.0, w: 28.0, h: 28.0 }
-}
-
-/// Slider capsule inside a `.cc-cap` card (top offset: border + padding + head + margin).
+/// Slider row inside a slider card (below the title): icon slot, thin track, icon slot.
 fn slider_of(card: RectF) -> RectF {
-    RectF { x: card.x + CAP_INSET, y: card.y + 32.0, w: card.w - 2.0 * CAP_INSET, h: SLIDER_H }
+    RectF { x: card.x + CAP_INSET, y: card.y + 33.0, w: card.w - 2.0 * CAP_INSET, h: SLIDER_H }
 }
 
-/// Head row (title left, value right) of a `.cc-cap` card.
+/// Head row (title) of a slider card.
 fn head_of(card: RectF) -> RectF {
     RectF { x: card.x + CAP_INSET, y: card.y + 9.0, w: card.w - 2.0 * CAP_INSET, h: 16.0 }
 }
 
-/// Slider icon: 14 px box at left 5 px, top 4 px inside the capsule.
+/// Left icon slot of a slider row (also the mute button on the volume row).
 fn icon_of(s: RectF) -> RectF {
-    RectF { x: s.x + 5.0, y: s.y + 4.0, w: 14.0, h: 14.0 }
+    RectF { x: s.x, y: s.y, w: END_W, h: s.h }
 }
 
-/// Fraction 0..1 for pointer x on the capsule. The thumb center travels from s.x+11 to s.x+w-11.
+/// The draggable track between the two icon slots.
+fn track_of(s: RectF) -> RectF {
+    RectF { x: s.x + END_W, y: s.y, w: s.w - 2.0 * END_W, h: s.h }
+}
+
+/// Fraction 0..1 for pointer x on the track. The thumb centre travels from track.x+8 to track.x+w-8.
 fn value_at(s: RectF, x: f32) -> f32 {
-    let track = RectF { x: s.x + 24.0, w: (s.w - 24.0).max(THUMB), ..s };
-    ((x - (track.x + THUMB / 2.0)) / (track.w - THUMB).max(1.0)).clamp(0.0, 1.0)
+    let t = track_of(s);
+    ((x - (t.x + THUMB / 2.0)) / (t.w - THUMB).max(1.0)).clamp(0.0, 1.0)
 }
 
 fn contains(r: RectF, x: f32, y: f32) -> bool {
@@ -205,23 +229,20 @@ fn fade(rgba: u32, k: f32) -> u32 {
     (rgba & !0xFF) | a
 }
 
-/// Circle button, macOS Control Center style. ON = filled system blue with a white glyph;
-/// OFF = translucent liquid-glass circle (light fill + specular rim) with a white glyph.
-/// `k` fades the circle, `icon_k` the glyph.
+/// Circle button, macOS Control Center style. ON = filled white with a blue glyph;
+/// OFF = translucent liquid-glass circle with a white glyph.
 fn draw_round(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, k: f32, icon_k: f32) -> Result<()> {
     let radius = rect.h / 2.0;
     if on {
-        r.fill_rounded_rect(rect, radius, fade(ACCENT, k))?;
-        super::glass::draw_highlights(r, rect, radius, 0.8 * k)?;
+        r.fill_rounded_rect(rect, radius, fade(WHITE, k))?;
+        super::glass::draw_highlights(r, rect, radius, 0.5 * k)?;
+    } else if k >= 0.99 {
+        super::glass::draw_card(r, rect, radius, ROUND_BG, k)?;
     } else {
-        if k >= 0.99 {
-            super::glass::draw_card(r, rect, radius, ROUND_BG, k)?;
-        } else {
-            r.fill_rounded_rect(rect, radius, fade(ROUND_BG, k))?;
-            super::glass::draw_highlights(r, rect, radius, k)?;
-        }
+        r.fill_rounded_rect(rect, radius, fade(ROUND_BG, k))?;
+        super::glass::draw_highlights(r, rect, radius, k)?;
     }
-    draw_glyph(r, rect, glyph, size, fade(TEXT, icon_k))
+    draw_glyph(r, rect, glyph, size, fade(if on { ACCENT } else { TEXT }, icon_k))
 }
 
 /// A panel icon: a Segoe glyph, or the dock's SF-style vector Wi-Fi / speaker icons.
@@ -246,13 +267,12 @@ fn draw_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, rgba: u32)
     }
 }
 
-/// Liquid-glass module (same material language as the dock tiles): light translucent fill,
-/// inner top highlight and specular rims.
-fn draw_module(r: &mut Renderer, rect: RectF) -> Result<()> {
-    super::glass::draw_card(r, rect, CARD_R, CARD, 0.9)
+/// Liquid-glass tile (same material language as the dock tiles).
+fn draw_module(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    super::glass::draw_card(r, rect, radius, CARD, 0.9)
 }
 
-/// One `.cc-toggle` row: round button, bold label, sub text.
+/// One toggle tile: round button, bold label, sub text.
 struct Toggle<'a> {
     glyph: Glyph,
     label: &'a str,
@@ -263,56 +283,53 @@ struct Toggle<'a> {
     dim_off: bool,
 }
 
-fn draw_toggle(r: &mut Renderer, row: RectF, t: Toggle) -> Result<()> {
-    // .cc-toggle.disabled is opacity .6; the disabled .cc-round adds .45 on top.
+/// Circle button of a toggle tile.
+fn round_of(tile: RectF) -> RectF {
+    RectF { x: tile.x + 8.0, y: tile.y + (tile.h - ROUND) / 2.0, w: ROUND, h: ROUND }
+}
+
+fn draw_toggle(r: &mut Renderer, tile: RectF, t: Toggle) -> Result<()> {
     let k = if t.enabled { 1.0 } else { 0.6 };
     let rk = if t.enabled { k } else { k * 0.45 };
     let icon_k = if t.on || !t.dim_off { 1.0 } else { 0.35 };
-    let round = RectF { x: row.x, y: row.y, w: ROUND, h: ROUND };
-    draw_round(r, round, t.glyph, 16.0, t.on, rk, rk * icon_k)?;
-    let tx = row.x + ROUND + 8.0;
-    let tw = (row.x + row.w - tx).max(0.0);
-    r.draw_text_styled(t.label, RectF { x: tx, y: row.y, w: tw, h: 14.0 }, 11.5, fade(TEXT, k), Align::Left, TextStyle::Bold)?;
-    r.draw_text(t.sub, RectF { x: tx, y: row.y + 14.0, w: tw, h: 14.0 }, 10.5, fade(SUB, k), Align::Left)
+    draw_module(r, tile, TILE_R)?;
+    draw_round(r, round_of(tile), t.glyph, 18.0, t.on, rk, rk * icon_k)?;
+    let tx = tile.x + 8.0 + ROUND + 9.0;
+    let tw = (tile.x + tile.w - 8.0 - tx).max(0.0);
+    r.draw_text_styled(t.label, RectF { x: tx, y: tile.y + 9.0, w: tw, h: 16.0 }, 12.0, fade(TEXT, k), Align::Left, TextStyle::Bold)?;
+    r.draw_text(t.sub, RectF { x: tx, y: tile.y + 26.0, w: tw, h: 15.0 }, 10.5, fade(SUB, k), Align::Left)
 }
 
-/// Square shortcut (`.cc-sq`): round glyph centered above a 10 px label.
-fn draw_square(r: &mut Renderer, rect: RectF, glyph: Glyph, label: &str) -> Result<()> {
-    draw_module(r, rect)?;
-    let top = rect.y + (rect.h - 45.0) / 2.0; // 28 circle + 4 gap + 13 text
-    let round = RectF { x: rect.x + (rect.w - ROUND) / 2.0, y: top, w: ROUND, h: ROUND };
-    draw_round(r, round, glyph, 15.0, false, 1.0, 1.0)?;
-    r.draw_text(label, RectF { x: rect.x, y: top + 32.0, w: rect.w, h: 13.0 }, 10.0, SQ_TEXT, Align::Center)
+/// Stadium pill with one centred glyph (network / sound shortcuts).
+fn draw_pill_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph) -> Result<()> {
+    draw_module(r, rect, TILE_R)?;
+    draw_glyph(r, rect, glyph, 18.0, TEXT)
 }
 
-/// `.cc-cap` card background with its title and right-aligned value.
+/// Slider card background with its title and right-aligned value.
 fn draw_cap(r: &mut Renderer, card: RectF, title: &str, value: &str) -> Result<()> {
-    draw_module(r, card)?;
+    draw_module(r, card, CARD_R)?;
     let head = head_of(card);
     r.draw_text_styled(title, head, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(value, head, 10.5, NA, Align::Right)
+    r.draw_text(value, head, 10.5, SUB, Align::Right)
 }
 
-/// Thumb-style capsule (`.cc-slider`): white fill to `frac`, white thumb circle, glyph at left.
-fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, glyph: Glyph) -> Result<()> {
+/// macOS slider row: small icon, thin track with white fill and a round thumb, big icon.
+fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, left: Glyph, right: Glyph) -> Result<()> {
     let k = if enabled { 1.0 } else { 0.4 };
-    let track = RectF { x: s.x + 24.0, w: (s.w - 24.0).max(THUMB), ..s };
-    let x0 = track.x + THUMB / 2.0;
-    let span = track.w - THUMB;
-    let end = x0 + span * frac.clamp(0.0, 1.0);
-    // Glass capsule track: translucent fill, faint inner shade and a specular rim.
-    r.fill_rounded_rect(track, track.h / 2.0, fade(TRACK, k))?;
-    super::glass::draw_highlights(r, track, track.h / 2.0, 0.7 * k)?;
-    if end > x0 {
-        r.fill_rounded_rect(
-            RectF { x: track.x, y: track.y, w: end - track.x, h: track.h },
-            track.h / 2.0,
-            fade(FILL, k),
-        )?;
+    let t = track_of(s);
+    let bar = RectF { x: t.x, y: t.y + (t.h - TRACK_H) / 2.0, w: t.w, h: TRACK_H };
+    let x0 = t.x + THUMB / 2.0;
+    let end = x0 + (t.w - THUMB) * frac.clamp(0.0, 1.0);
+    r.fill_rounded_rect(bar, TRACK_H / 2.0, fade(TRACK, k))?;
+    if end > bar.x {
+        r.fill_rounded_rect(RectF { w: end - bar.x, ..bar }, TRACK_H / 2.0, fade(FILL, k))?;
     }
-    // Thumb: no drop shadow (the CSS box-shadow is not drawn).
-    r.fill_rounded_rect(RectF { x: end - THUMB / 2.0, y: s.y, w: THUMB, h: THUMB }, THUMB / 2.0, fade(WHITE, k))?;
-    draw_glyph(r, icon_of(s), glyph, 14.0, fade(GLYPH_DARK, k))
+    r.fill_rounded_rect(RectF { x: end - THUMB / 2.0, y: t.y, w: THUMB, h: THUMB }, THUMB / 2.0, fade(WHITE, k))?;
+    let slot = icon_of(s);
+    draw_glyph(r, RectF { w: END_W - 4.0, ..slot }, left, 11.0, fade(SUB, k))?;
+    let rs = RectF { x: s.x + s.w - END_W + 4.0, w: END_W - 4.0, ..slot };
+    draw_glyph(r, rs, right, 15.0, fade(SUB, k))
 }
 
 fn radio_sub(v: Option<bool>) -> &'static str {
@@ -327,8 +344,6 @@ fn radio_sub(v: Option<bool>) -> &'static str {
 pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&Media>) -> Result<()> {
     let l = layout(rect);
 
-    // Connectivity module.
-    draw_module(r, l.conn)?;
     draw_toggle(
         r,
         l.wifi,
@@ -345,74 +360,76 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
             dim_off: true,
         },
     )?;
-    draw_toggle(
-        r,
-        l.bluetooth,
-        Toggle {
-            glyph: Glyph::Text(GLYPH_BT),
-            label: "Bluetooth",
-            sub: radio_sub(state.bluetooth),
-            on: state.bluetooth == Some(true),
-            enabled: state.bluetooth.is_some(),
-            dim_off: false,
-        },
+    // Bluetooth and network: two round buttons under the Wi-Fi tile.
+    let bt_on = state.bluetooth == Some(true);
+    let bt_k = if state.bluetooth.is_some() { 1.0 } else { 0.45 };
+    draw_round(r, l.bluetooth, Glyph::Text(GLYPH_BT), 20.0, bt_on, bt_k, bt_k)?;
+    draw_round(r, l.net, Glyph::Text(GLYPH_NETWORK), 20.0, false, 1.0, 1.0)?;
+    draw_now_playing(r, l.media, media)?;
+
+    // Dark mode pill (the "Focus" slot) and the two shortcut tiles.
+    draw_module(r, l.dark, TILE_R)?;
+    let moon = round_of(l.dark);
+    draw_round(r, moon, Glyph::Text(GLYPH_MOON), 16.0, state.dark, 1.0, 1.0)?;
+    r.draw_text_styled(
+        "Chế độ tối",
+        RectF { x: moon.x + ROUND + 9.0, y: l.dark.y, w: l.dark.w - ROUND - 26.0, h: l.dark.h },
+        12.0,
+        TEXT,
+        Align::Left,
+        TextStyle::Bold,
     )?;
+    draw_pill_glyph(r, l.sound, Glyph::Speaker(1.0, false))?;
+    draw_pill_glyph(r, l.display, Glyph::Text(GLYPH_DISPLAY))?;
 
-    draw_square(r, l.net, Glyph::Text(GLYPH_NETWORK), "Mạng")?;
-    draw_square(r, l.sound, Glyph::Speaker(1.0, false), "Âm thanh")?;
-    draw_module(r, l.dark)?;
-    let moon = RectF { x: l.dark.x + 7.0, y: l.dark.y + 6.0, w: 28.0, h: 28.0 };
-    draw_round(r, moon, Glyph::Text(GLYPH_MOON), 14.0, state.dark, 1.0, 1.0)?;
-    r.draw_text("Chế độ tối", RectF { x: moon.x + 36.0, y: l.dark.y, w: l.dark.w - 85.0, h: l.dark.h }, 10.5, TEXT, Align::Left)?;
-    // SmartDock Settings: small liquid-glass gear in the module's right corner.
-    draw_round(r, gear_of(l.dark), Glyph::Text(GLYPH_GEAR), 13.0, false, 1.0, 1.0)?;
-
-    // Brightness: unsupported shows the note and a disabled, empty capsule.
+    // Brightness: unsupported shows the note and a disabled, empty slider.
     let (br_frac, br_text) = match state.brightness {
         Some(p) => (p.min(100) as f32 / 100.0, format!("{}%", p.min(100))),
         None => (0.0, "Không hỗ trợ".to_string()),
     };
     draw_cap(r, l.brightness, "Màn hình", &br_text)?;
-    draw_capsule(r, slider_of(l.brightness), br_frac, state.brightness.is_some(), Glyph::Text(GLYPH_BRIGHTNESS))?;
+    draw_capsule(r, slider_of(l.brightness), br_frac, state.brightness.is_some(), Glyph::Text(GLYPH_BRIGHTNESS), Glyph::Text(GLYPH_BRIGHTNESS))?;
 
-    // Volume: the glyph at left toggles mute, as in the TSX speaker button.
+    // Volume: the small icon at left toggles mute.
     let vol = state.volume.clamp(0.0, 1.0);
     let vol_text = if state.muted { "Đã tắt tiếng".to_string() } else { format!("{}%", (vol * 100.0).round() as u32) };
     draw_cap(r, l.volume, "Âm thanh", &vol_text)?;
-    draw_capsule(r, slider_of(l.volume), vol, true, Glyph::Speaker(vol, state.muted))?;
+    draw_capsule(r, slider_of(l.volume), vol, true, Glyph::Speaker(vol, state.muted), Glyph::Speaker(1.0, false))?;
 
-    draw_now_playing(r, l.media, media)
+    for (rc, (glyph, _)) in l.shortcuts.into_iter().zip(SHORTCUTS) {
+        draw_round(r, rc, Glyph::Text(glyph), 18.0, false, 1.0, 1.0)?;
+    }
+
+    // SmartDock Settings pill, like macOS "Edit Controls".
+    draw_module(r, l.settings, l.settings.h / 2.0)?;
+    r.draw_text_styled("Cài đặt SmartDock", l.settings, 10.5, TEXT, Align::Center, TextStyle::Bold)
 }
 
+/// Prev / play / next, centred along the bottom of the Now Playing tile.
 fn media_buttons(card: RectF) -> [RectF; 3] {
-    let x = card.x + card.w - 3.0 * 28.0 - 10.0;
-    [0.0, 1.0, 2.0].map(|i| RectF { x: x + i * 28.0, y: card.y + 14.0, w: 28.0, h: 28.0 })
+    let cx = card.x + card.w / 2.0;
+    [-1.0, 0.0, 1.0].map(|i| RectF { x: cx + i * 38.0 - 15.0, y: card.y + card.h - 34.0, w: 30.0, h: 26.0 })
 }
 
 fn draw_now_playing(r: &mut Renderer, card: RectF, media: Option<&Media>) -> Result<()> {
-    draw_module(r, card)?;
-    let art = RectF { x: card.x + 8.0, y: card.y + 8.0, w: 40.0, h: 40.0 };
-    r.fill_rounded_rect_gradient(art, 8.0, 0xFF5F_6DFF, 0xFFC3_71FF)?;
+    draw_module(r, card, CARD_R + 2.0)?;
+    let art = RectF { x: card.x + 12.0, y: card.y + 12.0, w: 40.0, h: 40.0 };
+    r.fill_rounded_rect_gradient(art, 9.0, 0xFF5F_6DFF, 0xFFC3_71FF)?;
     r.draw_text("♪", art, 18.0, WHITE, Align::Center)?;
     let has = media.is_some_and(|m| !m.title.is_empty());
     let title = media.filter(|_| has).map_or("Không có gì đang phát", |m| m.title.as_str());
-    let artist = media.filter(|_| has).map_or("", |m| m.artist.as_str());
-    let text = RectF { x: art.x + art.w + 10.0, y: card.y + 9.0, w: (card.w - 196.0).max(40.0), h: 18.0 };
-    r.draw_text_styled(title, text, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(artist, RectF { y: text.y + 18.0, h: 15.0, ..text }, 10.5, SUB, Align::Left)?;
+    let artist = media.filter(|_| has).map_or("Now Playing", |m| m.artist.as_str());
+    let w = card.w - 24.0;
+    r.draw_text_styled(title, RectF { x: card.x + 12.0, y: card.y + 56.0, w, h: 16.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(artist, RectF { x: card.x + 12.0, y: card.y + 71.0, w, h: 14.0 }, 10.0, SUB, Align::Left)?;
     let glyphs = ["\u{E892}", if media.is_some_and(|m| m.playing) { "\u{E769}" } else { "\u{E768}" }, "\u{E893}"];
     for (button, glyph) in media_buttons(card).into_iter().zip(glyphs) {
-        r.draw_text_styled(glyph, button, 13.0, fade(TEXT, if has { 1.0 } else { 0.35 }), Align::Center, TextStyle::Icon)?;
+        r.draw_text_styled(glyph, button, 14.0, fade(TEXT, if has { 1.0 } else { 0.4 }), Align::Center, TextStyle::Icon)?;
     }
     Ok(())
 }
 
 // ---------- hit testing ----------
-
-/// Round button of a toggle row.
-fn round_of(row: RectF) -> RectF {
-    RectF { x: row.x, y: row.y, w: ROUND, h: ROUND }
-}
 
 /// Which slider a drag controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -435,6 +452,18 @@ pub fn slider_at(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Sl
     None
 }
 
+/// Slider whose whole card (title row included) is under (x, y): the mouse wheel adjusts it.
+pub fn slider_card_at(x: f32, y: f32, rect: RectF) -> Option<Slider> {
+    let l = layout(rect);
+    if contains(l.volume, x, y) {
+        Some(Slider::Volume)
+    } else if contains(l.brightness, x, y) {
+        Some(Slider::Brightness)
+    } else {
+        None
+    }
+}
+
 /// Fraction 0..1 for pointer x on `slider` (clamped, so dragging past the ends pins to 0/100%).
 pub fn slider_value(slider: Slider, x: f32, rect: RectF) -> f32 {
     let l = layout(rect);
@@ -448,20 +477,17 @@ pub fn slider_value(slider: Slider, x: f32, rect: RectF) -> f32 {
 /// Maps a click at (x, y) to an action. None when the click hits nothing actionable.
 pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<ControlAction> {
     let l = layout(rect);
-    // Only the round icon toggles a radio; the label opens its list / settings page.
+    // Only the round icon toggles a radio; the rest of the tile opens its list / settings page.
     if contains(round_of(l.wifi), x, y) {
         return state.wifi.map(|_| ControlAction::ToggleWifi);
     }
     if contains(l.wifi, x, y) {
         return Some(ControlAction::OpenWifiList);
     }
-    if contains(round_of(l.bluetooth), x, y) {
+    if contains(l.bluetooth, x, y) {
         return state.bluetooth.map(|_| ControlAction::ToggleBluetooth);
     }
-    if contains(l.bluetooth, x, y) {
-        return Some(ControlAction::OpenBluetoothSettings);
-    }
-    if contains(gear_of(l.dark), x, y) {
+    if contains(l.settings, x, y) {
         return Some(ControlAction::OpenSmartDockSettings);
     }
     if contains(l.dark, x, y) {
@@ -470,8 +496,16 @@ pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Con
     if contains(l.net, x, y) {
         return Some(ControlAction::OpenNetworkSettings);
     }
+    if contains(l.display, x, y) {
+        return Some(ControlAction::Launch("ms-settings:display"));
+    }
     if contains(l.sound, x, y) {
         return Some(ControlAction::OpenSoundSettings);
+    }
+    for (rc, (_, uri)) in l.shortcuts.into_iter().zip(SHORTCUTS) {
+        if contains(rc, x, y) {
+            return Some(ControlAction::Launch(uri));
+        }
     }
     let vol = slider_of(l.volume);
     if contains(icon_of(vol), x, y) {
@@ -502,13 +536,13 @@ mod settings_route_tests {
     use super::*;
 
     #[test]
-    fn dock_layout_cc_gear_opens_smartdock_settings_and_dark_label_still_toggles() {
+    fn dock_layout_cc_settings_pill_opens_smartdock_settings_and_dark_pill_still_toggles() {
         let rect = RectF { x: 0.5, y: 0.5, w: 339.0, h: HEIGHT - 1.0 };
         let l = layout(rect);
-        let g = gear_of(l.dark);
-        assert!(g.x + g.w <= l.dark.x + l.dark.w && g.y >= l.dark.y && g.y + g.h <= l.dark.y + l.dark.h);
+        assert!(l.settings.y + l.settings.h <= rect.y + rect.h);
         let state = ControlState::default();
-        let hit = hit_test(g.x + g.w / 2.0, g.y + g.h / 2.0, rect, &state);
+        let s = l.settings;
+        let hit = hit_test(s.x + s.w / 2.0, s.y + s.h / 2.0, rect, &state);
         assert!(matches!(hit, Some(ControlAction::OpenSmartDockSettings)), "{hit:?}");
         let other = hit_test(l.dark.x + 20.0, l.dark.y + 20.0, rect, &state);
         assert!(matches!(other, Some(ControlAction::ToggleDark)), "{other:?}");

@@ -167,12 +167,18 @@ pub fn paint_content(r: &mut Renderer, rect: RectF) {
 
 /// Draws the whole popup (header, body, footer) into `rect`. Call between `Renderer::begin` and `end`.
 pub fn draw_popup(r: &mut Renderer, kind: PopupKind, rect: RectF, data: &DataState) -> Result<()> {
+    if kind == PopupKind::Clock {
+        return super::calendar::draw(r, rect, data.weather.as_ref());
+    }
     let mut c = Ctx { r: Some(r), rect };
     draw_all(&mut c, kind, data).map(|_| ())
 }
 
 /// Total popup height for this content, in DIPs. Use it as the window height (and in the click hit test).
 pub fn content_height(kind: PopupKind, data: &DataState) -> f32 {
+    if kind == PopupKind::Clock {
+        return super::calendar::height();
+    }
     let width = if kind == PopupKind::Settings { 459.0 } else { WIDTH };
     let mut c = Ctx { r: None, rect: RectF { x: 0.0, y: 0.0, w: width, h: 0.0 } };
     draw_all(&mut c, kind, data).unwrap_or(0.0)
@@ -670,7 +676,7 @@ fn draw_weather(c: &mut Ctx<'_>, y: f32, w: Option<&Weather>) -> Result<f32> {
     c.text(&format!("{:.0}°", cur.temp), rect_at(x, y + 2.0, 74.0, 30.0), font(26.0, TEXT).bold())?;
     let dx = x + 80.0;
     let dw = c.inner_w() - 80.0;
-    c.text(wx_text(cur.code), rect_at(dx, y + 6.0, dw, 16.0), font(11.0, MUTED))?;
+    c.text(weather_text(cur.code), rect_at(dx, y + 6.0, dw, 16.0), font(11.0, MUTED))?;
     let details = format!("Cảm giác {:.0}° · Ẩm {:.0}% · Gió {:.0} km/h", cur.feels, cur.humidity, cur.wind);
     c.text(&details, rect_at(dx, y + 22.0, dw, 16.0), font(11.0, MUTED))?;
     y += 44.0;
@@ -679,7 +685,7 @@ fn draw_weather(c: &mut Ctx<'_>, y: f32, w: Option<&Weather>) -> Result<f32> {
     let slot = (c.inner_w() - 20.0) / 7.0;
     for (i, d) in w.daily.iter().take(7).enumerate() {
         let sx = x + 10.0 + i as f32 * slot;
-        c.text(&weekday_label(&d.date), rect_at(sx, y, slot, 13.0), font(9.5, MUTED).center())?;
+        c.text(&weekday_short(&d.date), rect_at(sx, y, slot, 13.0), font(9.5, MUTED).center())?;
         c.text(&format!("{:.0}°", d.max), rect_at(sx, y + 15.0, slot, 15.0), font(11.0, TEXT).bold().center())?;
         c.text(&format!("{:.0}°", d.min), rect_at(sx, y + 31.0, slot, 13.0), font(9.5, MUTED).center())?;
     }
@@ -1149,7 +1155,7 @@ fn setting_value(c: &mut Ctx<'_>, area: RectF, label: &str, value: &str) -> Resu
 // ---------------------------------------------------------------- labels
 
 /// Vietnamese short label for a WMO weather code (same buckets as weatherInfo in common.tsx).
-fn wx_text(code: u32) -> &'static str {
+pub(super) fn weather_text(code: u32) -> &'static str {
     match code {
         0 => "Trời quang",
         1..=2 => "Ít mây",
@@ -1165,7 +1171,7 @@ fn wx_text(code: u32) -> &'static str {
 }
 
 /// "T2".."CN" from a YYYY-MM-DD date; falls back to MM-DD.
-fn weekday_label(date: &str) -> String {
+pub(super) fn weekday_short(date: &str) -> String {
     match NaiveDate::parse_from_str(date, "%Y-%m-%d") {
         Ok(d) => WEEKDAYS[d.weekday().num_days_from_monday() as usize].to_owned(),
         Err(_) => date.get(5..).unwrap_or(date).to_owned(),

@@ -133,25 +133,57 @@ pub fn draw_chevron(r: &mut Renderer, rect: RectF, up: bool, rgba: u32) -> Resul
     )
 }
 
-/// SF `wifi`: dot + 3 concentric 90° arcs opening upward, in a 16x16 design box.
+/// SF `wifi`: a rounded wedge at the bottom plus two concentric 90° arcs opening upward, in a
+/// 16x16 design box (the wedge counts as the first bar, as on macOS).
 pub fn draw_wifi(r: &mut Renderer, rect: RectF, state: Wifi, rgba: u32) -> Result<()> {
     let m = Map::new(rect, 16.0, 16.0);
-    let (cx, cy) = (8.0, 13.6);
+    let (cx, cy) = (8.0, 13.4);
     let lit = match state {
         Wifi::Bars(n) => n.min(3),
         _ => 0,
     };
-    let width = STROKE * m.s;
-    for (i, rad) in [3.7f32, 7.0, 10.3].into_iter().enumerate() {
-        let k = if (i as u8) < lit { 1.0 } else { DIM };
+    let width = 1.9 * m.s;
+    for (i, rad) in [7.2f32, 10.8].into_iter().enumerate() {
+        let k = if (i as u8 + 1) < lit { 1.0 } else { DIM };
         r.draw_geometry_round(|s| Ok(arc(s, &m, cx, cy, rad, 225.0, 90.0)), fade(rgba, k), Some(width))?;
     }
-    let dot_k = if matches!(state, Wifi::Bars(_)) { 1.0 } else { DIM };
-    let d = 1.45 * m.s;
-    let c = m.p(cx, cy - 0.3);
-    r.fill_rounded_rect(RectF { x: c.x - d, y: c.y - d, w: 2.0 * d, h: 2.0 * d }, d, fade(rgba, dot_k))?;
+    // Wedge: apex at the centre, flaring up to a curved top edge.
+    let wedge_k = if matches!(state, Wifi::Bars(_)) { 1.0 } else { DIM };
+    let pt = |deg: f32, rad: f32| {
+        let a = deg.to_radians();
+        (cx + rad * a.cos(), cy + rad * a.sin())
+    };
+    let wedge = |s: &ID2D1GeometrySink| {
+        let pts = [(cx, cy + 0.3), pt(225.0, 4.4), pt(247.5, 4.8), pt(270.0, 5.0), pt(292.5, 4.8), pt(315.0, 4.4)];
+        // SAFETY: the sink is open for this closure.
+        unsafe {
+            s.BeginFigure(m.p(pts[0].0, pts[0].1), D2D1_FIGURE_BEGIN_FILLED);
+            for &(x, y) in &pts[1..] {
+                s.AddLine(m.p(x, y));
+            }
+            s.EndFigure(D2D1_FIGURE_END_CLOSED);
+        }
+        Ok(())
+    };
+    r.draw_geometry_round(wedge, fade(rgba, wedge_k), None)?;
+    r.draw_geometry_round(wedge, fade(rgba, wedge_k), Some(1.0 * m.s))?;
     if state == Wifi::Off {
         r.draw_geometry_round(|s| Ok(line(s, &m, (2.6, 2.2), (13.8, 15.0))), rgba, Some(width))?;
+    }
+    Ok(())
+}
+
+/// SF `switch.2` (the macOS Control Center menu-bar icon): two pill outlines, each with a knob,
+/// in a 16x16 design box.
+pub fn draw_control_center(r: &mut Renderer, rect: RectF, rgba: u32) -> Result<()> {
+    let m = Map::new(rect, 16.0, 16.0);
+    let w = 1.25 * m.s;
+    for (cy, knob_x) in [(3.7f32, 11.2f32), (12.3, 4.8)] {
+        let p = m.p(1.4, cy - 2.5);
+        r.stroke_rounded_rect(RectF { x: p.x, y: p.y, w: 13.2 * m.s, h: 5.0 * m.s }, 2.5 * m.s, rgba, w)?;
+        let c = m.p(knob_x, cy);
+        let d = 1.5 * m.s;
+        r.fill_rounded_rect(RectF { x: c.x - d, y: c.y - d, w: 2.0 * d, h: 2.0 * d }, d, rgba)?;
     }
     Ok(())
 }

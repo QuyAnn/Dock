@@ -292,24 +292,30 @@ pub fn draw_dock(
     }
     for (i, (t, rc)) in tiles.iter().zip(rects).enumerate() {
         let hovered = hover == Some(i);
-        match t.style {
-            Style::Bare => draw_bare(r, t, *rc)?,
-            Style::Card => draw_card(r, t, *rc, hovered)?,
-            Style::Usage => draw_usage(r, t, *rc, hovered)?,
-            Style::Note => draw_note(r, t, *rc, hovered)?,
-            Style::Label => draw_label(r, t, *rc, hovered)?,
-            Style::Ring => draw_ring(r, t, *rc, hovered)?,
-            Style::Clock => draw_clock(r, t, *rc, hovered)?,
-            Style::ClockWide => draw_clock_wide(r, t, *rc, hovered)?,
-            Style::Git => draw_git(r, t, *rc, hovered)?,
-            Style::Media => draw_media(r, t, *rc, hovered)?,
-            Style::Button => draw_button(r, t, *rc, hovered)?,
-            Style::Start => draw_start(r, *rc, hovered)?,
-            Style::Trash => super::apps::draw_trash_icon(r, *rc, hovered, t.progress.is_some())?,
-            Style::Search => super::apps::draw_search_icon(r, *rc, hovered)?,
-            Style::Separator => draw_separator(r, *rc)?,
-        }
+        draw_tile(r, t, *rc, hovered)?;
     }
+    Ok(())
+}
+
+/// Draws one tile in its style (the dock bar and the widget gallery previews share this).
+pub fn draw_tile(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+        match t.style {
+            Style::Bare => draw_bare(r, t, rc)?,
+            Style::Card => draw_card(r, t, rc, hovered)?,
+            Style::Usage => draw_usage(r, t, rc, hovered)?,
+            Style::Note => draw_note(r, t, rc, hovered)?,
+            Style::Label => draw_label(r, t, rc, hovered)?,
+            Style::Ring => draw_ring(r, t, rc, hovered)?,
+            Style::Clock => draw_clock(r, t, rc, hovered)?,
+            Style::ClockWide => draw_clock_wide(r, t, rc, hovered)?,
+            Style::Git => draw_git(r, t, rc, hovered)?,
+            Style::Media => draw_media(r, t, rc, hovered)?,
+            Style::Button => draw_button(r, t, rc, hovered)?,
+            Style::Start => draw_start(r, rc, hovered)?,
+            Style::Trash => super::apps::draw_trash_icon(r, rc, hovered, t.progress.is_some())?,
+            Style::Search => super::apps::draw_search_icon(r, rc, hovered)?,
+            Style::Separator => draw_separator(r, rc)?,
+        }
     Ok(())
 }
 
@@ -561,7 +567,9 @@ fn draw_button(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resu
         let wifi = RectF { x: rc.x + 7.0, y: cy - 7.5, w: 15.0, h: 15.0 };
         let spk = RectF { x: wifi.x + wifi.w + 6.0, y: cy - 7.5, w: 17.0, h: 15.0 };
         super::sficons::draw_wifi(r, wifi, st.wifi, 0xFFFF_FFFF)?;
-        return super::sficons::draw_speaker(r, spk, st.volume, st.muted, 0xFFFF_FFF0);
+        super::sficons::draw_speaker(r, spk, st.volume, st.muted, 0xFFFF_FFF0)?;
+        let ccr = RectF { x: spk.x + spk.w + 6.0, y: cy - 7.5, w: 15.0, h: 15.0 };
+        return super::sficons::draw_control_center(r, ccr, 0xFFFF_FFF0);
     }
     // Glyphs sit side by side, 14 px each with a 7 px gap.
     let mut x = rc.x + 9.0;
@@ -650,7 +658,7 @@ mod tests {
             Tile { id: "sep", width: 1.0, height: 24.0 },
             Tile { id: "apps", width: super::super::apps::cluster_width(apps), height: super::super::apps::CLUSTER_H },
         ];
-        let right = vec![t("cc", 56.0), t("media", MEDIA_W), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
+        let right = vec![t("cc", 78.0), t("media", MEDIA_W), t("cpu", 42.0), t("ram", 42.0), t("clock", 64.0)];
         (left, center, right)
     }
 

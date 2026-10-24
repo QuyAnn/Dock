@@ -253,6 +253,8 @@ pub const DOCK_MENU_W: f32 = 220.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DockMenuAction {
     Settings,
+    /// Open the widget gallery.
+    Gallery,
     /// Switch the widget to the other side of the dock.
     MoveSide(&'static str),
     /// Hide the widget (its switch in Settings goes off).
@@ -331,6 +333,7 @@ pub fn open_dock_menu(target: Option<&'static str>, settings: &Settings) -> f32 
     let clock = if settings.clock_style == "wide" { "Rộng" } else { "Gọn" };
     items.push(MenuItem::Row(DockMenuAction::CycleClock, format!("Kiểu đồng hồ: {clock}"), "\u{E823}"));
     items.push(MenuItem::Divider);
+    items.push(MenuItem::Row(DockMenuAction::Gallery, "Thư viện widget…".to_owned(), "\u{E8A9}"));
     items.push(MenuItem::Row(DockMenuAction::Settings, "Cài đặt SmartDock".to_owned(), "\u{E713}"));
     let h = 12.0 + items.iter().map(item_h).sum::<f32>();
     DOCK_MENU.with(|m| *m.borrow_mut() = items);
@@ -386,7 +389,7 @@ pub fn dock_menu_hit(x: f32, y: f32) -> Option<DockMenuAction> {
 /// Applies a widget action to the settings. `Settings` is handled by the caller.
 pub fn apply_dock_menu(action: DockMenuAction, settings: &mut Settings) {
     match action {
-        DockMenuAction::Settings | DockMenuAction::Extra(_) => {}
+        DockMenuAction::Settings | DockMenuAction::Gallery | DockMenuAction::Extra(_) => {}
         DockMenuAction::CycleSize => {
             settings.widget_size = if settings.widget_size == "compact" { "normal" } else { "compact" }.to_owned();
         }
