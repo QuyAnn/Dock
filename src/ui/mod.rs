@@ -16,3 +16,4 @@ pub mod svgpath; // SVG path subset (M L H V C A Z) drawn as D2D geometry, plus 
 pub mod sficons; // macOS SF-Symbols-style Wi-Fi / speaker status icons (D2D geometry)
 pub mod liquid; // Liquid Glass dock background: blur, saturate, lens refraction (CPU, cached)
 pub mod trayview; // SmartDock's own tray overflow popup (hidden notification icons)
+pub mod more_widgets;

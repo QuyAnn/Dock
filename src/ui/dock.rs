@@ -58,6 +58,8 @@ pub struct Icon {
 /// How a tile is drawn.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Style {
+    /// Original extended widgets; the view's `extra` identifies its geometry.
+    Widget,
     /// AI usage: a big icon plate on the left, then one line per limit (label, bar, reset, percent).
     Usage,
     /// Rounded card: optional icon square, title (muted, small) above value, optional bottom bar.
@@ -302,6 +304,7 @@ pub fn draw_dock(
 /// Draws one tile in its style (the dock bar and the widget gallery previews share this).
 pub fn draw_tile(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
         match t.style {
+            Style::Widget => super::more_widgets::draw(r, t, rc, hovered)?,
             Style::Bare => draw_bare(r, t, rc)?,
             Style::Card => draw_card(r, t, rc, hovered)?,
             Style::Metrics => draw_metrics(r, t, rc, hovered)?,

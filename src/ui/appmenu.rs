@@ -300,6 +300,11 @@ pub fn open_dock_menu(target: Option<&'static str>, settings: &Settings) -> f32 
         let to = if settings.layout.is_left(id) { "phải" } else { "trái" };
         items.push(MenuItem::Header(widget_label(id)));
         match id {
+            "pomodoro" => {
+                items.push(MenuItem::Row(DockMenuAction::Extra("pomodoro_skip"), "Bỏ qua giai đoạn".to_owned(), "\u{E893}"));
+                items.push(MenuItem::Row(DockMenuAction::Extra("pomodoro_reset"), "Đặt lại Pomodoro".to_owned(), "\u{E777}"));
+            }
+            "stopwatch" => items.push(MenuItem::Row(DockMenuAction::Extra("stopwatch_reset"), "Đặt lại bấm giờ".to_owned(), "\u{E777}")),
             "timer" => items.push(MenuItem::Row(DockMenuAction::Extra("timer_reset"), "Đặt lại bấm giờ".to_owned(), "\u{E777}")),
             "focus" => items.push(MenuItem::Row(DockMenuAction::Extra("focus_reset"), "Đặt lại hẹn giờ".to_owned(), "\u{E777}")),
             "trash" => {
@@ -320,7 +325,8 @@ pub fn open_dock_menu(target: Option<&'static str>, settings: &Settings) -> f32 
     let hidden: Vec<&'static str> = WIDGET_IDS.iter().copied().filter(|id| !settings.widget_shown(id)).collect();
     if !hidden.is_empty() {
         items.push(MenuItem::Header("Thêm widget"));
-        for id in hidden {
+        // The gallery holds the complete catalog. Keep this shortcut menu within a screen.
+        for id in hidden.into_iter().take(6) {
             items.push(MenuItem::Row(DockMenuAction::Add(id), widget_label(id).to_owned(), "\u{E710}"));
         }
         items.push(MenuItem::Divider);

@@ -9,3 +9,7 @@ pub mod usage;    // foreground-time / UserAssist ranking for auto-pinned launch
 pub mod focus;    // Pomodoro-style focus timer (work / break), advanced once a second
 pub mod widgets;  // Battery, network, disk and GPU samples on a background worker
 pub mod timer;    // Click-to-start/pause stopwatch shared by all docks
+pub mod productivity;
+pub mod calendar_progress;
+pub mod finance;
+pub mod screentime;

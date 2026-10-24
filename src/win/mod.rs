@@ -11,3 +11,4 @@ pub mod traysvc;  // our Shell_TrayWnd listener: learns tray icons, forwards eve
 pub mod grokbot;  // Grok Bot desktop app resolve/launch (never reads %USERPROFILE%\.grokbot)
 pub mod shellinfo; // Recycle Bin / Downloads readings, clipboard text, empty bin
 pub mod deskglass; // Liquid Glass sheen over the desktop icons (click-through overlay on the desktop list view)
+pub mod widget_tools;

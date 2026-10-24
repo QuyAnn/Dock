@@ -29,7 +29,15 @@ pub struct Weather {
     pub location: String,
     pub current: Current,
     pub daily: Vec<Day>,
+    pub hourly: Vec<Hour>,
+    pub sunrise: Option<i64>,
+    pub sunset: Option<i64>,
+    pub utc_offset_seconds: i32,
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
 }
+
+#[derive(Clone, Debug)]
+pub struct Hour { pub at: i64, pub temp: f32, pub code: u32 }
 
 #[derive(Clone, Debug)]
 struct Place {
@@ -56,12 +64,17 @@ pub fn refresh_weather_at(location: &str) -> Option<Weather> {
             ("latitude", lat.as_str()),
             ("longitude", lon.as_str()),
             ("current", "temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m"),
-            ("daily", "weather_code,temperature_2m_max,temperature_2m_min"),
+            ("daily", "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset"),
+            ("hourly", "temperature_2m,weather_code"),
             ("timezone", "auto"),
             ("forecast_days", "5"),
         ],
     )?;
 
+    parse_weather(&j, place.name)
+}
+
+fn parse_weather(j: &Value, location: String) -> Option<Weather> {
     let c = j.get("current")?;
     let current = Current {
         temp: num(c.get("temperature_2m"))?,
@@ -87,7 +100,35 @@ pub fn refresh_weather_at(location: &str) -> Option<Weather> {
         })
         .collect();
 
-    Some(Weather { location: place.name, current, daily })
+    let utc_offset_seconds = j.get("utc_offset_seconds").and_then(Value::as_i64).unwrap_or(0) as i32;
+    let timestamp = |v: &Value| -> Option<i64> {
+        Some(chrono::NaiveDateTime::parse_from_str(v.as_str()?, "%Y-%m-%dT%H:%M").ok()?.and_utc().timestamp() - utc_offset_seconds as i64)
+    };
+    let hourly = j.get("hourly").and_then(|h| {
+        Some(h.get("time")?.as_array()?.iter().enumerate().filter_map(|(i,time)| {
+            Some(Hour { at: timestamp(time)?, temp: num(h.get("temperature_2m")?.get(i))?, code: code(h.get("weather_code")?.get(i))? })
+        }).collect())
+    }).unwrap_or_default();
+    Some(Weather { location, current, daily, hourly,
+        sunrise: d.get("sunrise").and_then(|a| a.get(0)).and_then(timestamp),
+        sunset: d.get("sunset").and_then(|a| a.get(0)).and_then(timestamp),
+        utc_offset_seconds, fetched_at: chrono::Utc::now() })
+}
+
+#[cfg(test)]
+mod forecast_tests {
+    use super::*;
+    #[test]
+    fn parses_forecast_in_location_timezone_and_skips_null_hours() {
+        let j = serde_json::json!({"utc_offset_seconds":25200,
+            "current":{"temperature_2m":28,"apparent_temperature":30,"weather_code":0,"relative_humidity_2m":65,"wind_speed_10m":8},
+            "daily":{"time":["2026-10-25"],"temperature_2m_max":[30],"temperature_2m_min":[24],"weather_code":[2],"sunrise":["2026-10-25T06:00"],"sunset":["2026-10-25T18:00"]},
+            "hourly":{"time":["2026-10-25T12:00","2026-10-25T13:00"],"temperature_2m":[28,null],"weather_code":[0,1]}});
+        let w = parse_weather(&j,"Hanoi".into()).unwrap();
+        assert_eq!(w.hourly.len(),1); assert_eq!(w.daily.len(),1);
+        assert_eq!(chrono::DateTime::from_timestamp(w.hourly[0].at,0).unwrap().format("%H:%M").to_string(),"05:00");
+        assert_eq!(w.sunset.unwrap() - w.sunrise.unwrap(),43200);
+    }
 }
 
 /// "lat,lon" is used directly; anything else is geocoded (and cached).

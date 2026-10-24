@@ -72,6 +72,12 @@ pub fn empty_bin() {
 
 /// Current clipboard text, trimmed to one line of at most 120 characters.
 pub fn clipboard_text() -> Option<String> {
+    let text = clipboard_text_full()?;
+    text.lines().map(str::trim).find(|l| !l.is_empty()).map(|line| line.chars().take(120).collect())
+}
+
+/// Unicode text for the note/search editors, including line breaks; callers enforce their limit.
+pub fn clipboard_text_full() -> Option<String> {
     const CF_UNICODETEXT: u32 = 13;
     // SAFETY: the clipboard is opened and closed on this thread; the global memory is locked
     // only while we copy the NUL-terminated UTF-16 text out of it.
@@ -93,8 +99,7 @@ pub fn clipboard_text() -> Option<String> {
             Some(s)
         })();
         let _ = CloseClipboard();
-        let line = text?.lines().map(str::trim).find(|l| !l.is_empty())?.chars().take(120).collect::<String>();
-        Some(line)
+        text
     }
 }
 

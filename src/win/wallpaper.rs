@@ -198,6 +198,19 @@ fn newest_file(dir: &Path, prefix: Option<&str>) -> Option<PathBuf> {
 }
 
 /// Decodes the first frame, scaled down to at most `max_w` wide. Returns (w, h, orig_w, orig_h, rgba).
+pub(crate) fn thumbnail(path: &Path, max: u32) -> Result<(u32, u32, Vec<u8>)> {
+    let (w,h,_,_,pixels) = decode(path, max)?;
+    if h <= max { return Ok((w,h,pixels)); }
+    let nw = ((w as u64 * max as u64 / h as u64) as u32).max(1);
+    let mut out = vec![0; nw as usize * max as usize * 4];
+    for y in 0..max { for x in 0..nw {
+        let src = ((y as u64 * h as u64 / max as u64) * w as u64 + x as u64 * w as u64 / nw as u64) as usize * 4;
+        let dst = (y * nw + x) as usize * 4;
+        out[dst..dst+4].copy_from_slice(&pixels[src..src+4]);
+    }}
+    Ok((nw,max,out))
+}
+
 fn decode(path: &Path, max_w: u32) -> Result<(u32, u32, u32, u32, Vec<u8>)> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
     // SAFETY: CoInitializeEx on this thread is idempotent (an already-initialized thread returns an
@@ -214,7 +227,7 @@ fn decode(path: &Path, max_w: u32) -> Result<(u32, u32, u32, u32, Vec<u8>)> {
         let frame = decoder.GetFrame(0)?;
         let (mut ow, mut oh) = (0u32, 0u32);
         frame.GetSize(&mut ow, &mut oh)?;
-        if ow == 0 || oh == 0 {
+        if ow == 0 || oh == 0 || ow as u64 * oh as u64 > 100_000_000 {
             return Err(E_FAIL.into());
         }
 

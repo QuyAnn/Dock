@@ -269,7 +269,7 @@ pub fn skip(exe: &str) -> bool {
     p.contains("\\appdata\\local\\temp\\") || p.contains("\\downloads\\") || p.contains("\\windows\\installer\\")
 }
 
-fn process_exe(pid: u32) -> String {
+pub(crate) fn process_exe(pid: u32) -> String {
     // SAFETY: the handle is closed before returning.
     unsafe {
         let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else { return String::new() };
