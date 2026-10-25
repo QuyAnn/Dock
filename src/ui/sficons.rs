@@ -22,10 +22,20 @@ pub enum Wifi {
     Disconnected,
     /// Connected with 1..=3 bars lit (unused arcs dimmed).
     Bars(u8),
+    /// Wired connection only (no Wi-Fi link): an RJ45 plug.
+    Ethernet,
 }
 
 impl Wifi {
     /// `enabled`: radio state (None = unknown); `signal`: WLAN signal quality 0..=100 when connected.
+    /// A live Wi-Fi link wins; otherwise a cable shows the plug; otherwise radio state.
+    pub fn from_net(enabled: Option<bool>, signal: Option<u8>, ethernet: bool) -> Wifi {
+        match Wifi::from_state(enabled, signal) {
+            Wifi::Off | Wifi::Disconnected if ethernet => Wifi::Ethernet,
+            w => w,
+        }
+    }
+
     pub fn from_state(enabled: Option<bool>, signal: Option<u8>) -> Wifi {
         match (enabled, signal) {
             (Some(false), _) => Wifi::Off,
@@ -137,6 +147,16 @@ pub fn draw_chevron(r: &mut Renderer, rect: RectF, up: bool, rgba: u32) -> Resul
 /// 16x16 design box (the wedge counts as the first bar, as on macOS).
 pub fn draw_wifi(r: &mut Renderer, rect: RectF, state: Wifi, rgba: u32) -> Result<()> {
     let m = Map::new(rect, 16.0, 16.0);
+    if state == Wifi::Ethernet {
+        // RJ45 plug: body outline, four contact pins inside, cable stub below.
+        let w = 1.6 * m.s;
+        let p = m.p(2.6, 2.4);
+        r.stroke_rounded_rect(RectF { x: p.x, y: p.y, w: 10.8 * m.s, h: 8.4 * m.s }, 1.8 * m.s, rgba, w)?;
+        for x in [5.2f32, 7.1, 8.9, 10.8] {
+            r.draw_geometry_round(|s| Ok(line(s, &m, (x, 2.9), (x, 5.4))), rgba, Some(1.2 * m.s))?;
+        }
+        return r.draw_geometry_round(|s| Ok(line(s, &m, (8.0, 10.8), (8.0, 14.2))), rgba, Some(w));
+    }
     let (cx, cy) = (8.0, 13.4);
     let lit = match state {
         Wifi::Bars(n) => n.min(3),
@@ -231,6 +251,10 @@ mod tests {
         assert_eq!(Wifi::from_state(Some(true), Some(20)), Wifi::Bars(1));
         assert_eq!(Wifi::from_state(Some(true), Some(50)), Wifi::Bars(2));
         assert_eq!(Wifi::from_state(None, Some(99)), Wifi::Bars(3));
+        assert_eq!(Wifi::from_net(Some(true), None, true), Wifi::Ethernet);
+        assert_eq!(Wifi::from_net(Some(false), None, true), Wifi::Ethernet);
+        assert_eq!(Wifi::from_net(Some(true), Some(80), true), Wifi::Bars(3));
+        assert_eq!(Wifi::from_net(Some(true), None, false), Wifi::Disconnected);
         assert_eq!(waves_for(0.0), 0);
         assert_eq!(waves_for(0.2), 1);
         assert_eq!(waves_for(0.5), 2);
