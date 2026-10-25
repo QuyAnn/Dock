@@ -27,17 +27,23 @@ const ACCENT: u32 = 0x0A84_FFFF;
 const CARD_BG: u32 = 0xFFFF_FF1C;
 
 /// Sidebar categories; index 0 shows everything.
-pub const CATS: [&str; 7] = ["Tất cả widget", "Đồng hồ", "Năng suất", "Hệ thống", "AI", "Âm nhạc", "Thời tiết"];
+pub const CATS: [&str; 9] = ["Tất cả widget", "Đồng hồ", "Năng suất", "Hệ thống", "AI", "Âm nhạc", "Thời tiết", "Ảnh chụp", "Tài chính"];
 
 /// Every widget with its category index into `CATS`.
-pub const ITEMS: [(&str, usize); 16] = [
+pub const ITEMS: [(&str, usize); 45] = [
     ("clock", 1),
+    ("date", 1),
     ("git", 2),
     ("todo", 2),
     ("focus", 2),
+    ("timer", 2),
     ("downloads", 2),
     ("cpu", 3),
     ("ram", 3),
+    ("battery", 3),
+    ("net", 3),
+    ("disk", 3),
+    ("gpu", 3),
     ("lang", 3),
     ("cc", 3),
     ("chevron", 3),
@@ -47,7 +53,50 @@ pub const ITEMS: [(&str, usize); 16] = [
     ("grok", 4),
     ("media", 5),
     ("weather", 6),
+    ("pomodoro", 2),
+    ("stopwatch", 2),
+    ("notes", 2),
+    ("dayprog", 1),
+    ("monthprog", 1),
+    ("yearprog", 1),
+    ("theme", 3),
+    ("brightness", 3),
+    ("recyclebin", 3),
+    ("screenshot", 7),
+    ("recentshots", 7),
+    ("search", 2),
+    ("worldclock", 1),
+    ("analog", 1),
+    ("flipclock", 1),
+    ("segclock", 1),
+    ("daynum", 1),
+    ("sun", 6),
+    ("hourly", 6),
+    ("forecast", 6),
+    ("metric", 8),
+    ("currency", 8),
+    ("screentime", 2),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gallery_lists_every_widget_once_in_the_right_category() {
+        for id in crate::settings::WIDGET_IDS {
+            assert_eq!(ITEMS.iter().filter(|(name, _)| *name == id).count(), 1, "{id}");
+        }
+        assert!(ITEMS.iter().all(|(_,cat)|*cat>0 && *cat<CATS.len()));
+        for (id,cat) in [("pomodoro",2),("stopwatch",2),("notes",2),("dayprog",1),("monthprog",1),("yearprog",1),
+            ("theme",3),("brightness",3),("recyclebin",3),("screenshot",7),("recentshots",7),("search",2),
+            ("worldclock",1),("analog",1),("flipclock",1),("segclock",1),("daynum",1),("sun",6),("hourly",6),("forecast",6),
+            ("metric",8),("currency",8),("screentime",2)] {assert!(ITEMS.contains(&(id,cat)),"{id}");}
+        for (id, cat) in [("battery", 3), ("net", 3), ("disk", 3), ("gpu", 3), ("timer", 2), ("date", 1)] {
+            assert!(ITEMS.contains(&(id, cat)));
+        }
+    }
+}
 
 pub struct Entry {
     pub id: &'static str,
@@ -60,6 +109,8 @@ pub struct Entry {
     pub on: bool,
     /// Cannot be removed (Control Center button, tray chevron, clock).
     pub fixed: bool,
+    /// Hardware unavailable; an already-enabled widget can still be removed.
+    pub disabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -200,7 +251,7 @@ pub fn hit(x: f32, y: f32, rect: RectF, entries: &[Entry]) -> Option<Action> {
         for p in scrolled(entries, area) {
             if inside(p.card) {
                 let e = &entries[p.index];
-                return (!e.fixed).then_some(Action::Toggle(e.id));
+                return (!e.fixed && !e.disabled).then_some(Action::Toggle(e.id));
             }
         }
     }
@@ -253,6 +304,9 @@ pub fn draw(r: &mut Renderer, rect: RectF, entries: &[Entry]) -> Result<()> {
             r.draw_text("Không có widget nào khớp.", RectF { x: area.x, y: area.y + 10.0, w: area.w, h: 20.0 }, 12.0, MUTED, Align::Left)?;
         }
         for p in placed {
+            // Offscreen cards are already clipped; avoid building their glass
+            // and uploading bitmaps until their card or label enters the clip.
+            if p.card.y + CELL_H < area.y - 4.0 || p.card.y > area.y + area.h { continue; }
             let e = &entries[p.index];
             r.fill_rounded_rect(p.card, 16.0, CARD_BG)?;
             if e.on {
@@ -271,8 +325,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, entries: &[Entry]) -> Result<()> {
                 }
             }
             draw_tile(r, &e.view, p.tile, false)?;
-            let name = e.name.to_owned();
-            r.draw_text(&name, RectF { x: p.card.x - 6.0, y: p.card.y + CARD_H + 3.0, w: p.card.w + 12.0, h: 16.0 }, 10.5, MUTED, Align::Center)?;
+            r.draw_text(e.name, RectF { x: p.card.x - 6.0, y: p.card.y + CARD_H + 3.0, w: p.card.w + 12.0, h: 16.0 }, 10.5, MUTED, Align::Center)?;
         }
         Ok(())
     })();

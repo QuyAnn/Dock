@@ -1,10 +1,9 @@
 //! App icons: exe / AUMID -> 32x32 RGBA via shell AppsFolder, Appx logos, or SHGetFileInfo.
-use std::collections::HashMap;
 use std::iter::once;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::{PCWSTR, Result, BSTR};
 use windows::Win32::Foundation::{GENERIC_READ, HWND, SIZE};
@@ -17,7 +16,7 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
+    CoCreateInstance, CLSCTX_INPROC_SERVER,
 };
 use windows::Win32::UI::Shell::{
     SHCreateItemFromParsingName, SHGetFileInfoW, IShellItemImageFactory, SHFILEINFOW, SHGFI_ICON,
@@ -30,7 +29,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, GetIconInfo, GetSystemMetrics, HICON, ICONINFO, SM_CXICON, SM_CYICON,
 };
 
-const CACHE_LIMIT: usize = 128;
 /// Requested shell image size: 256 px (jumbo), reduced once when composed, so 38-DIP icons
 /// stay crisp at any DPI.
 const ICON_PX: i32 = 256;
@@ -50,10 +48,10 @@ pub struct IconBitmap {
     pub w: u32,
     pub h: u32,
     /// RGBA, 4 bytes per pixel, top-down rows.
-    pub rgba: Vec<u8>,
+    pub rgba: Arc<Vec<u8>>,
 }
 
-static CACHE: OnceLock<Mutex<HashMap<String, IconBitmap>>> = OnceLock::new();
+static CACHE: OnceLock<Mutex<crate::cache::ByteCache<String, IconBitmap>>> = OnceLock::new();
 
 /// Shell icon of an exe / packaged app as RGBA pixels. Successful results are cached.
 pub fn icon_for_exe(exe_path: &str, aumid: &str, package_path: &str) -> Option<IconBitmap> {
@@ -62,7 +60,7 @@ pub fn icon_for_exe(exe_path: &str, aumid: &str, package_path: &str) -> Option<I
 
 /// Same as [`icon_for_exe`], but may read `PKEY_AppUserModel_ID` from `hwnd` when AUMID is empty.
 pub fn icon_for_window(hwnd: isize, exe_path: &str, aumid: &str, package_path: &str) -> Option<IconBitmap> {
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = CACHE.get_or_init(|| Mutex::new(crate::cache::ByteCache::new(16 * 1024 * 1024)));
     let frame_host = is_frame_host(exe_path);
     let resolved = resolve_aumid(hwnd, exe_path, aumid);
     // Prefer AUMID as cache key. Never key ApplicationFrameHost by its shared host path.
@@ -73,7 +71,7 @@ pub fn icon_for_window(hwnd: isize, exe_path: &str, aumid: &str, package_path: &
     } else {
         exe_path.to_owned()
     };
-    if let Some(hit) = cache.lock().ok()?.get(&key).cloned() {
+    if let Some(hit) = cache.lock().ok()?.get_mut(&key).cloned() {
         return Some(hit);
     }
     // Packaged/UWP: AppsFolder (scale/targetsize/plated) first; AppxManifest only after that fails.
@@ -91,10 +89,7 @@ pub fn icon_for_window(hwnd: isize, exe_path: &str, aumid: &str, package_path: &
             }
         })?;
     let mut map = cache.lock().ok()?;
-    if map.len() >= CACHE_LIMIT {
-        map.clear();
-    }
-    map.insert(key, icon.clone());
+    map.insert(key, icon.clone(), icon.rgba.len());
     Some(icon)
 }
 
@@ -104,7 +99,7 @@ pub fn aumid_from_hwnd(hwnd: isize) -> Option<String> {
         return None;
     }
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _com = super::com::Apartment::mta();
         let store: IPropertyStore = SHGetPropertyStoreForWindow(HWND(hwnd as _)).ok()?;
         let value = store.GetValue(&PKEY_APPUSERMODEL_ID).ok()?;
         let bstr = BSTR::try_from(&value).ok()?;
@@ -160,7 +155,7 @@ fn apps_folder_icon(aumid: &str) -> Option<IconBitmap> {
 fn shell_image(path: &str) -> Option<IconBitmap> {
     let wide: Vec<u16> = path.encode_utf16().chain(once(0)).collect();
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _com = super::com::Apartment::mta();
         let factory: IShellItemImageFactory = SHCreateItemFromParsingName(
             PCWSTR(wide.as_ptr()),
             None::<&windows::Win32::System::Com::IBindCtx>,
@@ -202,7 +197,7 @@ fn generic_settings_icon() -> Option<IconBitmap> {
             }
         }
     }
-    Some(IconBitmap { w, h, rgba })
+    Some(IconBitmap { w, h, rgba: Arc::new(rgba) })
 }
 
 /// Rounded square with a window glyph when a packaged app's logo cannot be resolved.
@@ -229,7 +224,7 @@ fn generic_uwp_icon() -> Option<IconBitmap> {
             }
         }
     }
-    Some(IconBitmap { w, h, rgba })
+    Some(IconBitmap { w, h, rgba: Arc::new(rgba) })
 }
 
 fn appx_icon(exe_path: &str, package_path: &str, aumid: &str) -> Option<IconBitmap> {
@@ -323,7 +318,7 @@ fn is_blank_white(icon: &IconBitmap) -> bool {
 fn decode_image(path: &Path) -> Result<IconBitmap> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _com = super::com::Apartment::mta();
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let decoder = factory.CreateDecoderFromFilename(
@@ -346,7 +341,7 @@ fn decode_image(path: &Path) -> Result<IconBitmap> {
         )?;
         let mut rgba = vec![0; (w * h * 4) as usize];
         converter.CopyPixels(std::ptr::null(), w * 4, &mut rgba)?;
-        Ok(IconBitmap { w, h, rgba })
+        Ok(IconBitmap { w, h, rgba: Arc::new(rgba) })
     }
 }
 
@@ -412,7 +407,7 @@ unsafe fn hbitmap_to_rgba(hbmp: HBITMAP) -> Option<IconBitmap> {
         let a = if has_alpha { p[3] } else { 255 };
         rgba.extend_from_slice(&[p[2], p[1], p[0], a]);
     }
-    Some(IconBitmap { w, h, rgba })
+    Some(IconBitmap { w, h, rgba: Arc::new(rgba) })
 }
 
 unsafe fn read_rgba(color: HBITMAP, mask: HBITMAP) -> Option<IconBitmap> {
@@ -436,7 +431,7 @@ unsafe fn read_rgba(color: HBITMAP, mask: HBITMAP) -> Option<IconBitmap> {
         };
         rgba.extend_from_slice(&[p[2], p[1], p[0], a]);
     }
-    Some(IconBitmap { w, h, rgba })
+    Some(IconBitmap { w, h, rgba: Arc::new(rgba) })
 }
 
 unsafe fn read_pixels(hdc: HDC, bmp: HBITMAP, w: u32, h: u32, out: &mut [u8]) -> bool {

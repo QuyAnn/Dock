@@ -2,6 +2,8 @@
 //! SmartDock entry point: AppBar dock window with Direct2D tiles and popups.
 //! Startup: recover taskbar from a crash -> create dock -> register AppBar -> hide taskbar.
 //! Every exit path (WM_CLOSE, panic, Ctrl+C) restores the taskbar.
+mod background;
+mod cache;
 mod data;
 mod model;
 mod settings;
@@ -63,6 +65,7 @@ const TIMER_REFRESH: usize = 1; // 1 s: apps, stats, popup refresh, repaint
 const TIMER_GUARD: usize = 2; // 500 ms: keep the Windows taskbar hidden
 const TIMER_EXPLORER: usize = 0x5E5E; // one-shot: Explorer restarted, re-attach after it settles
 const TIMER_VISUALIZER: usize = 3; // ~30 fps, enabled only while media is playing
+const TIMER_STOPWATCH: usize = 4; // tenths of a second, only while its widget/popup is visible
 const HOTKEY_TOGGLE: i32 = 1;
 
 /// Data shared with the background refresh thread. Blocking calls run there, never on the UI thread.
@@ -133,6 +136,7 @@ struct App {
 #[derive(Clone, Copy, PartialEq)]
 enum OpenPopup {
     Data(&'static str),
+    Widget(&'static str),
     Control,
     AppMenu,
     /// Right-click on empty dock area ("Cài đặt SmartDock").
@@ -141,6 +145,23 @@ enum OpenPopup {
     Gallery,
     /// SmartDock's own tray overflow (hidden notification icons).
     Tray,
+}
+
+fn popup_demand(which: Option<OpenPopup>) -> u32 {
+    match which {
+        Some(OpenPopup::Gallery) => background::GALLERY,
+        Some(OpenPopup::Control) => background::for_widget("cc"),
+        // The calendar always includes a weather section, even if the dock's
+        // optional weather tile / clock annotation has been disabled.
+        Some(OpenPopup::Data("clock")) => background::WEATHER,
+        Some(OpenPopup::Data(id) | OpenPopup::Widget(id)) => background::for_widget(id),
+        _ => 0,
+    }
+}
+
+fn set_open(which: Option<OpenPopup>) {
+    background::PREVIEW.store(popup_demand(which), Ordering::Relaxed);
+    OPEN.with(|o| o.set(which));
 }
 
 /// Click resolved on the UI thread; side effects run after the APP borrow is released.
@@ -247,8 +268,9 @@ unsafe extern "system" fn console_handler(_ctrl_type: u32) -> BOOL {
 }
 
 fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
+    background::start(shared.clone());
     let liquid_shared = shared.clone();
-    thread::spawn(move || {
+    background::spawn("wallpaper", 512 * 1024, move || {
         let mut tick: u64 = 0;
         let mut have = false;
         loop {
@@ -336,43 +358,15 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
             thread::sleep(Duration::from_millis(if have { 1000 } else { 250 }));
         }
     });
-    thread::spawn(move || {
-        let mut tick: u64 = 0;
-        loop {
-            // Control state every 2 s (volume, mute, radios, brightness).
-            if tick % 2 == 0 {
-                let c = ControlState::read();
-                *shared.control.lock().unwrap() = c;
-            }
-            // Recycle Bin and Downloads readings every 5 s.
-            if tick % 5 == 0 {
-                win::shellinfo::refresh();
-            }
-            // Media every second, so play/pause and track changes show up quickly.
-            let update = DataState::fetch_media();
-            Arc::make_mut(&mut shared.data.lock().unwrap()).apply(update);
-            // Git, AI usage and weather every 10 min (first pass runs immediately).
-            if tick % 600 == 0 || shared.refresh_slow.swap(false, Ordering::SeqCst) {
-                let current = shared.settings.lock().unwrap().clone();
-                let repos = if current.git_folders.is_empty() { default_repos() } else { current.git_folders.clone() };
-                let updates = DataState::fetch_slow(&repos, &current.git_author, &current.weather_location);
-                let mut guard = shared.data.lock().unwrap();
-                let data = Arc::make_mut(&mut guard);
-                for update in updates {
-                    data.apply(update);
-                }
-            }
-            tick += 1;
-            thread::sleep(Duration::from_secs(1));
-        }
-    });
 }
 
 fn start_audio_meter(shared: Arc<Shared>) {
-    thread::spawn(move || {
+    background::spawn("audio-meter", 256 * 1024, move || {
         let mut ticks: u64 = 0;
         loop {
-            let playing = shared
+            let needed = shared.settings.lock().unwrap().tiles.music
+                || background::PREVIEW.load(Ordering::Relaxed) & background::MEDIA != 0;
+            let playing = needed && shared
                 .data
                 .lock()
                 .ok()
@@ -752,6 +746,7 @@ fn run() -> windows::core::Result<()> {
         // SAFETY: hwnd is live; timers drive refresh and the taskbar guard.
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetTimer(hwnd, TIMER_REFRESH, 1000, None);
+        SetTimer(hwnd, TIMER_STOPWATCH, 100, None);
         SetTimer(hwnd, TIMER_GUARD, 500, None);
         let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT, b'D' as u32);
     }
@@ -785,12 +780,19 @@ const USAGE_TILE_H: f32 = 0.0; // same height as every other widget
 
 /// Dock width of a widget.
 fn widget_width(id: &str) -> f32 {
+    if let Some(width) = ui::more_widgets::width(id) { return width; }
     match id {
         "git" => dock::GIT_W,
         "claude" | "codex" | "cursor" | "grok" => USAGE_TILE_W,
         "media" => dock::MEDIA_W,
         "weather" => 100.0,
         "focus" => 84.0,
+        "timer" => 104.0,
+        "battery" => 114.0,
+        "net" => 116.0,
+        "disk" => 124.0,
+        "gpu" => 64.0,
+        "date" => 112.0,
         "todo" => 160.0,
         "downloads" => 150.0,
         "chevron" => 30.0,
@@ -811,6 +813,7 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
         ids.iter()
             .filter_map(|id| settings::WIDGET_IDS.iter().copied().find(|w| *w == id))
             .filter(|id| settings.widget_shown(id))
+            .filter(|id| *id != "brightness" || win::widget_tools::brightness().is_some())
             .map(|id| Tile {
                 id,
                 width: if id == "clock" && settings.clock_style == "wide" {
@@ -833,7 +836,7 @@ fn layout_tiles(app_count: usize, settings: &settings::Settings) -> Zones {
         // closes the cluster after a second divider (like macOS).
         center: {
             let cell = |id| Tile { id, width: apps::ICON, height: apps::CLUSTER_H };
-            let mut center = vec![cell("start"), cell("search")];
+            let mut center = vec![cell("start"), cell("systemsearch")];
             if app_count > 0 {
                 center.push(Tile { id: "sep", width: 1.0, height: 24.0 });
                 center.push(Tile { id: "apps", width: apps_w, height: apps::CLUSTER_H });
@@ -1033,6 +1036,10 @@ fn tile_view(
     audio_peak: f32,
     settings: &settings::Settings,
 ) -> TileView {
+    if let Some(mut view) = ui::more_widgets::view(id, data, settings) {
+        ui::more_widgets::enrich(&mut view, data, settings);
+        return view;
+    }
     let now = Local::now();
     match id {
         "git" => tiles::git_tile(data),
@@ -1053,6 +1060,12 @@ fn tile_view(
             view
         }
         "weather" => tiles::weather_tile(data),
+        "battery" => tiles::battery_tile(&data.widgets),
+        "net" => tiles::net_tile(&data.widgets),
+        "disk" => tiles::disk_tile(&data.widgets),
+        "gpu" => tiles::gpu_tile(&data.widgets),
+        "timer" => tiles::timer_tile(),
+        "date" => tiles::date_tile(now.date_naive()),
         "focus" => {
             let f = data::focus::snapshot();
             let (title, accent) = match f.phase {
@@ -1106,7 +1119,7 @@ fn tile_view(
             ..TileView::card("", "")
         },
         "start" => TileView { style: Style::Start, ..TileView::card("", "") },
-        "search" => TileView { style: Style::Search, ..TileView::card("", "") },
+        "systemsearch" => TileView { style: Style::Search, ..TileView::card("", "") },
         "sep" => TileView { style: Style::Separator, ..TileView::card("", "") },
         // Ring: short label above the percent (no "CPU 65" single-line overlap).
         "cpu" => TileView {
@@ -1344,6 +1357,22 @@ fn in_tile(id: &str, r: &RectF, x: f32, y: f32) -> bool {
 }
 
 fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
+    // Stopwatch: a right click records a lap and presents all laps, including on secondary docks.
+    let special = APP.with(|a| {
+        let slot = a.borrow(); let app = slot.as_ref()?;
+        let (tiles, origin, dpi_value) = if app.hwnd == hwnd { (&app.tiles, app.origin, app.dpi) }
+            else { let sec = app.secondaries.iter().find(|s| s.hwnd == hwnd)?; (&sec.tiles, sec.origin, sec.dpi) };
+        let (id,rc) = tiles.iter().find(|(id,rc)| matches!(*id,"stopwatch"|"recentshots") && in_tile(id,rc,x,y))?;
+        let scale = dpi::scale(dpi_value);
+        Some((*id, RectF { x:origin.0+rc.x*scale,y:origin.1,w:rc.w*scale,h:DOCK_HEIGHT*scale }))
+    });
+    if let Some((id, anchor)) = special {
+        if id == "stopwatch" { data::productivity::lap(); }
+        set_open(None);
+        open_popup(OpenPopup::Widget(id), anchor);
+        repaint();
+        return;
+    }
     thumbnails::hide();
     let anchor = APP.with(|a| {
         let Ok(slot) = a.try_borrow() else { return None };
@@ -1693,18 +1722,26 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
                 None => Click::None,
             },
             "start" => Click::Start,
-            "search" => Click::Search,
+            "systemsearch" => Click::Search,
+            "pomodoro" => Click::Action(if x >= rect.x + rect.w - 32.0 { "pomodoro_skip" } else { "pomodoro" }),
+            "stopwatch" => Click::Action("stopwatch"),
+            "recentshots" => Click::Action(match (((x-rect.x-5.0)/((rect.w-12.0)/3.0)) as usize).min(2) { 0=>"shot0",1=>"shot1",_=>"shot2" }),
+            "theme" | "screenshot" | "recyclebin" => Click::Action(id),
+            "analog" | "flipclock" | "segclock" | "daynum" | "dayprog" | "monthprog" | "yearprog" => Click::Open(OpenPopup::Data("clock"), anchor),
+            id if ui::more_widgets::has_popup(id) => Click::Open(OpenPopup::Widget(id), anchor),
             "git" => Click::Open(OpenPopup::Data("git"), anchor),
             "claude" | "codex" | "cursor" => Click::Open(OpenPopup::Data(id), anchor),
             "grok" => Click::Open(OpenPopup::Data("grok"), anchor),
             "media" => Click::Open(OpenPopup::Data("media"), anchor),
             "weather" => Click::Open(OpenPopup::Data("weather"), anchor),
             "clock" => Click::Open(OpenPopup::Data("clock"), anchor),
+            "date" => Click::Open(OpenPopup::Data("clock"), anchor),
             "cpu" => Click::Open(OpenPopup::Data("cpu"), anchor),
             "ram" => Click::Open(OpenPopup::Data("ram"), anchor),
             "cc" => Click::Open(OpenPopup::Control, anchor),
             "chevron" => Click::TrayOverflow(anchor),
             "focus" => Click::Action("focus"),
+            "timer" => Click::Action("timer"),
             "lang" => Click::Action("lang"),
             "trash" => Click::Action("trash"),
             "downloads" => Click::Action("downloads"),
@@ -1717,7 +1754,21 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
 /// What a click on an action widget does. Also used by the widget's right-click menu.
 fn run_widget_action(id: &str) {
     match id {
+        "pomodoro" => data::productivity::pomo_toggle(),
+        "pomodoro_skip" => data::productivity::pomo_skip(),
+        "pomodoro_reset" => data::productivity::pomo_reset(),
+        "stopwatch" => data::productivity::watch_toggle(),
+        "stopwatch_reset" => data::productivity::watch_reset(),
+        "theme" => { thread::spawn(|| { if let Err(e) = win::widget_tools::toggle_theme() { show_error(&format!("Không đổi được giao diện: {e}")); } }); }
+        "screenshot" => { let _ = system::open_path(std::path::Path::new("ms-screenclip:")); }
+        "recyclebin" => { thread::spawn(|| { win::shellinfo::empty_bin(); win::shellinfo::refresh(); }); }
+        "shot0" | "shot1" | "shot2" => {
+            let index = match id {"shot1"=>1,"shot2"=>2,_=>0};
+            if let Some(shot)=win::widget_tools::shots().get(index) { let path=shot.path.clone();thread::spawn(move || {let _=system::open_path(&path);}); }
+        }
         "focus" => data::focus::toggle(),
+        "timer" => data::timer::toggle(),
+        "timer_reset" => data::timer::reset(),
         "lang" => win::kbd::switch(),
         "focus_reset" => data::focus::reset(),
         "trash" => {
@@ -1752,7 +1803,7 @@ fn popup_kind(id: &str) -> PopupKind {
 }
 
 /// Pushes fresh data (and sparkline history for CPU/RAM) into the popup content.
-fn feed_popup(kind: PopupKind, data: &DataState, history: &History) {
+fn feed_popup(kind: PopupKind, data: &Arc<DataState>, history: &History) {
     popup_content::set_content(kind, data.clone());
     let samples = match kind {
         PopupKind::Cpu => Some(history.snapshot().0),
@@ -1771,10 +1822,23 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
     }
     if OPEN.with(Cell::get) == Some(which) {
         popup::hide();
-        OPEN.with(|o| o.set(None));
+        set_open(None);
         return;
     }
     match which {
+        OpenPopup::Widget(id) => {
+            let settings = APP.with(|a| a.borrow().as_ref().map(|app| app.shared.settings.lock().unwrap().clone()));
+            if let Some(settings) = settings { ui::more_widgets::prepare(id, &settings); }
+            CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+            glass::set_panel_light(false);
+            let height = ui::more_widgets::popup_height(id);
+            POPUP_H_CUR.with(|h| h.set(height));
+            POPUP_W_CUR.with(|w| w.set(POPUP_W));
+            if popup::show(anchor, POPUP_W, height as i32).is_ok() {
+                set_open(Some(which));
+                if ui::more_widgets::editable(id) { popup::focus(); }
+            }
+        }
         OpenPopup::Data(id) => {
             let kind = popup_kind(id);
             popup_content::set_ai_provider(match id {
@@ -1807,7 +1871,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             }
             POPUP_W_CUR.with(|w| w.set(width));
             if popup::show(anchor, width, height as i32).is_ok() {
-                OPEN.with(|o| o.set(Some(which)));
+                set_open(Some(which));
             }
         }
         OpenPopup::Control => {
@@ -1816,7 +1880,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             CONTROL_VIEW.with(|c| *c.borrow_mut() = state);
             POPUP_W_CUR.with(|w| w.set(CONTROL_POPUP_W));
             if popup::show(anchor, CONTROL_POPUP_W, control_center::HEIGHT as i32).is_ok() {
-                OPEN.with(|o| o.set(Some(which)));
+                set_open(Some(which));
             }
         }
         OpenPopup::DockMenu => {
@@ -1826,7 +1890,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             POPUP_H_CUR.with(|h| h.set(height));
             POPUP_W_CUR.with(|w| w.set(appmenu::DOCK_MENU_W));
             if popup::show(anchor, appmenu::DOCK_MENU_W, height as i32).is_ok() {
-                OPEN.with(|o| o.set(Some(which)));
+                set_open(Some(which));
             }
         }
         OpenPopup::Gallery => open_gallery(),
@@ -1837,7 +1901,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             POPUP_H_CUR.with(|c| c.set(h));
             POPUP_W_CUR.with(|c| c.set(w));
             if popup::show(anchor, w, h as i32).is_ok() {
-                OPEN.with(|o| o.set(Some(which)));
+                set_open(Some(which));
             }
             repaint();
         }
@@ -1850,7 +1914,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             POPUP_H_CUR.with(|h| h.set(height));
             POPUP_W_CUR.with(|w| w.set(260.0));
             if popup::show(anchor, 260.0, height as i32).is_ok() {
-                OPEN.with(|o| o.set(Some(which)));
+                set_open(Some(which));
             }
         }
     }
@@ -1889,13 +1953,14 @@ fn gallery_entries() -> Vec<ui::gallery::Entry> {
                 },
                 on: settings.widget_shown(id),
                 fixed: settings::is_fixed_widget(id),
+                disabled: id == "brightness" && win::widget_tools::brightness().is_none() && !settings.widget_shown(id),
             })
             .collect()
     })
 }
 
 fn open_gallery() {
-    OPEN.with(|o| o.set(None));
+    set_open(None);
     appmenu::clear();
     popup::hide();
     ui::gallery::reset();
@@ -1904,7 +1969,7 @@ fn open_gallery() {
     POPUP_W_CUR.with(|w| w.set(ui::gallery::W));
     POPUP_H_CUR.with(|h| h.set(ui::gallery::H));
     if popup::show_centered(ui::gallery::W, ui::gallery::H as i32).is_ok() {
-        OPEN.with(|o| o.set(Some(OpenPopup::Gallery)));
+        set_open(Some(OpenPopup::Gallery));
         popup::focus();
     }
 }
@@ -1915,13 +1980,20 @@ fn open_settings_popup() {
         return;
     }
     // Swap in place: clear the open kind so open_popup does not treat it as a toggle.
-    OPEN.with(|o| o.set(None));
+    set_open(None);
     appmenu::clear();
     open_popup(OpenPopup::Data("settings"), anchor);
 }
 
 /// Keeps an open data popup live: fresh data and history each second, then a repaint of the popup.
 fn refresh_open_popup() {
+    if matches!(OPEN.with(Cell::get), Some(OpenPopup::Widget(_))) {
+        popup::invalidate(); return;
+    }
+    if OPEN.with(Cell::get) == Some(OpenPopup::Gallery) {
+        popup::invalidate();
+        return;
+    }
     let Some(OpenPopup::Data(id)) = OPEN.with(Cell::get) else { return };
     APP.with(|a| {
         let slot = a.borrow();
@@ -1937,6 +2009,17 @@ fn refresh_open_popup() {
 }
 
 fn paint_popup(r: &mut Renderer, rect: RectF) {
+    if let Some(OpenPopup::Widget(id)) = OPEN.with(Cell::get) {
+        APP.with(|a| {
+            let slot = a.borrow();
+            if let Some(app) = slot.as_ref() {
+                let data = app.shared.data.lock().unwrap().clone();
+                let settings = app.shared.settings.lock().unwrap().clone();
+                let _ = ui::more_widgets::paint_popup(r, id, rect, &data, &settings);
+            }
+        });
+        return;
+    }
     if OPEN.with(Cell::get) == Some(OpenPopup::Gallery) {
         let entries = gallery_entries();
         let _ = ui::gallery::draw(r, rect, &entries);
@@ -1975,6 +2058,12 @@ fn popup_rect() -> RectF {
 
 fn on_popup_click(x: f32, y: f32) {
     let rect = popup_rect();
+    if let Some(OpenPopup::Widget(id)) = OPEN.with(Cell::get) {
+        let action = ui::more_widgets::click(id, x, y, rect);
+        apply_more_widget_action(action);
+        if ui::more_widgets::editable(id) && OPEN.with(Cell::get)==Some(OpenPopup::Widget(id)) { popup::focus(); }
+        popup::repaint_now(); return;
+    }
     if OPEN.with(Cell::get) == Some(OpenPopup::DockMenu) {
         match appmenu::dock_menu_hit(x, y) {
             Some(appmenu::DockMenuAction::Gallery) => {
@@ -1988,7 +2077,7 @@ fn on_popup_click(x: f32, y: f32) {
                 log(&format!("dockmenu: {action:?}"));
                 if let appmenu::DockMenuAction::Extra(id) = action {
                     popup::hide();
-                    OPEN.with(|o| o.set(None));
+                    set_open(None);
                     run_widget_action(id);
                     return;
                 }
@@ -2001,7 +2090,7 @@ fn on_popup_click(x: f32, y: f32) {
                     let _ = settings::save(settings);
                 });
                 popup::hide();
-                OPEN.with(|o| o.set(None));
+                set_open(None);
                 repaint();
             }
             None => {}
@@ -2027,7 +2116,7 @@ fn on_popup_click(x: f32, y: f32) {
                 let _ = settings::save(settings);
             });
             popup::hide();
-            OPEN.with(|o| o.set(None));
+            set_open(None);
             appmenu::clear();
             repaint();
         }
@@ -2067,7 +2156,7 @@ fn on_popup_click(x: f32, y: f32) {
         match ui::gallery::hit(x, y, rect, &entries) {
             Some(ui::gallery::Action::Close) => {
                 popup::hide();
-                OPEN.with(|o| o.set(None));
+                set_open(None);
             }
             Some(ui::gallery::Action::Category(i)) => {
                 ui::gallery::select(i);
@@ -2141,7 +2230,7 @@ fn on_popup_click(x: f32, y: f32) {
             });
             // The list length changed: reopen at the new height.
             let anchor = LAST_ANCHOR.with(Cell::get);
-            OPEN.with(|o| o.set(None));
+            set_open(None);
             open_popup(OpenPopup::Data("todo"), anchor);
             repaint();
         }
@@ -2270,6 +2359,10 @@ fn close_tray_popup() {
 
 /// Typed character for the note input; Enter adds the note.
 fn on_popup_char(ch: char) {
+    if let Some(OpenPopup::Widget(id)) = OPEN.with(Cell::get) {
+        apply_more_widget_action(ui::more_widgets::input(id, ch));
+        popup::repaint_now(); return;
+    }
     if OPEN.with(Cell::get) == Some(OpenPopup::Gallery) {
         if ui::gallery::focused() {
             ui::gallery::input_char(ch);
@@ -2293,7 +2386,7 @@ fn on_popup_char(ch: char) {
             });
             // The list grew: reopen at the new height, keeping the input focused.
             let anchor = LAST_ANCHOR.with(Cell::get);
-            OPEN.with(|o| o.set(None));
+            set_open(None);
             open_popup(OpenPopup::Data("todo"), anchor);
             popup_content::todo_input_set_focus(true);
             popup::focus();
@@ -2303,13 +2396,52 @@ fn on_popup_char(ch: char) {
     }
 }
 
+fn apply_more_widget_action(action: ui::more_widgets::Action) {
+    use ui::more_widgets::Action;
+    match action {
+        Action::SaveNote(_) | Action::SetCities(_) | Action::SetCurrency(_,_,_) => {
+            let saved = APP.with(|a| {
+                let slot = a.borrow(); let Some(app) = slot.as_ref() else { return Ok(()) };
+                let mut guard = app.shared.settings.lock().unwrap();
+                let mut updated = (**guard).clone();
+                match action {
+                    Action::SaveNote(note) => updated.note = note,
+                    Action::SetCities(cities) => updated.world_cities = cities,
+                    Action::SetCurrency(amount,from,to) => { updated.currency_amount=amount;updated.currency_from=from;updated.currency_to=to; }
+                    _ => unreachable!(),
+                }
+                settings::save(&updated)?;
+                *guard = Arc::new(updated);
+                Ok::<(),std::io::Error>(())
+            });
+            match saved {
+                Ok(()) => { popup::hide(); repaint(); }
+                Err(e) => show_error(&format!("Không lưu được widget: {e}")),
+            }
+        }
+        Action::Search(query) => {
+            popup::hide();
+            thread::spawn(move || { if let Err(e) = win::widget_tools::search(&query) { show_error(&format!("Không mở được tìm kiếm: {e}")); } });
+        }
+        Action::WatchToggle => data::productivity::watch_toggle(),
+        Action::WatchReset => data::productivity::watch_reset(),
+        Action::Lap => data::productivity::lap(),
+        Action::OpenShot(i) => {
+            if let Some(shot) = win::widget_tools::shots().get(i) { let path=shot.path.clone(); popup::hide();thread::spawn(move || {let _=system::open_path(&path);}); }
+        }
+        Action::None => {},
+    }
+    repaint();
+}
+
 fn on_popup_hidden() {
+    popup_content::clear_content();
     popup_content::todo_input_set_focus(false);
     if OPEN.with(Cell::get) == Some(OpenPopup::Tray) {
         trayview::closed();
         repaint();
     }
-    OPEN.with(|o| o.set(None));
+    set_open(None);
     thumbnails::set_suppressed(false);
     CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
     glass::set_panel_light(false);
@@ -2328,6 +2460,11 @@ thread_local! {
 /// immediately and the system value is applied live (coalesced to ~30 Hz off the UI thread).
 fn on_popup_drag(phase: popup::DragPhase, x: f32, _y: f32) -> bool {
     let rect = popup_rect();
+    if OPEN.with(Cell::get) == Some(OpenPopup::Widget("brightness")) {
+        let handled = ui::more_widgets::brightness_drag(phase, x, _y, rect);
+        if handled { popup::repaint_now(); }
+        return handled;
+    }
     let slider = match phase {
         popup::DragPhase::Down => {
             let hit = CONTROL_VIEW.with(|c| c.borrow().as_ref().and_then(|st| control_center::slider_at(x, _y, rect, st)));
@@ -2426,7 +2563,7 @@ fn live_apply(action: control_center::ControlAction) {
     static TX: OnceLock<std::sync::Mutex<Sender<control_center::ControlAction>>> = OnceLock::new();
     let tx = TX.get_or_init(|| {
         let (tx, rx) = channel::<control_center::ControlAction>();
-        thread::spawn(move || {
+        background::spawn("live-controls", 512 * 1024, move || {
             while let Ok(first) = rx.recv() {
                 let mut vol = None;
                 let mut br = None;
@@ -2796,8 +2933,9 @@ fn shutdown() {
     // Hand the tray back to Explorer before the AppBars are removed.
     win::traysvc::shutdown();
     data::usage::flush();
+    data::screentime::flush();
     popup::hide();
-    OPEN.with(|o| o.set(None));
+    set_open(None);
     let secondary_hwnds = APP.with(|a| {
         if let Some(mut app) = a.borrow_mut().take() {
             unsafe {
@@ -2805,6 +2943,7 @@ fn shutdown() {
                 let _ = KillTimer(app.hwnd, TIMER_REFRESH);
                 let _ = KillTimer(app.hwnd, TIMER_GUARD);
                 let _ = KillTimer(app.hwnd, TIMER_VISUALIZER);
+                let _ = KillTimer(app.hwnd, TIMER_STOPWATCH);
                 let _ = UnregisterHotKey(app.hwnd, HOTKEY_TOGGLE);
             }
             tasks::unregister_shell_hook(app.hwnd);
@@ -2885,11 +3024,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                                 }
                                 data::usage::tick();
                                 app.apps.pins = pins_of(&current_settings);
+                                let demand = background::placed(&current_settings)
+                                    | background::PREVIEW.load(Ordering::Relaxed);
                                 drop(current_settings);
                                 app.apps.refresh(&app.attention);
-                                app.stats = data::stats::read_stats();
-                                app.history.push(&app.stats);
-                                let playing = app
+                                if demand & background::STATS != 0 {
+                                    app.stats = data::stats::read_stats();
+                                    app.history.push(&app.stats);
+                                }
+                                let playing = demand & background::MEDIA != 0 && app
                                     .shared
                                     .data
                                     .lock()
@@ -2932,6 +3075,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     guard_work_area(hwnd);
                 }
                 TIMER_VISUALIZER => repaint(),
+                TIMER_STOPWATCH => {
+                    let (_,running,_) = data::productivity::watch_summary();
+                    if running {
+                        let visible = APP.with(|a| a.try_borrow().ok().is_some_and(|slot| slot.as_ref().is_some_and(|app| app.shared.settings.lock().unwrap().tiles.stopwatch)));
+                        if visible { repaint(); }
+                        if matches!(OPEN.with(Cell::get),Some(OpenPopup::Widget("stopwatch")|OpenPopup::Gallery)) { popup::invalidate(); }
+                    }
+                }
                 id if id == thumbnails::TIMER_THUMB_DELAY || id == thumbnails::TIMER_THUMB_POLL => {
                     thumbnails::on_dock_timer(hwnd, id);
                 }

@@ -17,6 +17,35 @@ pub struct TileSettings {
     pub music: bool,
     pub cpu: bool,
     pub ram: bool,
+    pub battery: bool,
+    pub net: bool,
+    pub disk: bool,
+    pub gpu: bool,
+    pub timer: bool,
+    pub pomodoro: bool,
+    pub stopwatch: bool,
+    pub notes: bool,
+    pub dayprog: bool,
+    pub monthprog: bool,
+    pub yearprog: bool,
+    pub theme: bool,
+    pub brightness: bool,
+    pub recyclebin: bool,
+    pub screenshot: bool,
+    pub recentshots: bool,
+    pub search: bool,
+    pub worldclock: bool,
+    pub analog: bool,
+    pub flipclock: bool,
+    pub segclock: bool,
+    pub daynum: bool,
+    pub sun: bool,
+    pub hourly: bool,
+    pub forecast: bool,
+    pub metric: bool,
+    pub currency: bool,
+    pub screentime: bool,
+    pub date: bool,
     pub weather: bool,
     pub focus: bool,
     pub todo: bool,
@@ -36,6 +65,35 @@ impl Default for TileSettings {
             music: true,
             cpu: true,
             ram: true,
+            battery: false,
+            net: false,
+            disk: false,
+            gpu: false,
+            timer: false,
+            pomodoro: false,
+            stopwatch: false,
+            notes: false,
+            dayprog: false,
+            monthprog: false,
+            yearprog: false,
+            theme: false,
+            brightness: false,
+            recyclebin: false,
+            screenshot: false,
+            recentshots: false,
+            search: false,
+            worldclock: false,
+            analog: false,
+            flipclock: false,
+            segclock: false,
+            daynum: false,
+            sun: false,
+            hourly: false,
+            forecast: false,
+            metric: false,
+            currency: false,
+            screentime: false,
+            date: false,
             weather: true,
             focus: false,
             todo: false,
@@ -47,8 +105,8 @@ impl Default for TileSettings {
 }
 
 /// Every widget that can sit on the left or right of the dock, with the Settings key it uses.
-pub const WIDGET_IDS: [&str; 16] =
-    ["git", "claude", "codex", "cursor", "grok", "media", "weather", "cpu", "ram", "focus", "todo", "downloads", "chevron", "cc", "lang", "clock"];
+pub const WIDGET_IDS: [&str; 45] =
+    ["git", "claude", "codex", "cursor", "grok", "media", "weather", "cpu", "ram", "focus", "todo", "downloads", "chevron", "cc", "lang", "clock", "battery", "net", "disk", "gpu", "timer", "date", "pomodoro", "stopwatch", "notes", "dayprog", "monthprog", "yearprog", "theme", "brightness", "recyclebin", "screenshot", "recentshots", "search", "worldclock", "analog", "flipclock", "segclock", "daynum", "sun", "hourly", "forecast", "metric", "currency", "screentime"];
 
 /// Always on: these can be moved but not removed (tray chevron, Wi-Fi/volume button, clock).
 pub fn is_fixed_widget(id: &str) -> bool {
@@ -66,8 +124,13 @@ pub struct WidgetLayout {
 
 impl Default for WidgetLayout {
     fn default() -> Self {
-        let own = |ids: &[&str]| ids.iter().map(|s| (*s).to_owned()).collect();
-        Self { left: own(&["git", "claude", "codex", "cursor", "grok", "weather", "focus", "todo", "downloads"]), right: own(&["chevron", "cc", "media", "cpu", "ram", "lang", "clock"]) }
+        let own = |ids: &[&str]| -> Vec<String> { ids.iter().map(|s| (*s).to_owned()).collect() };
+        let right = own(&["chevron", "cc", "media", "cpu", "ram", "battery", "net", "disk", "gpu", "lang", "date", "clock"]);
+        let mut left = own(&["git", "claude", "codex", "cursor", "grok", "weather", "focus", "todo", "downloads", "timer"]);
+        for id in WIDGET_IDS {
+            if !left.iter().chain(&right).any(|s| s == id) { left.push(id.to_owned()); }
+        }
+        Self { left, right }
     }
 }
 
@@ -148,6 +211,35 @@ impl TileSettings {
             "weather" => self.weather,
             "cpu" => self.cpu,
             "ram" => self.ram,
+            "battery" => self.battery,
+            "net" => self.net,
+            "disk" => self.disk,
+            "gpu" => self.gpu,
+            "timer" => self.timer,
+            "pomodoro" => self.pomodoro,
+            "stopwatch" => self.stopwatch,
+            "notes" => self.notes,
+            "dayprog" => self.dayprog,
+            "monthprog" => self.monthprog,
+            "yearprog" => self.yearprog,
+            "theme" => self.theme,
+            "brightness" => self.brightness,
+            "recyclebin" => self.recyclebin,
+            "screenshot" => self.screenshot,
+            "recentshots" => self.recentshots,
+            "search" => self.search,
+            "worldclock" => self.worldclock,
+            "analog" => self.analog,
+            "flipclock" => self.flipclock,
+            "segclock" => self.segclock,
+            "daynum" => self.daynum,
+            "sun" => self.sun,
+            "hourly" => self.hourly,
+            "forecast" => self.forecast,
+            "metric" => self.metric,
+            "currency" => self.currency,
+            "screentime" => self.screentime,
+            "date" => self.date,
             "focus" => self.focus,
             "lang" => self.lang,
             "todo" => self.todo,
@@ -168,6 +260,35 @@ impl TileSettings {
             "weather" => self.weather = on,
             "cpu" => self.cpu = on,
             "ram" => self.ram = on,
+            "battery" => self.battery = on,
+            "net" => self.net = on,
+            "disk" => self.disk = on,
+            "gpu" => self.gpu = on,
+            "timer" => self.timer = on,
+            "pomodoro" => self.pomodoro = on,
+            "stopwatch" => self.stopwatch = on,
+            "notes" => self.notes = on,
+            "dayprog" => self.dayprog = on,
+            "monthprog" => self.monthprog = on,
+            "yearprog" => self.yearprog = on,
+            "theme" => self.theme = on,
+            "brightness" => self.brightness = on,
+            "recyclebin" => self.recyclebin = on,
+            "screenshot" => self.screenshot = on,
+            "recentshots" => self.recentshots = on,
+            "search" => self.search = on,
+            "worldclock" => self.worldclock = on,
+            "analog" => self.analog = on,
+            "flipclock" => self.flipclock = on,
+            "segclock" => self.segclock = on,
+            "daynum" => self.daynum = on,
+            "sun" => self.sun = on,
+            "hourly" => self.hourly = on,
+            "forecast" => self.forecast = on,
+            "metric" => self.metric = on,
+            "currency" => self.currency = on,
+            "screentime" => self.screentime = on,
+            "date" => self.date = on,
             "focus" => self.focus = on,
             "lang" => self.lang = on,
             "todo" => self.todo = on,
@@ -190,6 +311,35 @@ pub fn widget_label(id: &str) -> &'static str {
         "weather" => "Thời tiết",
         "cpu" => "CPU",
         "ram" => "RAM",
+        "battery" => "Pin",
+        "net" => "Tốc độ mạng",
+        "disk" => "Dung lượng trống",
+        "gpu" => "GPU",
+        "timer" => "Bấm giờ",
+        "pomodoro" => "Pomodoro",
+        "stopwatch" => "Đồng hồ bấm giờ",
+        "notes" => "Sổ ghi chú",
+        "dayprog" => "Tiến độ ngày",
+        "monthprog" => "Tiến độ tháng",
+        "yearprog" => "Tiến độ năm",
+        "theme" => "Sáng / tối",
+        "brightness" => "Độ sáng màn hình",
+        "recyclebin" => "Thùng rác",
+        "screenshot" => "Chụp màn hình",
+        "recentshots" => "Ảnh chụp gần đây",
+        "search" => "Tìm kiếm",
+        "worldclock" => "Giờ thế giới",
+        "analog" => "Đồng hồ kim",
+        "flipclock" => "Đồng hồ lật",
+        "segclock" => "Đồng hồ LED",
+        "daynum" => "Lịch ngày",
+        "sun" => "Mặt trời",
+        "hourly" => "Thời tiết theo giờ",
+        "forecast" => "Dự báo bốn ngày",
+        "metric" => "Bitcoin / USD",
+        "currency" => "Đổi tiền",
+        "screentime" => "Thời gian ứng dụng",
+        "date" => "Ngày tháng",
         "focus" => "Hẹn giờ tập trung",
         "lang" => "Ngôn ngữ bàn phím",
         "todo" => "Ghi chú",
@@ -205,6 +355,46 @@ pub fn widget_label(id: &str) -> &'static str {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn extended_widgets_default_off_and_roundtrip_with_local_content() {
+        let mut s:Settings=serde_json::from_str("{}").unwrap();
+        for id in &WIDGET_IDS[22..] {
+            assert!(!s.widget_shown(id));
+            assert!(!widget_label(id).is_empty());
+            assert_eq!(s.layout.left.iter().chain(&s.layout.right).filter(|v|v.as_str()==*id).count(),1,"{id}");
+            s.tiles.set(id,true);
+            assert!(s.widget_shown(id));
+        }
+        s.note="Ghi chú tiếng Việt 📝".into();
+        s.world_cities=vec![WorldCity::new("Delhi",330)];
+        s.currency_from="EUR".into();s.currency_to="VND".into();s.currency_amount=100.5;
+        let roundtrip:Settings=serde_json::from_slice(&serde_json::to_vec(&s).unwrap()).unwrap();
+        assert_eq!(s,roundtrip);
+        for id in &WIDGET_IDS[22..] {s.tiles.set(id,false);assert!(!s.widget_shown(id));}
+    }
+
+    #[test]
+    fn new_widgets_load_from_old_settings_and_persist_switches_and_positions() {
+        let mut s: Settings = serde_json::from_str(r#"{"tiles":{"cpu":false},"layout":{"left":["git"],"right":["clock"]}}"#).unwrap();
+        s.layout.normalize();
+        for id in ["battery", "net", "disk", "gpu", "timer", "date"] {
+            assert!(!s.widget_shown(id), "{id} defaults off for old settings");
+            assert!(!widget_label(id).is_empty());
+            assert!(!is_fixed_widget(id));
+            s.tiles.set(id, true);
+            assert!(s.widget_shown(id));
+            s.layout.place(id, true, 0);
+        }
+        let loaded: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(loaded, s);
+        assert!(!loaded.tiles.cpu);
+        for id in ["battery", "net", "disk", "gpu", "timer", "date"] {
+            assert!(loaded.layout.is_left(id));
+            s.tiles.set(id, false);
+            assert!(!s.widget_shown(id));
+        }
+    }
 
     #[test]
     fn widget_layout_normalize_fills_missing_and_drops_unknown() {
@@ -282,6 +472,13 @@ pub struct Settings {
     pub clock_style: String,
     /// Items of the To-do widget.
     pub todos: Vec<TodoItem>,
+    /// Latest local note, edited directly in its popup.
+    pub note: String,
+    /// City labels and fixed UTC offsets in minutes (editable in settings.json).
+    pub world_cities: Vec<WorldCity>,
+    pub currency_from: String,
+    pub currency_to: String,
+    pub currency_amount: f64,
 }
 
 impl Default for Settings {
@@ -309,6 +506,11 @@ impl Default for Settings {
             desktop_glass: false,
             clock_style: "compact".to_owned(),
             todos: Vec::new(),
+            note: String::new(),
+            world_cities: vec![WorldCity::new("Tokyo", 540), WorldCity::new("London", 0), WorldCity::new("New York", -300)],
+            currency_from: "USD".into(),
+            currency_to: "VND".into(),
+            currency_amount: 1.0,
         }
     }
 }
@@ -430,4 +632,11 @@ impl Settings {
         let i = DOCK_STYLES.iter().position(|(id, _)| *id == self.dock_style).unwrap_or(0);
         self.dock_style = DOCK_STYLES[(i + 1) % DOCK_STYLES.len()].0.to_owned();
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorldCity { pub name: String, pub offset_minutes: i32 }
+impl WorldCity {
+    pub fn new(name: &str, offset_minutes: i32) -> Self { Self { name: name.into(), offset_minutes } }
 }

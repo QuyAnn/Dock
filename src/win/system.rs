@@ -24,7 +24,7 @@ use windows::Win32::Media::Audio::{
     eConsole, eMultimedia, eRender, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+    CoCreateInstance, CLSCTX_ALL,
 };
 use windows::Win32::System::Registry::{
     RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD,
@@ -96,12 +96,8 @@ pub fn open_path(path: &std::path::Path) -> Result<()> {
 }
 
 thread_local! {
-    // Initialize COM/WinRT once per thread. Ignoring the result is fine:
-    // RPC_E_CHANGED_MODE means the thread was already initialized.
-    static COM_INIT: () = {
-        // SAFETY: plain init call with no pointers.
-        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-    };
+    // Drop the apartment when temporary polling threads exit.
+    static COM_INIT: super::com::Apartment = super::com::Apartment::mta();
 }
 
 fn init_com() {
@@ -213,7 +209,7 @@ pub fn watch_volume() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    std::thread::spawn(|| {
+    crate::background::spawn("volume-watch", 256 * 1024, || {
         let Ok(vol) = endpoint_volume() else { return };
         let cb: IAudioEndpointVolumeCallback = VolumeWatcher.into();
         // SAFETY: vol is live; cb stays alive with this thread (parked forever).

@@ -180,7 +180,7 @@ fn box_downscale(src: &IconBitmap, target: u32, crop: f32) -> IconBitmap {
             }
         }
     }
-    IconBitmap { w: target, h: target, rgba: out }
+    IconBitmap { w: target, h: target, rgba: out.into() }
 }
 
 /// Opens Grok Bot if needed, otherwise focuses an existing window.

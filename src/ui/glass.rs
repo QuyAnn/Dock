@@ -4,7 +4,6 @@ use windows::core::Result;
 use windows::Win32::Foundation::HWND;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::dock::RectF;
@@ -67,11 +66,15 @@ struct Piece {
     w: u32,
     h: u32,
     rgba: Vec<u8>,
+    // Keep the source identity allocated without retaining its pixel buffers.
+    // Otherwise a later backdrop could reuse its address and hit stale pieces.
+    source: std::sync::Weak<LiquidBitmap>,
 }
 
 thread_local! {
     static CTX: RefCell<Option<Ctx>> = const { RefCell::new(None) };
-    static PIECES: RefCell<HashMap<PieceKey, Arc<Piece>>> = RefCell::new(HashMap::new());
+    static PIECES: RefCell<crate::cache::ByteCache<PieceKey, Arc<Piece>>> =
+        RefCell::new(crate::cache::ByteCache::new(16 * 1024 * 1024));
 }
 
 /// Dock style for the tiles: 0 glass, 1 midnight, 2 black.
@@ -202,24 +205,28 @@ fn piece_for(rect: RectF, radius: f32, layer: Layer) -> Option<Arc<Piece>> {
         let ph = (rect.h * ctx.sy).round().max(1.0) as i32;
         let pr = radius * ctx.sy;
         let key: PieceKey = (Arc::as_ptr(&ctx.bg) as usize, px, py, pw, ph, (pr * 4.0).round() as i32, layer);
-        if let Some(p) = PIECES.with(|m| m.borrow().get(&key).cloned()) {
+        if let Some(p) = PIECES.with(|m| m.borrow_mut().get_mut(&key).cloned()) {
             return Some(p);
         }
-        let piece = Arc::new(render_piece(&ctx.bg, px, py, pw, ph, pr, ctx.sy, layer));
+        let mut piece = render_piece(&ctx.bg, px, py, pw, ph, pr, ctx.sy, layer);
+        piece.source = Arc::downgrade(&ctx.bg);
+        let piece = Arc::new(piece);
         PIECES.with(|m| {
             let mut m = m.borrow_mut();
-            // Magnified plates make transient sizes; keep the cache bounded.
-            if m.len() > 256 {
-                let live = key.0;
-                m.retain(|k, _| k.0 == live);
-                if m.len() > 192 {
-                    m.clear();
-                }
-            }
-            m.insert(key, piece.clone());
+            m.insert(key, piece.clone(), piece.rgba.len());
         });
         Some(piece)
     })
+}
+
+/// Drop CPU pieces belonging to a closed popup as well as its sampling context.
+pub fn release_backdrop(bg: &Arc<LiquidBitmap>) {
+    let address = Arc::as_ptr(bg) as usize;
+    PIECES.with(|m| m.borrow_mut().retain(|k, _| k.0 != address));
+    CTX.with(|c| {
+        let mut ctx = c.borrow_mut();
+        if ctx.as_ref().is_some_and(|c| Arc::ptr_eq(&c.bg, bg)) { *ctx = None; }
+    });
 }
 
 /// CPU render of one glass piece (straight RGBA, `pw` x `ph`).
@@ -311,7 +318,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         }
         out[o * 4 + 3] = alpha[o];
     }
-    Piece { w, h, rgba: out }
+    Piece { w, h, rgba: out, source: std::sync::Weak::new() }
 }
 
 
@@ -319,12 +326,12 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
 // Popup backdrop: the same wallpaper-based Liquid Glass as the dock, cut at the popup's position.
 // ---------------------------------------------------------------------------------------------
 
-static WALLPAPER: std::sync::Mutex<Option<Arc<crate::win::wallpaper::WallpaperPixels>>> = std::sync::Mutex::new(None);
+static WALLPAPER: std::sync::Mutex<Option<Arc<crate::win::wallpaper::WallpaperReference>>> = std::sync::Mutex::new(None);
 
-/// Keeps the decoded wallpaper so popups can render their own glass backdrop when they open.
+/// Retain the reload recipe, releasing the full desktop decode after making dock crops.
 pub fn set_wallpaper(wp: crate::win::wallpaper::WallpaperPixels) {
     if let Ok(mut slot) = WALLPAPER.lock() {
-        *slot = Some(Arc::new(wp));
+        *slot = Some(Arc::new(crate::win::wallpaper::WallpaperReference::from_pixels(wp)));
     }
 }
 
@@ -353,7 +360,8 @@ pub fn popup_backdrop(rect: windows::Win32::Foundation::RECT, monitor: windows::
         };
         return Some(Arc::new(super::liquid::render_frost(&grab, r, dpr)));
     }
-    let wp = WALLPAPER.lock().ok()?.clone()?;
+    let source = WALLPAPER.lock().ok()?.clone()?;
+    let wp = source.load().ok()?;
     // Same placement rules as the dock bar: a spanned wallpaper is addressed in virtual-screen
     // coordinates, every other fit mode per monitor.
     let (origin, screen) = if wp.mode == crate::win::wallpaper::FitMode::Span {
