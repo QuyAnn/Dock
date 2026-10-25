@@ -52,7 +52,7 @@ pub struct Tile {
 pub struct Icon {
     pub w: u32,
     pub h: u32,
-    pub rgba: Vec<u8>,
+    pub rgba: std::sync::Arc<Vec<u8>>,
 }
 
 /// How a tile is drawn.

@@ -15,7 +15,7 @@ use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICImagingFactory, WICBitmapDitherTypeNone,
     WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
 
 /// Fallback when Background is missing: the Electron default #1d2430.
@@ -45,6 +45,29 @@ pub struct WallpaperPixels {
     pub mode: FitMode,
     /// Desktop Background colour (letterbox fill for fit/center).
     pub background: [u8; 3],
+}
+
+/// Small reload recipe for the rarely used popup fallback. Dock crops retain
+/// their exact pixels; the full decoded desktop need not remain resident.
+pub struct WallpaperReference {
+    source: PathBuf,
+    width: u32,
+    mode: FitMode,
+    background: [u8; 3],
+}
+
+impl WallpaperReference {
+    pub fn from_pixels(wp: WallpaperPixels) -> Self {
+        Self { source: wp.source, width: wp.w, mode: wp.mode, background: wp.background }
+    }
+
+    pub fn load(&self) -> Result<WallpaperPixels> {
+        let (w, h, orig_w, orig_h, rgba) = decode(&self.source, self.width)?;
+        Ok(WallpaperPixels {
+            source: self.source.clone(), w, h, orig_w, orig_h, rgba,
+            mode: self.mode, background: self.background,
+        })
+    }
 }
 
 /// Identity of the wallpaper file and settings; used to detect changes without decoding.
@@ -213,10 +236,9 @@ pub(crate) fn thumbnail(path: &Path, max: u32) -> Result<(u32, u32, Vec<u8>)> {
 
 fn decode(path: &Path, max_w: u32) -> Result<(u32, u32, u32, u32, Vec<u8>)> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
-    // SAFETY: CoInitializeEx on this thread is idempotent (an already-initialized thread returns an
-    // ignorable HRESULT). `wide` is NUL-terminated and lives for the calls. Output pointers are locals.
+    let _com = super::com::Apartment::mta();
+    // SAFETY: `wide` is NUL-terminated and lives for the calls. Output pointers are locals.
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
         let decoder = factory.CreateDecoderFromFilename(
             PCWSTR(wide.as_ptr()),
@@ -248,5 +270,40 @@ fn decode(path: &Path, max_w: u32) -> Result<(u32, u32, u32, u32, Vec<u8>)> {
             conv.CopyPixels(std::ptr::null(), ow * 4, &mut buf)?;
         }
         Ok((dw, dh, ow, oh, buf))
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    #[test]
+    fn wallpaper_fallback_reload_preserves_decoded_pixels_and_placement() {
+        let path = std::env::temp_dir().join(format!("smartdock-wallpaper-test-{}.bmp", std::process::id()));
+        struct Temp(PathBuf);
+        impl Drop for Temp { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+        let _temp = Temp(path.clone());
+        // 2x2, 24-bit BMP with two padded rows of distinct colours.
+        let mut bmp = vec![0u8; 70];
+        bmp[..2].copy_from_slice(b"BM");
+        for (offset, value) in [(2, 70u32), (10, 54), (14, 40), (18, 2), (22, 2), (34, 16)] {
+            bmp[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        bmp[26..28].copy_from_slice(&1u16.to_le_bytes());
+        bmp[28..30].copy_from_slice(&24u16.to_le_bytes());
+        bmp[54..].copy_from_slice(&[0,0,255, 0,255,0, 0,0, 255,0,0, 255,255,255, 0,0]);
+        std::fs::write(&path, bmp).unwrap();
+        for max_w in [1, 2] {
+            let (w, h, orig_w, orig_h, rgba) = decode(&path, max_w).unwrap();
+            let expected = rgba.clone();
+            let reference = WallpaperReference::from_pixels(WallpaperPixels {
+                source: path.clone(), w, h, orig_w, orig_h, rgba,
+                mode: FitMode::Span, background: DEFAULT_BG,
+            });
+            let loaded = reference.load().unwrap();
+            assert_eq!(loaded.rgba, expected);
+            assert_eq!((loaded.w, loaded.h, loaded.orig_w, loaded.orig_h), (w, h, orig_w, orig_h));
+            assert_eq!(loaded.mode, FitMode::Span);
+            assert_eq!(loaded.background, DEFAULT_BG);
+        }
     }
 }

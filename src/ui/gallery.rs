@@ -304,6 +304,9 @@ pub fn draw(r: &mut Renderer, rect: RectF, entries: &[Entry]) -> Result<()> {
             r.draw_text("Không có widget nào khớp.", RectF { x: area.x, y: area.y + 10.0, w: area.w, h: 20.0 }, 12.0, MUTED, Align::Left)?;
         }
         for p in placed {
+            // Offscreen cards are already clipped; avoid building their glass
+            // and uploading bitmaps until their card or label enters the clip.
+            if p.card.y + CELL_H < area.y - 4.0 || p.card.y > area.y + area.h { continue; }
             let e = &entries[p.index];
             r.fill_rounded_rect(p.card, 16.0, CARD_BG)?;
             if e.on {
@@ -322,8 +325,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, entries: &[Entry]) -> Result<()> {
                 }
             }
             draw_tile(r, &e.view, p.tile, false)?;
-            let name = e.name.to_owned();
-            r.draw_text(&name, RectF { x: p.card.x - 6.0, y: p.card.y + CARD_H + 3.0, w: p.card.w + 12.0, h: 16.0 }, 10.5, MUTED, Align::Center)?;
+            r.draw_text(e.name, RectF { x: p.card.x - 6.0, y: p.card.y + CARD_H + 3.0, w: p.card.w + 12.0, h: 16.0 }, 10.5, MUTED, Align::Center)?;
         }
         Ok(())
     })();

@@ -126,7 +126,7 @@ pub fn start() {
     }
     STOPPED.store(false, Ordering::SeqCst);
     FAILED.store(false, Ordering::SeqCst);
-    let spawned = std::thread::Builder::new().name("tray-svc".into()).spawn(|| {
+    let spawned = std::thread::Builder::new().name("tray-svc".into()).stack_size(512 * 1024).spawn(|| {
         run();
         OUR_TRAY.store(0, Ordering::SeqCst);
         THREAD_ALIVE.store(false, Ordering::SeqCst);
@@ -659,7 +659,7 @@ fn hicon_rgba(icon: HICON) -> Option<IconBitmap> {
         let un = |c: u8| ((c as u32 * 255 + a / 2) / a).min(255) as u8;
         rgba.extend_from_slice(&[un(b[2]), un(b[1]), un(b[0]), a as u8]);
     }
-    any.then_some(IconBitmap { w: n as u32, h: n as u32, rgba })
+    any.then_some(IconBitmap { w: n as u32, h: n as u32, rgba: rgba.into() })
 }
 
 fn render_icon(icon: HICON, n: i32, bg: u8) -> Option<Vec<u8>> {

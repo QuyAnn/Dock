@@ -36,6 +36,15 @@ pub fn refresh_ai() -> Vec<AiUsage> {
     vec![claude(), codex(), cursor(), grok()]
 }
 
+pub fn refresh_ai_selected(enabled: [bool; 4]) -> Vec<AiUsage> {
+    let providers: [fn() -> AiUsage; 4] = [claude, codex, cursor, grok];
+    let names = ["Claude", "Codex", "Cursor", "Grok"];
+    // Keep provider slots stable: the UI also indexes this vector by provider.
+    providers.into_iter().enumerate().map(|(i, fetch)| {
+        if enabled[i] { fetch() } else { no_data(names[i], "") }
+    }).collect()
+}
+
 fn no_data(name: &str, status: &str) -> AiUsage {
     AiUsage { name: name.to_owned(), session_pct: f32::NAN, reset_text: status.to_owned(), windows: Vec::new(), cost_usd: None }
 }

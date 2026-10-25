@@ -31,6 +31,12 @@ fn path() -> Option<std::path::PathBuf> {
 static TODAY: LazyLock<Mutex<Today>> = LazyLock::new(|| Mutex::new(path().and_then(|p| std::fs::read(p).ok())
     .and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()));
 pub fn snapshot() -> Today { TODAY.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+/// The dock needs only the total, not a cloned and sorted per-app table on each paint.
+pub fn total_seconds() -> f64 {
+    let today = TODAY.lock().unwrap_or_else(|e| e.into_inner());
+    if today.date != Local::now().format("%Y-%m-%d").to_string() { return 0.0; }
+    today.apps.values().sum()
+}
 pub fn flush() {
     static WRITER:Mutex<()> = Mutex::new(());
     let _writer=WRITER.lock().unwrap_or_else(|e|e.into_inner());
@@ -47,6 +53,11 @@ pub fn flush() {
 pub struct Tracker { last: Option<(Instant,String)>, save_at: Option<Instant> }
 impl Tracker {
     pub fn sample(&mut self, enabled: bool) {
+        if !enabled {
+            self.last = None;
+            self.save_at = None;
+            return;
+        }
         let now = Instant::now();
         let local = Local::now(); let date = local.format("%Y-%m-%d").to_string();
         let mut today = TODAY.lock().unwrap_or_else(|e| e.into_inner());

@@ -21,8 +21,12 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn read(&mut self) -> WidgetStats {
+        self.read_selected(true, true, true, true)
+    }
+
+    pub fn read_selected(&mut self, battery_on: bool, net_on: bool, disk_on: bool, gpu_on: bool) -> WidgetStats {
         let now = Instant::now();
-        let net = match network_counters() {
+        let net = match net_on.then(network_counters).flatten() {
             Some(current) => {
                 let rate = self.net_previous.as_ref().map(|(at, prev)| network_rate(prev, &current, now.duration_since(*at).as_secs_f64()));
                 self.net_previous = Some((now, current));
@@ -31,14 +35,17 @@ impl Sampler {
             None => { self.net_previous = None; None }
         };
         // Missing counters/drivers are normal. Retry occasionally so a device can appear later.
-        if self.gpu.is_none() && self.gpu_retry.is_none_or(|at| now.duration_since(at).as_secs() >= 60) {
+        if !gpu_on {
+            self.gpu = None;
+            self.gpu_retry = None;
+        } else if self.gpu.is_none() && self.gpu_retry.is_none_or(|at| now.duration_since(at).as_secs() >= 60) {
             self.gpu = GpuQuery::open();
             self.gpu_retry = Some(now);
         }
         WidgetStats {
-            battery: battery(),
+            battery: battery_on.then(battery).flatten(),
             net,
-            disk_free: [disk_free(w!("C:\\")), disk_free(w!("D:\\"))],
+            disk_free: if disk_on { [disk_free(w!("C:\\")), disk_free(w!("D:\\"))] } else { [None; 2] },
             gpu_pct: self.gpu.as_mut().and_then(GpuQuery::read),
         }
     }
@@ -193,5 +200,20 @@ mod tests {
         add_engine(&mut e, "invalid", f64::NAN);
         assert_eq!(e.len(), 3);
         assert_eq!(e.values().copied().reduce(f64::max), Some(50.0));
+    }
+
+    #[test]
+    fn disabled_telemetry_never_opens_gpu_queries_and_discards_network_baseline() {
+        let mut sampler = Sampler::default();
+        sampler.net_previous = Some((Instant::now(), HashMap::new()));
+        sampler.gpu_retry = Some(Instant::now());
+        let sample = sampler.read_selected(false, false, false, false);
+        assert!(sampler.gpu.is_none());
+        assert!(sampler.gpu_retry.is_none());
+        assert!(sampler.net_previous.is_none());
+        assert!(sample.battery.is_none());
+        assert!(sample.net.is_none());
+        assert_eq!(sample.disk_free, [None; 2]);
+        assert!(sample.gpu_pct.is_none());
     }
 }

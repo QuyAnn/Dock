@@ -1,6 +1,6 @@
 //! Public, no-key endpoints. Each worker schedules with Instant so latency cannot cause drift.
 use std::collections::BTreeMap;
-use std::sync::{Mutex, LazyLock};
+use std::sync::{Arc, Mutex, LazyLock};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
@@ -13,8 +13,8 @@ pub struct Finance {
     pub btc_error: bool,
     pub rates_error: bool,
 }
-static DATA: LazyLock<Mutex<Finance>> = LazyLock::new(|| Mutex::new(Finance::default()));
-pub fn snapshot() -> Finance { DATA.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+static DATA: LazyLock<Mutex<Arc<Finance>>> = LazyLock::new(|| Mutex::new(Arc::new(Finance::default())));
+pub fn snapshot() -> Arc<Finance> { DATA.lock().unwrap_or_else(|e| e.into_inner()).clone() }
 fn positive(v: f64) -> Option<f64> { (v.is_finite() && v > 0.0).then_some(v) }
 pub fn parse_btc(v: &Value) -> Option<f64> { positive(v.pointer("/data/amount")?.as_str()?.parse().ok()?) }
 pub fn parse_rates(v: &Value) -> Option<BTreeMap<String,f64>> {
@@ -31,13 +31,15 @@ pub fn convert(rates: &BTreeMap<String,f64>, amount: f64, from: &str, to: &str) 
 pub fn refresh_btc() {
     let value = super::http::agent().get("https://api.coinbase.com/v2/prices/BTC-USD/spot").call().ok()
         .and_then(|r| r.into_json::<Value>().ok()).and_then(|v| parse_btc(&v));
-    let mut d = DATA.lock().unwrap_or_else(|e| e.into_inner()); d.btc_error = value.is_none();
+    let mut guard = DATA.lock().unwrap_or_else(|e| e.into_inner());
+    let d = Arc::make_mut(&mut guard); d.btc_error = value.is_none();
     if let Some(v) = value { d.btc = Some(v); d.btc_at = Some(Utc::now()); }
 }
 pub fn refresh_rates() {
     let value = super::http::agent().get("https://open.er-api.com/v6/latest/USD").call().ok()
         .and_then(|r| r.into_json::<Value>().ok()).and_then(|v| parse_rates(&v));
-    let mut d = DATA.lock().unwrap_or_else(|e| e.into_inner()); d.rates_error = value.is_none();
+    let mut guard = DATA.lock().unwrap_or_else(|e| e.into_inner());
+    let d = Arc::make_mut(&mut guard); d.rates_error = value.is_none();
     if let Some(v) = value { d.rates = v; d.rates_at = Some(Utc::now()); }
 }
 #[cfg(test)]

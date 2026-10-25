@@ -1,4 +1,4 @@
-//! The single popup window. Created on `show`, destroyed on `hide` (or when dismissed).
+//! The single popup HWND is reused; rendering resources live only while visible.
 //! Never activates: WS_EX_NOACTIVATE, so keyboard focus stays where it was.
 //! Dismissal is polled (GetAsyncKeyState / GetCursorPos) because the window never gets input focus.
 use std::cell::{Cell, RefCell};
@@ -219,6 +219,8 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
                 let _ = windows::Win32::Graphics::Dwm::DwmFlush();
             }
         }
+        pw.renderer.release();
+        if let Some(bg) = pw.backdrop.take() { super::glass::release_backdrop(&bg); }
         pw.backdrop = super::glass::popup_backdrop(rect, monitor, dpi);
         pw.renderer.resize(width_px, height_px, dpi);
         unsafe {
@@ -344,8 +346,7 @@ pub fn invalidate() {
     });
 }
 
-/// Hides the persistent popup window. Keeping its HWND and D2D resources alive makes the next open
-/// a synchronous move/resize/show operation, matching the Electron fast path.
+/// Keep the HWND for reuse; release its surface, GPU bitmaps and CPU backdrop on hide.
 pub fn hide() {
     if DRAGGING.with(Cell::get) {
         // SAFETY: drops our own capture; WM_CAPTURECHANGED finishes the drag.
@@ -354,11 +355,13 @@ pub fn hide() {
         }
     }
     POPUP.with(|p| {
-        if let Some(pw) = p.borrow().as_ref() {
+        if let Some(pw) = p.borrow_mut().as_mut() {
             unsafe {
                 let _ = KillTimer(pw.hwnd, TIMER_ID);
                 let _ = ShowWindow(pw.hwnd, SW_HIDE);
             }
+            pw.renderer.release();
+            if let Some(bg) = pw.backdrop.take() { super::glass::release_backdrop(&bg); }
         }
     });
     if let Some(f) = ON_HIDE.with(Cell::get) {
@@ -503,6 +506,8 @@ fn paint() {
         // Skip the frame if the state is already borrowed; the next WM_PAINT retries.
         let Ok(mut g) = p.try_borrow_mut() else { return };
         if let Some(pw) = g.as_mut() {
+            // A queued invalidation after hide must not recreate the released target.
+            if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(pw.hwnd) }.as_bool() { return; }
             let (w, h) = pw.renderer.size();
             let rect = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
             let backdrop = pw.backdrop.clone();
@@ -568,5 +573,38 @@ fn poll() {
     });
     if close {
         hide();
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    #[test]
+    fn hiding_discards_resources_and_hidden_paints_do_not_recreate_them() {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = unsafe { CreateWindowExW(
+            WS_EX_TOOLWINDOW, w!("STATIC"), w!("Popup hide test"), WS_POPUP,
+            0, 0, 100, 100, None, None, None, None,
+        ) }.unwrap();
+        let bg = Arc::new(LiquidBitmap { w: 2, h: 2, rgba: vec![255; 16], plain: Vec::new() });
+        let mut renderer = Renderer::new(hwnd, 100, 100, 96);
+        renderer.begin().unwrap();
+        super::super::glass::set_backdrop(Some(bg.clone()), 100.0, 100.0);
+        super::super::glass::draw_panel_glass(&mut renderer, RectF { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, 12.0).unwrap();
+        renderer.end().unwrap();
+        POPUP.with(|p| *p.borrow_mut() = Some(Popup {
+            hwnd, renderer, anchor: RectF::default(), mouse_down: false, esc_down: false,
+            backdrop: Some(bg.clone()),
+        }));
+        hide();
+        paint();
+        POPUP.with(|p| {
+            let p = p.borrow();
+            let pw = p.as_ref().unwrap();
+            assert!(pw.renderer.is_released());
+            assert!(pw.backdrop.is_none());
+        });
+        assert_eq!(Arc::strong_count(&bg), 1);
+        POPUP.with(|p| { p.borrow_mut().take(); });
     }
 }

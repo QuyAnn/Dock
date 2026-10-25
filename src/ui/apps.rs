@@ -66,7 +66,7 @@ pub fn set_pointer(x: Option<f32>) {
 struct AppIcon {
     w: u32,
     h: u32,
-    rgba: Vec<u8>,
+    rgba: std::sync::Arc<Vec<u8>>,
     /// Shadow bitmap, padded by `shadow_pad(w)` on each side.
     shadow: (u32, u32, Vec<u8>),
 }
@@ -80,7 +80,7 @@ impl AppIcon {
     fn from_composed(rgba: Vec<u8>) -> Self {
         let alpha: Vec<u8> = rgba.chunks_exact(4).map(|p| p[3]).collect();
         let shadow = soft_shadow(ICON_N, ICON_N, &alpha, SHADOW_SIGMA_PX, SHADOW_OPACITY, SHADOW_DY_PX);
-        Self { w: ICON_N, h: ICON_N, rgba, shadow }
+        Self { w: ICON_N, h: ICON_N, rgba: std::sync::Arc::new(rgba), shadow }
     }
 
     fn bitmap(&self) -> IconBitmap {

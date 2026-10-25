@@ -36,6 +36,21 @@ impl ControlState {
             dark: system::dark_mode(),
         }
     }
+
+    /// The fixed dock button uses only Wi-Fi and volume. Other hardware reads
+    /// are needed while the full panel is visible; keep its last snapshot idle.
+    pub fn refresh(&mut self, full_panel: bool) {
+        let (volume, muted) = system::get_volume();
+        self.volume = volume;
+        self.muted = muted;
+        self.wifi = system::wifi_enabled();
+        self.wifi_signal = system::wifi_signal();
+        if full_panel {
+            self.brightness = system::get_brightness();
+            self.bluetooth = system::bluetooth_enabled();
+            self.dark = system::dark_mode();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

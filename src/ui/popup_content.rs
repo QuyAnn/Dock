@@ -124,7 +124,7 @@ pub enum SettingsAction {
 
 
 thread_local! {
-    static CONTENT: RefCell<Option<(PopupKind, DataState)>> = const { RefCell::new(None) };
+    static CONTENT: RefCell<Option<(PopupKind, std::sync::Arc<DataState>)>> = const { RefCell::new(None) };
     static AI_PROVIDER: RefCell<Option<&'static str>> = const { RefCell::new(None) };
     /// Sample history per kind (Cpu, Ram), percent 0..=100, oldest first.
     static HISTORY: RefCell<Vec<(PopupKind, Vec<f32>)>> = const { RefCell::new(Vec::new()) };
@@ -147,8 +147,13 @@ pub fn set_history(kind: PopupKind, samples: Vec<f32>) {
 }
 
 /// Stores what `paint_content` draws. Call before `popup::show` and after each data refresh.
-pub fn set_content(kind: PopupKind, data: DataState) {
+pub fn set_content(kind: PopupKind, data: std::sync::Arc<DataState>) {
     CONTENT.with(|c| *c.borrow_mut() = Some((kind, data)));
+}
+
+pub fn clear_content() {
+    CONTENT.with(|c| *c.borrow_mut() = None);
+    HISTORY.with(|h| h.borrow_mut().clear());
 }
 
 pub fn set_settings(settings: crate::settings::Settings) {
@@ -750,7 +755,7 @@ pub fn update_media(media: Option<Media>, peak: f32) {
     MEDIA_PEAK.with(|p| p.set(peak));
     CONTENT.with(|c| {
         if let Some((_, data)) = c.borrow_mut().as_mut() {
-            data.media = media;
+            std::sync::Arc::make_mut(data).media = media;
         }
     });
 }

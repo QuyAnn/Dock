@@ -69,7 +69,13 @@ pub fn brightness_pending() -> bool { BRIGHTNESS_REQUEST.load(Ordering::Relaxed)
 #[derive(Clone, Debug)]
 pub struct Shot { pub path: PathBuf, pub w: u32, pub h: u32, pub rgba: Arc<Vec<u8>> }
 static SHOTS: Mutex<Vec<Shot>> = Mutex::new(Vec::new());
+static SHOT_SIGNATURE: Mutex<Vec<(SystemTime,u64,PathBuf)>> = Mutex::new(Vec::new());
+pub fn clear_shots() {
+    *SHOTS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+    SHOT_SIGNATURE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
 pub fn shots() -> Vec<Shot> { SHOTS.lock().unwrap_or_else(|e| e.into_inner()).clone() }
+pub fn has_shots() -> bool { !SHOTS.lock().unwrap_or_else(|e| e.into_inner()).is_empty() }
 pub fn screenshots_dir() -> Option<PathBuf> {
     use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Screenshots, KF_FLAG_DEFAULT};
     use windows::Win32::System::Com::CoTaskMemFree;
@@ -85,24 +91,26 @@ pub fn screenshots_dir() -> Option<PathBuf> {
 }
 pub fn refresh_shots() {
     let Some(dir) = screenshots_dir() else { return };
-    let mut files: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| {
+    let mut files = Vec::with_capacity(4);
+    for candidate in std::fs::read_dir(dir).into_iter().flatten().flatten().filter_map(|e| {
         let path = e.path();
         let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         if !["png","jpg","jpeg","bmp"].contains(&ext.as_str()) { return None; }
         let meta = e.metadata().ok()?;
         meta.is_file().then_some((meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len(), path))
-    }).collect();
-    files.sort_by(|a,b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
-    files.truncate(3);
+    }) {
+        files.push(candidate);
+        files.sort_by(|a,b| b.0.cmp(&a.0).then_with(|| a.2.cmp(&b.2)));
+        files.truncate(3);
+    }
     // Cache decoded thumbnails; avoid decoding unchanged files every five seconds.
-    static SIGNATURE: Mutex<Vec<(SystemTime,u64,PathBuf)>> = Mutex::new(Vec::new());
-    if *SIGNATURE.lock().unwrap_or_else(|e| e.into_inner()) == files { return; }
+    if *SHOT_SIGNATURE.lock().unwrap_or_else(|e| e.into_inner()) == files { return; }
     let next = files.iter().filter_map(|(_,_,path)| {
         let (w,h,rgba) = super::wallpaper::thumbnail(path, 320).ok()?;
         Some(Shot { path: path.clone(), w, h, rgba: Arc::new(rgba) })
     }).collect();
     *SHOTS.lock().unwrap_or_else(|e| e.into_inner()) = next;
-    *SIGNATURE.lock().unwrap_or_else(|e| e.into_inner()) = files;
+    *SHOT_SIGNATURE.lock().unwrap_or_else(|e| e.into_inner()) = files;
 }
 
 /// Percent-encode UTF-8 bytes, including shell punctuation. Never build a command line from input.

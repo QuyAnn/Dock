@@ -73,7 +73,7 @@ struct Thumb {
 /// The single peek window. Created once, then only shown/hidden/moved.
 struct Host {
     hwnd: HWND,
-    /// D2D surface for the glass panel and titles (window is reused, so is the renderer).
+    /// Lightweight renderer; its D2D surface and bitmap cache are released on hide.
     renderer: Renderer,
     visible: bool,
     thumbs: Vec<Thumb>,
@@ -307,6 +307,7 @@ pub fn hide() {
         let Ok(mut g) = h.try_borrow_mut() else { return None };
         let host = g.as_mut()?;
         unregister_all(&mut host.thumbs);
+        host.renderer.release();
         let was = host.visible;
         host.visible = false;
         host.outside_ms = 0;
@@ -447,7 +448,7 @@ fn paint(hwnd: HWND, _hdc: HDC) {
         let Some(host) = g.as_mut() else {
             return;
         };
-        if host.hwnd != hwnd {
+        if host.hwnd != hwnd || !host.visible {
             return;
         }
         let scale = dpi::scale(host.renderer.dpi());

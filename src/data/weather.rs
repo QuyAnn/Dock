@@ -89,6 +89,7 @@ fn parse_weather(j: &Value, location: String) -> Option<Weather> {
         .get("time")?
         .as_array()?
         .iter()
+        .take(5)
         .enumerate()
         .filter_map(|(i, date)| {
             Some(Day {
@@ -105,7 +106,7 @@ fn parse_weather(j: &Value, location: String) -> Option<Weather> {
         Some(chrono::NaiveDateTime::parse_from_str(v.as_str()?, "%Y-%m-%dT%H:%M").ok()?.and_utc().timestamp() - utc_offset_seconds as i64)
     };
     let hourly = j.get("hourly").and_then(|h| {
-        Some(h.get("time")?.as_array()?.iter().enumerate().filter_map(|(i,time)| {
+        Some(h.get("time")?.as_array()?.iter().take(5 * 24).enumerate().filter_map(|(i,time)| {
             Some(Hour { at: timestamp(time)?, temp: num(h.get("temperature_2m")?.get(i))?, code: code(h.get("weather_code")?.get(i))? })
         }).collect())
     }).unwrap_or_default();
@@ -155,6 +156,7 @@ fn resolve(location: &str) -> Option<Place> {
         lon: r.get("longitude")?.as_f64()?,
         name: r.get("name")?.as_str()?.to_owned(),
     };
+    if cache.len() >= 32 { cache.remove(0); }
     cache.push((location.to_owned(), place.clone()));
     Some(place)
 }

@@ -159,7 +159,7 @@ pub struct Renderer {
     brush: Option<ID2D1SolidColorBrush>,
     /// GPU bitmaps reused across frames (liquid backdrop, app icons). Keyed by the source
     /// buffer address/size plus a content fingerprint; dropped with the render target.
-    bitmaps: std::collections::HashMap<(usize, usize, u32, u32, u64), (ID2D1Bitmap, u64)>,
+    bitmaps: crate::cache::ByteCache<(usize, usize, u32, u32, u64), (ID2D1Bitmap, u64)>,
     frame: u64,
 }
 
@@ -173,7 +173,7 @@ impl Renderer {
             dpi: dpi.max(96),
             target: None,
             brush: None,
-            bitmaps: std::collections::HashMap::new(),
+            bitmaps: crate::cache::ByteCache::new(32 * 1024 * 1024),
             frame: 0,
         }
     }
@@ -209,6 +209,9 @@ impl Renderer {
         self.brush = None;
         self.target = None;
     }
+
+    #[cfg(test)]
+    pub fn is_released(&self) -> bool { self.target.is_none() && self.brush.is_none() }
 
     fn parts(&mut self) -> Result<(&ID2D1HwndRenderTarget, &ID2D1SolidColorBrush)> {
         if self.target.is_none() {
@@ -261,7 +264,7 @@ impl Renderer {
         }
         self.frame += 1;
         // Forget bitmaps not drawn in the last 120 frames (closed apps, old wallpaper, temp buffers).
-        if self.frame % 32 == 0 || self.bitmaps.len() > 256 {
+        if self.frame % 32 == 0 {
             let f = self.frame;
             self.bitmaps.retain(|_, (_, used)| f.saturating_sub(*used) < 120);
         }
@@ -590,7 +593,7 @@ impl Renderer {
             Some(b) => b,
             None => {
                 let b = self.create_bitmap(w, h, rgba)?;
-                self.bitmaps.insert(key, (b.clone(), frame));
+                self.bitmaps.insert(key, (b.clone(), frame), rgba.len());
                 b
             }
         };
@@ -955,5 +958,52 @@ pub fn reset_dwm_transparency(hwnd: HWND) {
     // SAFETY: `m` lives for the call.
     unsafe {
         let _ = DwmExtendFrameIntoClientArea(hwnd, &m);
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    #[test]
+    fn all_tiles_and_popups_render_after_target_release_and_bitmap_eviction() {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let hwnd = unsafe { CreateWindowExW(
+            WS_EX_TOOLWINDOW, w!("STATIC"), w!("Renderer lifecycle test"), WS_POPUP,
+            0, 0, 1000, 800, None, None, None, None,
+        ) }.unwrap();
+        struct Window(HWND);
+        impl Drop for Window { fn drop(&mut self) { unsafe { let _ = DestroyWindow(self.0); } } }
+        let _window = Window(hwnd);
+        let mut r = Renderer::new(hwnd, 1000, 800, 96);
+        let settings = crate::settings::Settings::default();
+        let data = crate::tiles::DataState::default();
+        let control = crate::ControlState::default();
+        let stats = crate::Stats::default();
+        // Force continuous evictions without changing any drawing paths or pixels.
+        r.bitmaps = crate::cache::ByteCache::new(8);
+        for _ in 0..2 {
+            for id in crate::settings::WIDGET_IDS {
+                r.begin().unwrap();
+                let v = crate::tile_view(id, &data, &control, &stats, 0.0, &settings);
+                crate::dock::draw_tile(&mut r, &v, RectF { x: 5.0, y: 5.0, w: 250.0, h: 42.0 }, false).unwrap();
+                // Each upload exceeds the test budget and must still draw successfully.
+                r.draw_bitmap(2, 2, &[255; 16], RectF { x: 5.0, y: 60.0, w: 20.0, h: 20.0 }).unwrap();
+                r.end().unwrap();
+            }
+            use crate::popup_content::PopupKind;
+            for kind in [PopupKind::Git, PopupKind::Ai, PopupKind::Weather, PopupKind::Media,
+                PopupKind::Clock, PopupKind::Cpu, PopupKind::Ram, PopupKind::Settings, PopupKind::Todo] {
+                r.begin().unwrap();
+                crate::popup_content::draw_popup(&mut r, kind, RectF { x: 0.0, y: 0.0, w: 460.0, h: 700.0 }, &data).unwrap();
+                r.end().unwrap();
+            }
+            r.begin().unwrap();
+            crate::control_center::draw(&mut r, RectF { x: 0.0, y: 0.0, w: 296.0, h: 500.0 }, &control, None).unwrap();
+            r.end().unwrap();
+            r.release();
+            assert!(r.target.is_none());
+            assert!(r.brush.is_none());
+            r.resize(1000, 800, 144);
+        }
     }
 }

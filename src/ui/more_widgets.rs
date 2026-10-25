@@ -45,8 +45,8 @@ pub fn view(id:&str,d:&DataState,s:&Settings) -> Option<TileView> {
                 accent:if rest {GREEN} else {ORANGE}, sub:if running {"▶"} else {"Ⅱ"}.into(),
                 ..TileView::card(format!("{} · VÒNG {round}",if rest {"NGHỈ"} else {"TẬP TRUNG"}),crate::data::timer::time_text(left)) }
         }
-        "stopwatch" => { let (elapsed,running,laps) = p::watch(); TileView {
-            sub:format!("{} · {}",if running {"▶"} else {"Ⅱ"},laps.len()), ..TileView::card("BẤM GIỜ",p::watch_text(elapsed)) } }
+        "stopwatch" => { let (elapsed,running,lap_count) = p::watch_summary(); TileView {
+            sub:format!("{} · {}",if running {"▶"} else {"Ⅱ"},lap_count), ..TileView::card("BẤM GIỜ",p::watch_text(elapsed)) } }
         "notes" => TileView { style:Style::Note,sub:if s.note.is_empty() {"Bấm để viết ghi chú".into()} else {s.note.replace(['\r','\n']," ")},..TileView::card("Sổ ghi chú","") },
         "dayprog"|"monthprog"|"yearprog" => {
             let (day,month,year,days) = calendar_progress::fractions(now.naive_local());
@@ -59,7 +59,7 @@ pub fn view(id:&str,d:&DataState,s:&Settings) -> Option<TileView> {
             ..TileView::card("ĐỘ SÁNG",tools::brightness().map_or("Không hỗ trợ".into(),|n|format!("{n}%"))) },
         "recyclebin" => { let b=crate::win::shellinfo::info(); TileView {style:Style::Metrics,sub:crate::data::widgets::size_text(b.bin_bytes),..TileView::card("THÙNG RÁC",format!("{} mục",b.bin_items))} }
         "screenshot" => TileView::card("CHỤP MÀN HÌNH","✂  Chụp vùng"),
-        "recentshots" => TileView::card("ẢNH CHỤP GẦN ĐÂY",if tools::shots().is_empty() {"Chưa có ảnh"} else {""}),
+        "recentshots" => TileView::card("ẢNH CHỤP GẦN ĐÂY",if !tools::has_shots() {"Chưa có ảnh"} else {""}),
         "search" => TileView::card("TÌM KIẾM","Web / thư mục…"),
         "worldclock" => TileView::card("GIỜ THẾ GIỚI",""),
         "analog"|"flipclock"|"segclock" => TileView::card("",now.format("%H:%M").to_string()),
@@ -70,7 +70,7 @@ pub fn view(id:&str,d:&DataState,s:&Settings) -> Option<TileView> {
         "currency" => { let f=finance::snapshot(); TileView {style:Style::Metrics,
             sub:finance::convert(&f.rates,s.currency_amount,&s.currency_from,&s.currency_to).map_or("Chưa có tỷ giá".into(),|n|format!("{n:.2} {}{}",s.currency_to,if f.rates_error {" · cũ"} else {""})),
             ..TileView::card("ĐỔI TIỀN",format!("{} {}",s.currency_amount,s.currency_from))} }
-        "screentime" => { let rows=crate::data::screentime::snapshot().ranked(); let secs=rows.iter().map(|(_,v)|v).sum::<f64>();
+        "screentime" => { let secs=crate::data::screentime::total_seconds();
             TileView::card("MÀN HÌNH HÔM NAY",duration_text(secs)) }
         _ => return None,
     };
@@ -415,7 +415,7 @@ pub fn click(id:&str,x:f32,y:f32,rc:RectF) -> Action {
                 return match (lx/((w+6.0)/3.0)) as usize {0=>Action::WatchToggle,1=>Action::Lap,_=>Action::WatchReset};
             }
             if inside(rect(0.0,364.0,w,28.0),lx,ly) {
-                let pages=p::watch().2.len().div_ceil(8).max(1);
+                let pages=p::watch_summary().2.div_ceil(8).max(1);
                 LAP_PAGE.with(|v|v.set(if lx<w/2.0 {v.get().saturating_sub(1)} else {(v.get()+1).min(pages-1)}));
             }
         }

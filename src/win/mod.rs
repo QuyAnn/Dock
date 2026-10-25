@@ -1,5 +1,6 @@
 //! Win32 platform layer. Each file owns one concern; see docs in each.
 pub mod kbd;
+pub mod com;
 pub mod appbar;   // AppBar registration, dock placement, taskbar hide/restore + crash recovery
 pub mod dpi;      // per-monitor-v2 awareness and DIP/physical-pixel conversions
 pub mod monitors; // EnumDisplayMonitors + primary/secondary selection (unit-tested)

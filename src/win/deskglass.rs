@@ -39,7 +39,9 @@ const RADIUS: f32 = 0.24;
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
     if on && !STARTED.swap(true, Ordering::SeqCst) {
-        thread::spawn(run);
+        if !crate::background::spawn("desktop-glass", 512 * 1024, run) {
+            STARTED.store(false, Ordering::SeqCst);
+        }
     }
 }
 

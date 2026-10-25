@@ -21,6 +21,10 @@ pub fn watch() -> (Duration, bool, Vec<Duration>) {
     let s = WATCH.lock().unwrap_or_else(|e| e.into_inner());
     (s.at(Instant::now()), s.start.is_some(), s.laps.clone())
 }
+pub fn watch_summary() -> (Duration, bool, usize) {
+    let s = WATCH.lock().unwrap_or_else(|e| e.into_inner());
+    (s.at(Instant::now()), s.start.is_some(), s.laps.len())
+}
 pub fn watch_toggle() { WATCH.lock().unwrap_or_else(|e| e.into_inner()).toggle(Instant::now()); }
 pub fn lap() { WATCH.lock().unwrap_or_else(|e| e.into_inner()).lap(Instant::now()); }
 pub fn watch_reset() { *WATCH.lock().unwrap_or_else(|e| e.into_inner()) = Stopwatch::default(); }
