@@ -18,6 +18,7 @@ pub struct ControlState {
     pub brightness: Option<u32>, // percent, None when DDC/CI is unsupported
     pub wifi: Option<bool>,     // None when there is no Wi-Fi radio
     pub wifi_signal: Option<u8>, // WLAN signal quality 0..=100 while connected
+    pub ethernet: bool,         // wired adapter with a cable connected
     pub bluetooth: Option<bool>, // None when there is no Bluetooth radio
     pub dark: bool,
 }
@@ -32,6 +33,7 @@ impl ControlState {
             brightness: system::get_brightness(),
             wifi: system::wifi_enabled(),
             wifi_signal: system::wifi_signal(),
+            ethernet: system::ethernet_connected(),
             bluetooth: system::bluetooth_enabled(),
             dark: system::dark_mode(),
         }
@@ -45,6 +47,7 @@ impl ControlState {
         self.muted = muted;
         self.wifi = system::wifi_enabled();
         self.wifi_signal = system::wifi_signal();
+        self.ethernet = system::ethernet_connected();
         if full_panel {
             self.brightness = system::get_brightness();
             self.bluetooth = system::bluetooth_enabled();
@@ -74,6 +77,66 @@ pub enum ControlAction {
     OpenSmartDockSettings,
     /// Bottom shortcut: opens a URI such as calculator: or ms-screenclip:.
     Launch(&'static str),
+    /// Opens the in-panel list of audio output devices (UI thread).
+    PickOutput,
+    /// Leaves the output list without changing anything (UI thread).
+    CloseOutputs,
+    /// Makes output device `n` of the open list the default.
+    SetOutput(usize),
+}
+
+thread_local! {
+    /// Output devices while the picker is open (UI thread only); None shows the normal panel.
+    static OUTPUTS: std::cell::RefCell<Option<Vec<system::AudioOutput>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn outputs_open() -> bool {
+    OUTPUTS.with(|o| o.borrow().is_some())
+}
+
+pub fn show_outputs(list: Vec<system::AudioOutput>) {
+    OUTPUTS.with(|o| *o.borrow_mut() = Some(list));
+}
+
+pub fn hide_outputs() {
+    OUTPUTS.with(|o| *o.borrow_mut() = None);
+}
+
+/// Id of device `n` in the open list.
+pub fn output_id(n: usize) -> Option<String> {
+    OUTPUTS.with(|o| o.borrow().as_ref().and_then(|l| l.get(n).map(|d| d.id.clone())))
+}
+
+const ROW_H: f32 = 44.0;
+
+fn outputs_back(rect: RectF) -> RectF {
+    RectF { x: rect.x + PAD, y: rect.y + PAD, w: rect.w - 2.0 * PAD, h: 30.0 }
+}
+
+fn output_row(rect: RectF, i: usize) -> RectF {
+    RectF { x: rect.x + PAD, y: rect.y + PAD + 40.0 + i as f32 * (ROW_H + 6.0), w: rect.w - 2.0 * PAD, h: ROW_H }
+}
+
+fn draw_outputs(r: &mut Renderer, rect: RectF, list: &[system::AudioOutput]) -> Result<()> {
+    let back = outputs_back(rect);
+    r.draw_text_styled("‹  Đầu ra âm thanh", back, 13.0, TEXT, Align::Left, TextStyle::Bold)?;
+    if list.is_empty() {
+        return r.draw_text("Không tìm thấy thiết bị", output_row(rect, 0), 11.5, SUB, Align::Center);
+    }
+    for (i, d) in list.iter().enumerate() {
+        let row = output_row(rect, i);
+        draw_module(r, row, 16.0)?;
+        let dot = RectF { x: row.x + 10.0, y: row.y + (row.h - 24.0) / 2.0, w: 24.0, h: 24.0 };
+        draw_glyph(r, dot, Glyph::Speaker(1.0, false), 13.0, if d.is_default { TEXT } else { SUB })?;
+        let text = RectF { x: row.x + 42.0, y: row.y, w: row.w - 42.0 - 34.0, h: row.h };
+        r.draw_text_styled(&d.name, text, 11.5, TEXT, Align::Left, if d.is_default { TextStyle::Bold } else { TextStyle::Ui })?;
+        if d.is_default {
+            let c = RectF { x: row.x + row.w - 30.0, y: row.y + (row.h - 18.0) / 2.0, w: 18.0, h: 18.0 };
+            r.fill_rounded_rect(c, 9.0, ACCENT)?;
+            r.draw_text_styled("✓", c, 11.0, WHITE, Align::Center, TextStyle::Bold)?;
+        }
+    }
+    Ok(())
 }
 
 /// Runs the system call for `action`. Blocking. Toggles re-read the live radio/mute state
@@ -105,6 +168,8 @@ pub fn apply(action: ControlAction) -> Result<()> {
         // Handled on the UI thread by the caller (it swaps the popup to Settings).
         ControlAction::OpenSmartDockSettings => Ok(()),
         ControlAction::Launch(uri) => system::open_settings(uri),
+        // Output picker actions touch UI-thread state; the caller handles them.
+        ControlAction::PickOutput | ControlAction::CloseOutputs | ControlAction::SetOutput(_) => Ok(()),
     }
 }
 
@@ -357,22 +422,27 @@ fn radio_sub(v: Option<bool>) -> &'static str {
 
 /// Draws the whole panel into `rect`.
 pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&Media>) -> Result<()> {
+    if let Some(done) = OUTPUTS.with(|o| o.borrow().as_ref().map(|l| draw_outputs(r, rect, l))) {
+        return done;
+    }
     let l = layout(rect);
 
+    // Wired only: the tile reports the cable instead of the Wi-Fi radio.
+    let wired = sficons::Wifi::from_net(state.wifi, state.wifi_signal, state.ethernet) == sficons::Wifi::Ethernet;
     draw_toggle(
         r,
         l.wifi,
         Toggle {
-            glyph: Glyph::Wifi(match sficons::Wifi::from_state(state.wifi, state.wifi_signal) {
+            glyph: Glyph::Wifi(match sficons::Wifi::from_net(state.wifi, state.wifi_signal, state.ethernet) {
                 // The round button already shows on/off; keep the fan full while on.
                 sficons::Wifi::Disconnected if state.wifi == Some(true) => sficons::Wifi::Bars(3),
                 w => w,
             }),
-            label: "Wi-Fi",
-            sub: radio_sub(state.wifi),
-            on: state.wifi == Some(true),
-            enabled: state.wifi.is_some(),
-            dim_off: true,
+            label: if wired { "Ethernet" } else { "Wi-Fi" },
+            sub: if wired { "Đã kết nối" } else { radio_sub(state.wifi) },
+            on: wired || state.wifi == Some(true),
+            enabled: wired || state.wifi.is_some(),
+            dim_off: !wired,
         },
     )?;
     // Bluetooth and network: two round buttons under the Wi-Fi tile.
@@ -408,7 +478,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     // Volume: the small icon at left toggles mute.
     let vol = state.volume.clamp(0.0, 1.0);
     let vol_text = if state.muted { "Đã tắt tiếng".to_string() } else { format!("{}%", (vol * 100.0).round() as u32) };
-    draw_cap(r, l.volume, "Âm thanh", &vol_text)?;
+    draw_cap(r, l.volume, "Âm thanh  ›", &vol_text)?;
     draw_capsule(r, slider_of(l.volume), vol, true, Glyph::Speaker(vol, state.muted), Glyph::Speaker(1.0, false))?;
 
     for (rc, (glyph, _)) in l.shortcuts.into_iter().zip(SHORTCUTS) {
@@ -455,6 +525,9 @@ pub enum Slider {
 
 /// Slider under (x, y) for a drag start (the volume glyph is the mute button, not the track).
 pub fn slider_at(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Slider> {
+    if outputs_open() {
+        return None;
+    }
     let l = layout(rect);
     let vol = slider_of(l.volume);
     if contains(vol, x, y) && !contains(icon_of(vol), x, y) {
@@ -491,6 +564,16 @@ pub fn slider_value(slider: Slider, x: f32, rect: RectF) -> f32 {
 
 /// Maps a click at (x, y) to an action. None when the click hits nothing actionable.
 pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<ControlAction> {
+    if let Some(hit) = OUTPUTS.with(|o| {
+        o.borrow().as_ref().map(|l| {
+            if contains(outputs_back(rect), x, y) {
+                return Some(ControlAction::CloseOutputs);
+            }
+            (0..l.len()).find(|&i| contains(output_row(rect, i), x, y)).map(ControlAction::SetOutput)
+        })
+    }) {
+        return hit;
+    }
     let l = layout(rect);
     // Only the round icon toggles a radio; the rest of the tile opens its list / settings page.
     if contains(round_of(l.wifi), x, y) {
@@ -515,12 +598,16 @@ pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Con
         return Some(ControlAction::Launch("ms-settings:display"));
     }
     if contains(l.sound, x, y) {
-        return Some(ControlAction::OpenSoundSettings);
+        return Some(ControlAction::PickOutput);
     }
     for (rc, (_, uri)) in l.shortcuts.into_iter().zip(SHORTCUTS) {
         if contains(rc, x, y) {
             return Some(ControlAction::Launch(uri));
         }
+    }
+    // The "Âm thanh ›" title row opens the output device list.
+    if contains(head_of(l.volume), x, y) {
+        return Some(ControlAction::PickOutput);
     }
     let vol = slider_of(l.volume);
     if contains(icon_of(vol), x, y) {

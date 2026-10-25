@@ -390,3 +390,114 @@ pub fn bluetooth_enabled() -> Option<bool> {
 pub fn set_bluetooth(on: bool) -> Result<()> {
     set_radio(RadioKind::Bluetooth, on)
 }
+
+// ---------- audio output devices ----------
+
+/// An active playback endpoint.
+#[derive(Clone, Debug)]
+pub struct AudioOutput {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Undocumented but stable COM interface (used by every "audio switcher" tool); only
+/// `SetDefaultEndpoint` is called, the other slots just keep the vtable layout right.
+#[windows::core::interface("f8679f50-850a-41cf-9c72-430f290290c8")]
+unsafe trait IPolicyConfig: windows::core::IUnknown {
+    fn GetMixFormat(&self, a: *const std::ffi::c_void, b: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    fn GetDeviceFormat(&self, a: *const std::ffi::c_void, b: i32, c: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    fn ResetDeviceFormat(&self, a: *const std::ffi::c_void) -> windows::core::HRESULT;
+    fn SetDeviceFormat(&self, a: *const std::ffi::c_void, b: *mut std::ffi::c_void, c: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    fn GetProcessingPeriod(&self, a: *const std::ffi::c_void, b: i32, c: *mut i64, d: *mut i64) -> windows::core::HRESULT;
+    fn SetProcessingPeriod(&self, a: *const std::ffi::c_void, b: *mut i64) -> windows::core::HRESULT;
+    fn GetShareMode(&self, a: *const std::ffi::c_void, b: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    fn SetShareMode(&self, a: *const std::ffi::c_void, b: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    fn GetPropertyValue(&self, a: *const std::ffi::c_void, b: i32, c: *const std::ffi::c_void, d: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    fn SetPropertyValue(&self, a: *const std::ffi::c_void, b: i32, c: *const std::ffi::c_void, d: *mut std::ffi::c_void) -> windows::core::HRESULT;
+    fn SetDefaultEndpoint(&self, id: windows::core::PCWSTR, role: i32) -> windows::core::HRESULT;
+    fn SetEndpointVisibility(&self, a: *const std::ffi::c_void, b: i32) -> windows::core::HRESULT;
+}
+
+const CLSID_POLICY_CONFIG: windows::core::GUID = windows::core::GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+
+/// Active output devices with the default one flagged. Empty on failure.
+pub fn list_outputs() -> Vec<AudioOutput> {
+    use windows::Win32::Media::Audio::DEVICE_STATE_ACTIVE;
+    use windows::Win32::System::Com::{CoTaskMemFree, STGM_READ};
+    use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
+    init_com();
+    let read = || -> Result<Vec<AudioOutput>> {
+        let key = PROPERTYKEY {
+            fmtid: windows::core::GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
+            pid: 14,
+        };
+        // SAFETY: COM is initialized; every interface/pointer below is used only while live.
+        unsafe {
+            let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let default_id = enumerator
+                .GetDefaultAudioEndpoint(eRender, eConsole)
+                .ok()
+                .and_then(|d| d.GetId().ok())
+                .map(|p| {
+                    let s = p.to_string().unwrap_or_default();
+                    CoTaskMemFree(Some(p.as_ptr().cast()));
+                    s
+                })
+                .unwrap_or_default();
+            let devices = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+            let mut out = Vec::new();
+            for i in 0..devices.GetCount()? {
+                let dev = devices.Item(i)?;
+                let id_p = dev.GetId()?;
+                let id = id_p.to_string().unwrap_or_default();
+                CoTaskMemFree(Some(id_p.as_ptr().cast()));
+                let name = dev
+                    .OpenPropertyStore(STGM_READ)
+                    .and_then(|store| store.GetValue(&key))
+                    .map(|pv| {
+                        let s = pv.to_string();
+                        s
+                    })
+                    .unwrap_or_else(|_| "Thiết bị âm thanh".to_string());
+                out.push(AudioOutput { is_default: id == default_id, id, name });
+            }
+            Ok(out)
+        }
+    };
+    read().unwrap_or_default()
+}
+
+/// Makes `id` the default output for all roles (console, multimedia, communications).
+pub fn set_default_output(id: &str) -> Result<()> {
+    init_com();
+    let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the calls.
+    unsafe {
+        let cfg: IPolicyConfig = CoCreateInstance(&CLSID_POLICY_CONFIG, None, CLSCTX_ALL)?;
+        for role in 0..3 {
+            cfg.SetDefaultEndpoint(windows::core::PCWSTR(wide.as_ptr()), role).ok()?;
+        }
+    }
+    Ok(())
+}
+
+/// True when a wired Ethernet adapter is up with a cable connected (hardware interfaces only,
+/// so virtual switches, VPNs and loopback do not count).
+pub fn ethernet_connected() -> bool {
+    use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2};
+    let mut table = ptr::null_mut();
+    // SAFETY: Windows allocates the table with NumEntries rows; it is freed after the scan.
+    unsafe {
+        if GetIfTable2(&mut table).is_err() {
+            return false;
+        }
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize);
+        // Type 6 = IF_TYPE_ETHERNET_CSMACD (Wi-Fi is 71); MediaConnectState 1 = connected.
+        let found = rows
+            .iter()
+            .any(|r| r.Type == 6 && r.OperStatus.0 == 1 && r.MediaConnectState.0 == 1 && r.InterfaceAndOperStatusFlags._bitfield & 1 != 0);
+        FreeMibTable(table.cast());
+        found
+    }
+}

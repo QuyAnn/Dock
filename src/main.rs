@@ -1106,7 +1106,7 @@ fn tile_view(
         "cc" => TileView {
             style: Style::Button,
             status: Some(dock::StatusIcons {
-                wifi: ui::sficons::Wifi::from_state(control.wifi, control.wifi_signal),
+                wifi: ui::sficons::Wifi::from_net(control.wifi, control.wifi_signal, control.ethernet),
                 volume: control.volume,
                 muted: control.muted,
             }),
@@ -1878,6 +1878,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             let state = APP.with(|a| a.borrow().as_ref().map(|app| app.shared.control.lock().unwrap().clone()));
             glass::set_panel_light(true);
             CONTROL_VIEW.with(|c| *c.borrow_mut() = state);
+            control_center::hide_outputs();
             POPUP_W_CUR.with(|w| w.set(CONTROL_POPUP_W));
             if popup::show(anchor, CONTROL_POPUP_W, control_center::HEIGHT as i32).is_ok() {
                 set_open(Some(which));
@@ -2125,6 +2126,29 @@ fn on_popup_click(x: f32, y: f32) {
     let control = CONTROL_VIEW.with(|c| c.borrow().clone());
     if let Some(state) = control {
         if let Some(action) = control_center::hit_test(x, y, rect, &state) {
+            match action {
+                control_center::ControlAction::PickOutput => {
+                    control_center::show_outputs(win::system::list_outputs());
+                    popup::repaint_now();
+                    return;
+                }
+                control_center::ControlAction::CloseOutputs => {
+                    control_center::hide_outputs();
+                    popup::repaint_now();
+                    return;
+                }
+                control_center::ControlAction::SetOutput(n) => {
+                    if let Some(id) = control_center::output_id(n) {
+                        control_center::hide_outputs();
+                        popup::repaint_now();
+                        thread::spawn(move || {
+                            let _ = win::system::set_default_output(&id);
+                        });
+                    }
+                    return;
+                }
+                _ => {}
+            }
             if action == control_center::ControlAction::OpenSmartDockSettings {
                 log("settings: opened from the Control Center gear");
                 open_settings_popup();
