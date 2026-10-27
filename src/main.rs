@@ -3066,7 +3066,7 @@ fn handle_file_drop(hwnd: HWND, wparam: usize) {
         win::shellinfo::refresh();
         // SAFETY: hwnd may be gone; InvalidateRect then just fails.
         unsafe {
-            let _ = InvalidateRect(HWND(paint_hwnd as _), None, false.into());
+            let _ = InvalidateRect(HWND(paint_hwnd as _), None, BOOL(0));
         }
     });
 }
