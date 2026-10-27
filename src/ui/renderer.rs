@@ -384,6 +384,14 @@ impl Renderer {
         unsafe { brush.SetColor(&c) };
     }
 
+    /// Area fills: like `set_color`, but in light-ink mode opaque white surfaces (switch knobs,
+    /// slider thumbs) stay white and dark wells (inputs, tracks) turn into milky white wells.
+    fn set_fill_color(brush: &ID2D1SolidColorBrush, rgba: u32) {
+        let c = color(light_fill(rgba));
+        // SAFETY: `c` lives for the call.
+        unsafe { brush.SetColor(&c) };
+    }
+
     /// Starts a frame and clears to transparent.
     pub fn begin(&mut self) -> Result<()> {
         let (rt, _) = self.parts()?;
@@ -417,7 +425,7 @@ impl Renderer {
 
     pub fn fill_rounded_rect(&mut self, rect: RectF, radius: f32, rgba: u32) -> Result<()> {
         let (rt, brush) = self.parts()?;
-        Self::set_color(brush, rgba);
+        Self::set_fill_color(brush, rgba);
         let rr = rounded(rect, radius);
         // SAFETY: `rr` lives for the call.
         unsafe { rt.FillRoundedRectangle(&rr, brush) };
@@ -455,7 +463,7 @@ impl Renderer {
 
     pub fn fill_rect(&mut self, rect: RectF, rgba: u32) -> Result<()> {
         let (rt, brush) = self.parts()?;
-        Self::set_color(brush, rgba);
+        Self::set_fill_color(brush, rgba);
         let r = d2d_rect(rect);
         // SAFETY: `r` lives for the call.
         unsafe { rt.FillRectangle(&r, brush) };
@@ -660,7 +668,7 @@ impl Renderer {
             sink.Close()?;
         }
         let (rt, brush) = self.parts()?;
-        Self::set_color(brush, rgba);
+        Self::set_fill_color(brush, rgba);
         let g: &ID2D1Geometry = &geo;
         draw(rt, brush, g)
     }
@@ -1038,6 +1046,22 @@ pub fn light_ink(rgba: u32) -> u32 {
         return rgba;
     }
     if a >= 0x60 { 0x1D1D_1F00 | a } else { a }
+}
+
+/// Fill variant of `light_ink` (see `Renderer::set_fill_color`).
+pub fn light_fill(rgba: u32) -> u32 {
+    if !LIGHT_INK.with(std::cell::Cell::get) {
+        return rgba;
+    }
+    let (r, g, b, a) = (rgba >> 24, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF, rgba & 0xFF);
+    let (lo, hi) = (r.min(g).min(b), r.max(g).max(b));
+    if hi - lo <= 0x18 && lo >= 0xE8 && a >= 0xE0 {
+        return rgba;
+    }
+    if hi <= 0x40 && hi - lo <= 0x18 && a < 0xA0 {
+        return 0xFFFF_FF00 | (a * 2).min(0xC0);
+    }
+    light_ink(rgba)
 }
 
 /// Path-geometry drawing used by `svgpath`. Kept in its own block so it does not touch the core API.
