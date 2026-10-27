@@ -494,13 +494,13 @@ fn draw_control_rims(r: &mut Renderer, rect: RectF, radius: f32, k: f32) -> Resu
     let inner = RectF { x: x + 1.25, y: y + 1.25, w: (w - 2.5).max(0.0), h: (h - 2.5).max(0.0) };
     r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y), 0xFFFF_FF00 | a(26.0), (x, y + h * 0.4), 0xFFFF_FF00, 1.0)?;
     // Bottom inner shade, very faint.
-    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y + h * 0.6), 0x0000_0000, (x, y + h), 0x0000_0022, 1.0)?;
+    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y + h * 0.6), 0x0000_0000, (x, y + h), 0x0000_0030, 1.5)?;
     // Outer specular rim: bright top/left, fading toward the bottom-right.
     let edge = RectF { x: x + 0.25, y: y + 0.25, w: (w - 0.5).max(0.0), h: (h - 0.5).max(0.0) };
     let reach = w.min(h * 2.2);
-    r.stroke_rounded_rect_linear(edge, radius, (x, y), 0xFFFF_FF00 | a(185.0), (x + reach * 0.45, y + h), 0xFFFF_FF00 | a(34.0), 1.25)?;
+    r.stroke_rounded_rect_linear(edge, radius, (x, y), 0xFFFF_FF00 | a(190.0), (x + reach * 0.35, y + h * 0.95), 0xFFFF_FF00 | a(18.0), 1.25)?;
     // Faint secondary glint at the bottom-right.
-    r.stroke_rounded_rect_linear(edge, radius, (x + w, y + h), 0xFFFF_FF00 | a(70.0), (x + w - reach * 0.5, y + h * 0.4), 0xFFFF_FF00, 1.0)
+    r.stroke_rounded_rect_linear(edge, radius, (x + w, y + h), 0xFFFF_FF00 | a(80.0), (x + w - reach * 0.4, y + h * 0.5), 0xFFFF_FF00, 1.0)
 }
 
 /// Very soft, low-opacity drop shadow (wide and faint, slightly below the module).
