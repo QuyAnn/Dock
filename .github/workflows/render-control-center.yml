@@ -49,12 +49,37 @@ jobs:
       - name: Render production Control Center
         shell: pwsh
         run: |
-          & .\target\release\smartdock.exe --render-cc render-output\control_center_ocean.png render-inputs\ocean.jpg
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\target\release\smartdock.exe --render-cc render-output\control_center_light.png render-inputs\light.jpg
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & .\target\release\smartdock.exe --render-cc render-output\control_center_dark.png render-inputs\dark.jpg
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = (Resolve-Path ".\target\release\smartdock.exe").Path
+          function Invoke-Render([string]$Output, [string]$Wallpaper) {
+            $outPath = [System.IO.Path]::GetFullPath($Output)
+            $wallpaperPath = (Resolve-Path $Wallpaper).Path
+            $process = Start-Process -FilePath $exe `
+              -ArgumentList @("--render-cc", $outPath, $wallpaperPath) `
+              -Wait -PassThru
+            if ($process.ExitCode -ne 0) {
+              $log = [System.IO.Path]::ChangeExtension($outPath, ".log")
+              if (Test-Path $log) { Get-Content $log | Write-Error }
+              throw "Control Center render failed with exit code $($process.ExitCode): $Output"
+            }
+          }
+          Invoke-Render "render-output\control_center_ocean.png" "render-inputs\ocean.jpg"
+          Invoke-Render "render-output\control_center_light.png" "render-inputs\light.jpg"
+          Invoke-Render "render-output\control_center_dark.png" "render-inputs\dark.jpg"
+      - name: Validate rendered PNGs
+        shell: pwsh
+        run: |
+          $expected = @(
+            "render-output\control_center_ocean.png",
+            "render-output\control_center_light.png",
+            "render-output\control_center_dark.png"
+          )
+          foreach ($path in $expected) {
+            if (-not (Test-Path $path)) { throw "Missing render: $path" }
+            $file = Get-Item $path
+            if ($file.Length -lt 10KB) {
+              throw "Render is too small ($($file.Length) bytes): $path"
+            }
+          }
       - uses: actions/upload-artifact@v4
         with:
           name: control-center-renders
