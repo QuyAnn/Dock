@@ -243,6 +243,9 @@ impl Renderer {
         renderer.begin()?;
         draw(&mut renderer)?;
         renderer.end()?;
+        // A WIC bitmap render target owns a write lock until every D2D reference is released.
+        // Drop the target and its brush before handing the bitmap to the PNG encoder.
+        renderer.release();
 
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
         unsafe {
