@@ -612,6 +612,7 @@ mod memory_tests {
         POPUP.with(|p| *p.borrow_mut() = Some(Popup {
             hwnd, renderer, anchor: RectF::default(), mouse_down: false, esc_down: false,
             backdrop: Some(bg.clone()),
+            floating_modules: false,
         }));
         hide();
         paint();
