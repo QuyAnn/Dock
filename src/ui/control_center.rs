@@ -353,6 +353,13 @@ fn fade(rgba: u32, k: f32) -> u32 {
 /// free-standing round module: smoky glass when off, a solid white disc when on (macOS 27).
 /// Either way the "on" glyph is system blue.
 fn draw_round(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, k: f32, icon_k: f32) -> Result<()> {
+    // Badges and indicators glow system blue; a free-standing toggle shows a dark glyph on white.
+    let on_color = if rect.w <= ROUND + 1.0 { ACCENT } else { 0x1C1C_1EFF };
+    draw_round_with(r, rect, glyph, size, on, on_color, k, icon_k)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_round_with(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, on_color: u32, k: f32, icon_k: f32) -> Result<()> {
     let radius = rect.h / 2.0;
     let badge_only = rect.w <= ROUND + 1.0;
     match (on, badge_only) {
@@ -360,7 +367,7 @@ fn draw_round(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, 
         (false, true) => super::glass::draw_control_badge(r, rect, radius)?,
         (false, false) => super::glass::draw_control_card(r, rect, radius)?,
     }
-    draw_glyph(r, rect, glyph, size, fade(if on { ACCENT } else { text() }, icon_k))
+    draw_glyph(r, rect, glyph, size, fade(if on { on_color } else { text() }, icon_k))
 }
 
 /// A panel icon: a Segoe glyph, or the dock's SF-style vector Wi-Fi / speaker icons.
@@ -512,7 +519,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     let bt_k = if state.bluetooth.is_some() { 1.0 } else { 0.45 };
     draw_round(r, l.bluetooth, Glyph::Text(GLYPH_BT), 22.0, bt_on, bt_k, bt_k)?;
     let net_glyph = if state.ethernet { GLYPH_ETHERNET } else { GLYPH_NETWORK };
-    draw_round(r, l.net, Glyph::Text(net_glyph), 22.0, state.ethernet, 1.0, 1.0)?;
+    draw_round_with(r, l.net, Glyph::Text(net_glyph), 22.0, state.ethernet, ACCENT, 1.0, 1.0)?;
     draw_now_playing(r, l.media, media)?;
 
     // Dark mode pill (the "Focus" slot) and the two shortcut tiles.
@@ -524,10 +531,10 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
         RectF {
             x: moon.x + ROUND + 10.0,
             y: l.dark.y,
-            w: (l.dark.x + l.dark.w) - (moon.x + ROUND + 10.0) - 8.0,
+            w: (l.dark.x + l.dark.w) - (moon.x + ROUND + 10.0) - 4.0,
             h: l.dark.h,
         },
-        TITLE_PT,
+        12.5,
         text(),
         Align::Left,
         TextStyle::Bold,

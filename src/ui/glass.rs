@@ -282,7 +282,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     // Control material (macOS 27): smoky dark (or milky light) veil over the heavily blurred
     // backdrop, then a thick-glass bevel lit from the top-left.
     let (veil, veil_a) = match layer {
-        Layer::Control => ([74.0f32, 74.0, 80.0], 0.56f32),
+        Layer::Control => ([72.0f32, 72.0, 78.0], 0.63f32),
         Layer::ControlLight => ([246.0f32, 246.0, 250.0], 0.30f32),
         _ => ([0.0f32; 3], 0.0f32),
     };
@@ -355,7 +355,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 let top = lit.max(0.0);
                 let bottom = (-lit).max(0.0);
                 // Specular rim: a bright soft line ~2-3 DIP wide, strongest on top, weaker below.
-                let rim = (-d / 1.1).exp() * (top.powf(1.4) * 0.62 + bottom.powf(1.6) * 0.42);
+                let rim = (-d / 1.1).exp() * (top.powf(1.4) * 0.62 + bottom.powf(1.4) * 0.50);
                 // Bottom inner glow: a lighter band rising ~6 DIP from the lower edge.
                 let glow = if ny > 0.0 { ny.powf(2.0) * (1.0 - d / 7.0).max(0.0).powf(1.5) * 0.16 } else { 0.0 };
                 // Thick-glass sides: darker toward the middle of the left/right edges.
