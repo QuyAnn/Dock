@@ -397,7 +397,9 @@ fn draw_toggle(r: &mut Renderer, tile: RectF, t: Toggle) -> Result<()> {
     let rk = if t.enabled { k } else { k * 0.45 };
     let icon_k = if t.on || !t.dim_off { 1.0 } else { 0.35 };
     draw_module(r, tile, TILE_R)?;
-    draw_round(r, round_of(tile), t.glyph, 20.0, t.on, rk, rk * icon_k)?;
+    // The filled Wi-Fi fan spans ~57% of the badge (0.72 of its 32-DIP box), like macOS.
+    let size = if matches!(t.glyph, Glyph::Wifi { .. }) { 32.0 } else { 20.0 };
+    draw_round(r, round_of(tile), t.glyph, size, t.on, rk, rk * icon_k)?;
     let tx = tile.x + BADGE_INSET + ROUND + 10.0;
     let tw = (tile.x + tile.w - 8.0 - tx).max(0.0);
     let (line1, line2) = wrap_two(t.sub, tw, SUB_PT);
@@ -506,7 +508,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     // Dark mode pill (the "Focus" slot) and the two shortcut tiles.
     draw_module(r, l.dark, TILE_R)?;
     let moon = round_of(l.dark);
-    draw_round(r, moon, Glyph::Moon, 21.0, state.dark, 1.0, 1.0)?;
+    draw_round(r, moon, Glyph::Moon, 22.0, state.dark, 1.0, 1.0)?;
     r.draw_text_styled(
         "Chế độ tối",
         RectF {
