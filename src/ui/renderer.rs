@@ -191,6 +191,7 @@ impl Renderer {
         dpi: u32,
         draw: impl FnOnce(&mut Renderer) -> Result<()>,
     ) -> Result<()> {
+        use std::io::Write;
         use std::iter::once;
         use std::os::windows::ffi::OsStrExt;
         use windows::core::PCWSTR;
@@ -203,9 +204,25 @@ impl Renderer {
         use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
         use windows::Win32::System::Com::StructuredStorage::IPropertyBag2;
 
+        let mut trace = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.with_extension("log"))
+            .ok();
+        macro_rules! trace {
+            ($message:expr) => {
+                if let Some(file) = trace.as_mut() {
+                    let _ = writeln!(file, "render-wic: {}", $message);
+                    let _ = file.flush();
+                }
+            };
+        }
+        trace!("initializing COM");
         let _com = crate::win::com::Apartment::mta();
+        trace!("creating WIC factory");
         let wic: IWICImagingFactory =
             unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
+        trace!("creating WIC PBGRA bitmap");
         let bitmap = unsafe {
             wic.CreateBitmap(
                 pixel_w,
@@ -214,6 +231,7 @@ impl Renderer {
                 WICBitmapCacheOnLoad,
             )?
         };
+        trace!("creating Direct2D WIC render target");
         let props = D2D1_RENDER_TARGET_PROPERTIES {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -224,6 +242,7 @@ impl Renderer {
             ..Default::default()
         };
         let target = unsafe { d2d_factory()?.CreateWicBitmapRenderTarget(&bitmap, &props)? };
+        trace!("creating Direct2D brush");
         let brush = unsafe { target.CreateSolidColorBrush(&color(0), None)? };
         unsafe {
             target.SetDpi(dpi.max(96) as f32, dpi.max(96) as f32);
@@ -240,30 +259,40 @@ impl Renderer {
             bitmaps: crate::cache::ByteCache::new(32 * 1024 * 1024),
             frame: 0,
         };
+        trace!("beginning Direct2D frame");
         renderer.begin()?;
         draw(&mut renderer)?;
+        trace!("ending Direct2D frame");
         renderer.end()?;
         // A WIC bitmap render target owns a write lock until every D2D reference is released.
         // Drop the target and its brush before handing the bitmap to the PNG encoder.
         renderer.release();
+        trace!("released Direct2D target");
 
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
         unsafe {
+            trace!("creating output stream");
             let stream = wic.CreateStream()?;
             stream.InitializeFromFilename(PCWSTR(wide.as_ptr()), GENERIC_WRITE.0)?;
+            trace!("creating PNG encoder");
             let encoder = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
             encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+            trace!("creating PNG frame");
             let mut frame: Option<IWICBitmapFrameEncode> = None;
             let mut options: Option<IPropertyBag2> = None;
             encoder.CreateNewFrame(&mut frame, &mut options)?;
             let frame = frame.ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
             frame.Initialize(options.as_ref())?;
+            trace!("configuring PNG frame");
             frame.SetSize(pixel_w, pixel_h)?;
             frame.SetResolution(dpi as f64, dpi as f64)?;
             let mut format = GUID_WICPixelFormat32bppPBGRA;
             frame.SetPixelFormat(&mut format)?;
+            trace!("writing WIC bitmap to PNG frame");
             frame.WriteSource(&bitmap, std::ptr::null())?;
+            trace!("committing PNG frame");
             frame.Commit()?;
+            trace!("committing PNG encoder");
             encoder.Commit()
         }
     }

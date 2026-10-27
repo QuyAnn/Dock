@@ -224,6 +224,16 @@ fn render_control_center_cli() -> Option<i32> {
         return Some(2);
     }
     let out = std::path::PathBuf::from(&args[2]);
+    let log_path = out.with_extension("log");
+    let _ = std::fs::write(&log_path, "render-cli: entered before SmartDock initialization\n");
+    let panic_log = log_path.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&panic_log) {
+            let _ = writeln!(file, "render-cli: panic: {info}");
+            let _ = file.flush();
+        }
+    }));
     let rendered = std::panic::catch_unwind(|| {
         ui::cc_preview::render(&out, std::path::Path::new(&args[3]))
     });
@@ -232,13 +242,21 @@ fn render_control_center_cli() -> Option<i32> {
         Ok(Err(e)) => {
             let msg = format!("Control Center render failed: {e}\n");
             eprint!("{msg}");
-            let _ = std::fs::write(out.with_extension("log"), msg);
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, msg.as_bytes()));
             Some(1)
         }
         Err(_) => {
             let msg = "Control Center renderer panicked before producing the PNG.\n";
             eprint!("{msg}");
-            let _ = std::fs::write(out.with_extension("log"), msg);
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, msg.as_bytes()));
             Some(1)
         }
     }

@@ -49,22 +49,30 @@ jobs:
           New-Gradient "render-inputs/dark.jpg" "#193250" "#050A13"
       - name: Render production Control Center
         shell: pwsh
+        env:
+          RUST_BACKTRACE: "1"
         run: |
           $exe = (Resolve-Path ".\target\release\smartdock.exe").Path
           function Invoke-Render([string]$Output, [string]$Wallpaper) {
             $outPath = [System.IO.Path]::GetFullPath($Output)
             $wallpaperPath = (Resolve-Path $Wallpaper).Path
+            $stderrPath = [System.IO.Path]::ChangeExtension($outPath, ".stderr.log")
             $process = Start-Process -FilePath $exe `
               -ArgumentList @("--render-cc", $outPath, $wallpaperPath) `
+              -RedirectStandardError $stderrPath `
               -PassThru
             if (-not $process.WaitForExit(60000)) {
               $process.Kill($true)
+              $log = [System.IO.Path]::ChangeExtension($outPath, ".log")
+              if (Test-Path $log) { Get-Content $log | Write-Error }
+              if (Test-Path $stderrPath) { Get-Content $stderrPath | Write-Error }
               throw "Control Center render timed out after 60 seconds: $Output"
             }
             $process.Refresh()
             if ($process.ExitCode -ne 0) {
               $log = [System.IO.Path]::ChangeExtension($outPath, ".log")
               if (Test-Path $log) { Get-Content $log | Write-Error }
+              if (Test-Path $stderrPath) { Get-Content $stderrPath | Write-Error }
               throw "Control Center render failed with exit code $($process.ExitCode): $Output"
             }
           }
