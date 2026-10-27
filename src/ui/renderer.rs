@@ -261,9 +261,17 @@ impl Renderer {
         };
         trace!("beginning Direct2D frame");
         renderer.begin()?;
-        draw(&mut renderer)?;
-        trace!("ending Direct2D frame");
-        renderer.end()?;
+        trace!("drawing Control Center");
+        let drawn = draw(&mut renderer);
+        trace!(format!("draw returned {drawn:?}; ending Direct2D frame"));
+        // The offscreen renderer only has `base_target` (no HWND target), so `Renderer::end`
+        // would skip EndDraw and leave the WIC bitmap write-locked. Always pair BeginDraw here.
+        let ended = match renderer.base_target.as_ref() {
+            Some(rt) => unsafe { rt.EndDraw(None, None) },
+            None => Ok(()),
+        };
+        drawn?;
+        ended?;
         // A WIC bitmap render target owns a write lock until every D2D reference is released.
         // Drop the target and its brush before handing the bitmap to the PNG encoder.
         renderer.release();
