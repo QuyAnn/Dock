@@ -85,6 +85,7 @@ jobs:
             $code = $process.ExitCode
             Write-Host ("Exit code: {0} (0x{1:X8})" -f $code, $code)
             Show-Logs $outPath
+            if (Test-Path $outPath) { Write-Host "PNG size: $((Get-Item $outPath).Length) bytes" }
             if ($code -ne 0) { return "exit $code : $Output" }
             if (Test-Path $outPath) { Write-Host "PNG size: $((Get-Item $outPath).Length) bytes" }
             return $null

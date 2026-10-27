@@ -264,6 +264,18 @@ fn render_control_center_cli() -> Option<i32> {
 
 fn main() {
     if let Some(code) = render_control_center_cli() {
+        // The PNG is fully written and closed at this point. Skip CRT/TLS/COM teardown: on the
+        // headless CI runner it aborts with STATUS_INVALID_PARAMETER after a successful render.
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let _ = std::io::stdout().flush();
+        unsafe {
+            // SAFETY: terminating the current process with a plain exit code.
+            let _ = windows::Win32::System::Threading::TerminateProcess(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                code as u32,
+            );
+        }
         std::process::exit(code);
     }
     dpi::enable_per_monitor_v2();
