@@ -213,7 +213,7 @@ const GLYPH_DARK: u32 = 0x5555_55FF;
 // Segoe MDL2 Assets codepoints.
 const GLYPH_BT: &str = "\u{E702}";
 const GLYPH_BRIGHTNESS: &str = "\u{E706}";
-const GLYPH_NETWORK: &str = "\u{E968}";
+const GLYPH_NETWORK: &str = "\u{E774}";
 const GLYPH_MOON: &str = "\u{E708}";
 const GLYPH_GEAR: &str = "\u{E713}";
 const GLYPH_CALC: &str = "\u{E8EF}";
