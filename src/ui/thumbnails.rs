@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::dock::RectF;
-use super::renderer::{apply_acrylic, apply_popup_corners, Align, Renderer, POPUP_CORNER_RADIUS};
+use super::renderer::{apply_acrylic, Align, Renderer, POPUP_CORNER_RADIUS};
 use crate::win::dpi;
 use crate::win::tasks::{close_window, focus_window};
 
@@ -81,6 +81,8 @@ struct Host {
     dock: HWND,
     /// Poll ticks the pointer has been outside icon + peek.
     outside_ms: u32,
+    /// Glass backdrop captured behind the peek when it opens; released on hide.
+    backdrop: Option<std::sync::Arc<super::liquid::LiquidBitmap>>,
 }
 
 struct Pending {
@@ -211,8 +213,10 @@ fn host_hwnd() -> Option<HWND> {
         )
     }
     .ok()?;
-    apply_popup_corners(hwnd);
-    apply_acrylic(hwnd, super::glass::PANEL_ACRYLIC_TINT);
+    // Fully transparent window: the shared popup glass is drawn by `paint`.
+    apply_acrylic(hwnd, 0);
+    super::renderer::apply_dwm_transparency(hwnd);
+    super::renderer::apply_dock_no_chrome(hwnd);
     HOST.with(|h| {
         *h.borrow_mut() = Some(Host {
             hwnd,
@@ -222,9 +226,21 @@ fn host_hwnd() -> Option<HWND> {
             anchor: RECT::default(),
             dock: HWND::default(),
             outside_ms: 0,
+            backdrop: None,
         });
     });
     Some(hwnd)
+}
+
+/// Work-area-independent monitor rect of the dock's monitor (wallpaper fallback placement).
+fn monitor_of(dock: HWND) -> RECT {
+    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+    let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    // SAFETY: plain monitor queries with a properly sized out-struct.
+    unsafe {
+        let _ = GetMonitorInfoW(MonitorFromWindow(dock, MONITOR_DEFAULTTONEAREST), &mut info);
+    }
+    info.rcMonitor
 }
 
 fn unregister_all(thumbs: &mut Vec<Thumb>) {
@@ -282,8 +298,22 @@ fn show(pending: Pending) {
         hide();
         return;
     }
+    // Same glass as every popup: capture what is behind the peek once, with the peek off screen.
+    super::glass::set_control_dark(crate::win::system::dark_mode());
+    let area = RECT { left: x, top: y, right: x + width, bottom: y + height };
     HOST.with(|h| {
         if let Some(host) = h.borrow_mut().as_mut() {
+            if host.visible {
+                // SAFETY: our own window; DwmFlush waits until it is gone from the composition.
+                unsafe {
+                    let _ = ShowWindow(host.hwnd, SW_HIDE);
+                    let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+                }
+            }
+            if let Some(bg) = host.backdrop.take() {
+                super::glass::release_backdrop(&bg);
+            }
+            host.backdrop = super::glass::popup_backdrop_for(area, monitor_of(pending.dock), dpi, true);
             host.thumbs = thumbs;
             host.renderer.resize(width, height, dpi);
             host.anchor = pending.anchor;
@@ -308,6 +338,9 @@ pub fn hide() {
         let host = g.as_mut()?;
         unregister_all(&mut host.thumbs);
         host.renderer.release();
+        if let Some(bg) = host.backdrop.take() {
+            super::glass::release_backdrop(&bg);
+        }
         let was = host.visible;
         host.visible = false;
         host.outside_ms = 0;
@@ -481,10 +514,15 @@ fn paint(hwnd: HWND, _hdc: HDC) {
                 }
             })
             .collect();
+        let backdrop = host.backdrop.clone();
         let r = &mut host.renderer;
         let panel = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: hgt - 1.0 };
         let _ = r.begin().and_then(|_| {
-            super::glass::draw_panel(r, panel, POPUP_CORNER_RADIUS)?;
+            super::glass::set_backdrop(backdrop, w, hgt);
+            let surface = super::glass::draw_popup_surface(r, panel, POPUP_CORNER_RADIUS + 4.0);
+            super::glass::set_backdrop(None, w, hgt);
+            surface?;
+            super::renderer::set_light_ink(!super::glass::control_dark());
             for (title, rc) in &titles {
                 // DirectWrite: full Unicode (Vietnamese) titles, ellipsized to the thumbnail width.
                 r.draw_text(title, *rc, 11.0, 0xF4F4_F7FF, Align::Left)?;
@@ -496,6 +534,7 @@ fn paint(hwnd: HWND, _hdc: HDC) {
                 r.stroke_line(cx - k, cy - k, cx + k, cy + k, 0xFFFF_FFE6, 1.4)?;
                 r.stroke_line(cx - k, cy + k, cx + k, cy - k, 0xFFFF_FFE6, 1.4)?;
             }
+            super::renderer::set_light_ink(false);
             r.end()
         });
     });

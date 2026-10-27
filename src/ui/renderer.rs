@@ -379,7 +379,7 @@ impl Renderer {
     }
 
     fn set_color(brush: &ID2D1SolidColorBrush, rgba: u32) {
-        let c = color(rgba);
+        let c = color(light_ink(rgba));
         // SAFETY: `c` lives for the call.
         unsafe { brush.SetColor(&c) };
     }
@@ -493,6 +493,20 @@ impl Renderer {
             )
         };
         Ok(())
+    }
+
+    /// Width in DIPs of `text` laid out on one line with the given size and style.
+    pub fn measure_text(&self, text: &str, size: f32, style: TextStyle) -> Result<f32> {
+        let format = text_format(size, Align::Left, style)?;
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let dw = dwrite_factory()?;
+        // SAFETY: the slice and format live for the call; metrics is a plain out-struct.
+        unsafe {
+            let layout = dw.CreateTextLayout(&wide, &format, 10_000.0, 1_000.0)?;
+            let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut m)?;
+            Ok(m.widthIncludingTrailingWhitespace)
+        }
     }
 
     /// Linear top-to-bottom gradient inside a rounded rect (`.clock-time`, `.dock` tint).
@@ -998,6 +1012,32 @@ impl Renderer {
             0,
         )
     }
+}
+
+thread_local! {
+    /// Set while popup content is painted on the light (milky) glass: neutral white ink becomes
+    /// near-black so every popup keeps its contrast without per-popup colour tables.
+    static LIGHT_INK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enables the light-appearance ink remap (see `light_ink`) for subsequent solid-colour draws.
+pub fn set_light_ink(on: bool) {
+    LIGHT_INK.with(|c| c.set(on));
+}
+
+/// In light-ink mode, near-white neutral colours (text, glyphs, hairlines, subtle white fills)
+/// map to their dark counterparts: opaque ink to #1D1D1F, translucent fills to black at the same
+/// alpha. Coloured accents pass through unchanged.
+pub fn light_ink(rgba: u32) -> u32 {
+    if !LIGHT_INK.with(std::cell::Cell::get) {
+        return rgba;
+    }
+    let (r, g, b, a) = (rgba >> 24, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF, rgba & 0xFF);
+    let (lo, hi) = (r.min(g).min(b), r.max(g).max(b));
+    if lo < 0xB0 || hi - lo > 0x30 {
+        return rgba;
+    }
+    if a >= 0x60 { 0x1D1D_1F00 | a } else { a }
 }
 
 /// Path-geometry drawing used by `svgpath`. Kept in its own block so it does not touch the core API.

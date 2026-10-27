@@ -214,12 +214,29 @@ fn default_repos() -> Vec<PathBuf> {
 /// Returning `Some` means the process must terminate immediately with that exit code.
 fn render_control_center_cli() -> Option<i32> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if !args.get(1).is_some_and(|a| a == "--render-cc") {
+    let mode = args.get(1)?.to_string_lossy().to_string();
+    if !matches!(mode.as_str(), "--render-cc" | "--render-popup" | "--render-icons") {
         return None;
     }
+    // `--render-popup <name> ...` takes the same arguments as `--render-cc` after the name.
+    let name = (mode == "--render-popup").then(|| args.get(2).map(|a| a.to_string_lossy().to_string())).flatten();
+    let args: Vec<std::ffi::OsString> = if mode == "--render-popup" {
+        args.iter().enumerate().filter(|(i, _)| *i != 2).map(|(_, a)| a.clone()).collect()
+    } else {
+        args
+    };
     let appearance = args.get(4).map(|a| a.to_string_lossy().to_ascii_lowercase());
-    if !(args.len() == 4 || (args.len() == 5 && matches!(appearance.as_deref(), Some("dark" | "light")))) {
-        let msg = "Usage: smartdock.exe --render-cc <out.png> <wallpaper> [dark|light]\n";
+    let valid = if mode == "--render-icons" {
+        args.len() == 3
+    } else {
+        (mode != "--render-popup" || name.as_deref().is_some_and(|n| ui::cc_preview::POPUPS.contains(&n)))
+            && (args.len() == 4 || (args.len() == 5 && matches!(appearance.as_deref(), Some("dark" | "light"))))
+    };
+    if !valid {
+        let msg = format!(
+            "Usage: smartdock.exe --render-cc <out.png> <wallpaper> [dark|light]\n       smartdock.exe --render-popup <{}> <out.png> <wallpaper> [dark|light]\n       smartdock.exe --render-icons <out.png>\n",
+            ui::cc_preview::POPUPS.join("|")
+        );
         eprint!("{msg}");
         let _ = std::fs::write("render-control-center.log", msg);
         return Some(2);
@@ -236,7 +253,18 @@ fn render_control_center_cli() -> Option<i32> {
         }
     }));
     let rendered = std::panic::catch_unwind(|| {
-        ui::cc_preview::render(&out, std::path::Path::new(&args[3]), appearance.as_deref() != Some("light"))
+        let dark = appearance.as_deref() != Some("light");
+        match mode.as_str() {
+            "--render-icons" => ui::cc_preview::render_icons(&out),
+            "--render-popup" => ui::cc_preview::render_popup(
+                name.as_deref().unwrap_or_default(),
+                &out,
+                std::path::Path::new(&args[3]),
+                dark,
+                &preview_gallery_entries,
+            ),
+            _ => ui::cc_preview::render(&out, std::path::Path::new(&args[3]), dark),
+        }
     });
     match rendered {
         Ok(Ok(())) => Some(0),
@@ -1998,6 +2026,30 @@ thread_local! {
 
 /// Shows SmartDock Settings in the popup, anchored where the current popup was opened.
 /// Entries for the widget gallery: every widget with its live preview tile.
+/// Gallery entries for `--render-popup gallery`: default settings and sample data, no running app.
+fn preview_gallery_entries(data: &DataState) -> Vec<ui::gallery::Entry> {
+    let settings = settings::Settings::default();
+    let control = ControlState::default();
+    let stats = data::stats::read_stats();
+    ui::gallery::ITEMS
+        .iter()
+        .map(|&(id, cat)| ui::gallery::Entry {
+            id,
+            name: settings::widget_label(id),
+            cat,
+            view: tile_view(id, data, &control, &stats, 0.0, &settings),
+            width: if settings::is_fixed_widget(id) {
+                widget_width(id)
+            } else {
+                (widget_width(id) * settings.widget_scale()).round()
+            },
+            on: settings.widget_shown(id),
+            fixed: settings::is_fixed_widget(id),
+            disabled: false,
+        })
+        .collect()
+}
+
 fn gallery_entries() -> Vec<ui::gallery::Entry> {
     APP.with(|a| {
         let slot = a.borrow();

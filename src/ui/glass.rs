@@ -487,7 +487,11 @@ pub fn draw_panel_tint(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()>
 /// plain translucent `fallback` fill with highlights.
 pub fn draw_card(r: &mut Renderer, rect: RectF, radius: f32, fallback: u32, k: f32) -> Result<()> {
     if CTX.with(|c| c.borrow().is_some()) {
-        draw_glass(r, rect, radius, Layer::Tile, false)
+        // Inside a glass popup: a subtle raised section of the same material (the light-ink
+        // remap turns these into faint dark tints on the milky light variant).
+        r.fill_rounded_rect(rect, radius, 0xFFFF_FF12)?;
+        let edge = RectF { x: rect.x + 0.5, y: rect.y + 0.5, w: (rect.w - 1.0).max(0.0), h: (rect.h - 1.0).max(0.0) };
+        r.stroke_rounded_rect_linear(edge, (radius - 0.5).max(0.0), (rect.x, rect.y), 0xFFFF_FF30, (rect.x, rect.y + rect.h), 0xFFFF_FF08, 0.75)
     } else {
         r.fill_rounded_rect(rect, radius, fallback)?;
         draw_highlights(r, rect, radius, k)
@@ -501,7 +505,7 @@ pub fn set_control_dark(dark: bool) {
     CONTROL_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn control_dark() -> bool {
+pub fn control_dark() -> bool {
     CONTROL_DARK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -509,16 +513,31 @@ fn control_dark() -> bool {
 /// shows through a faint veil, the rim refracts and brightens, and a crisp specular edge plus a
 /// very soft shadow make it read as a thick lens. Separate from dock tiles and popup cards.
 pub fn draw_control_card(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    draw_glass_surface(r, rect, radius, true)
+}
+
+/// Shared surface for every popup panel (widget/data popups, menus, calendar, gallery, tray):
+/// the Control Center material at panel scale. The window edge is the panel edge, so the soft
+/// outer shadow is left out (it would be clipped).
+pub fn draw_popup_surface(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    draw_glass_surface(r, rect, radius, false)
+}
+
+/// The one Control Center glass recipe: smoky (dark) or milky (light) veil over the captured,
+/// blurred backdrop with the CPU bevel and edge lens, then the hairline specular rims.
+fn draw_glass_surface(r: &mut Renderer, rect: RectF, radius: f32, shadow: bool) -> Result<()> {
     if rect.w < 1.0 || rect.h < 1.0 {
         return Ok(());
     }
     let radius = radius.min(rect.w / 2.0).min(rect.h / 2.0);
     let dark = control_dark();
-    draw_control_shadow(r, rect, radius)?;
+    if shadow {
+        draw_control_shadow(r, rect, radius)?;
+    }
     let layer = if dark { Layer::Control } else { Layer::ControlLight };
     match piece_for(rect, radius, layer) {
         Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
-        None => r.fill_rounded_rect(rect, radius, if dark { 0xFFFF_FF1C } else { 0xFFFF_FF38 })?,
+        None => r.fill_rounded_rect(rect, radius, if dark { 0x2C2C_30E0 } else { 0xF2F2_F6E8 })?,
     }
     draw_control_rims(r, rect, radius, if dark { 1.0 } else { 1.15 })
 }

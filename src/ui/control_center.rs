@@ -138,7 +138,7 @@ fn draw_outputs(r: &mut Renderer, rect: RectF, list: &[system::AudioOutput]) -> 
         let row = output_row(rect, i);
         draw_module(r, row, 16.0)?;
         let dot = RectF { x: row.x + 10.0, y: row.y + (row.h - 24.0) / 2.0, w: 24.0, h: 24.0 };
-        draw_glyph(r, dot, Glyph::Speaker(1.0, false), 13.0, if d.is_default { text() } else { sub() })?;
+        draw_glyph(r, dot, speaker(1.0, false), 16.0, if d.is_default { text() } else { sub() })?;
         let label = RectF { x: row.x + 42.0, y: row.y, w: row.w - 42.0 - 34.0, h: row.h };
         r.draw_text_styled(&d.name, label, 11.5, text(), Align::Left, if d.is_default { TextStyle::Bold } else { TextStyle::Ui })?;
         if d.is_default {
@@ -244,24 +244,12 @@ fn fill() -> u32 {
     if dark() { 0xFFFF_FFFF } else { 0x2C2C_2EE6 }
 }
 
-// Segoe MDL2 Assets codepoints.
-const GLYPH_BT: &str = "\u{E702}";
-const GLYPH_BRIGHTNESS: &str = "\u{E706}";
-const GLYPH_ETHERNET: &str = "\u{E839}";
-const GLYPH_NETWORK: &str = "\u{E774}";
-const GLYPH_MOON: &str = "\u{E708}";
-const GLYPH_GEAR: &str = "\u{E713}";
-const GLYPH_CALC: &str = "\u{E8EF}";
-const GLYPH_CAMERA: &str = "\u{E722}";
-const GLYPH_CLOCK: &str = "\u{E916}";
-const GLYPH_DISPLAY: &str = "\u{E7F4}";
-
 /// Bottom shortcut circles: glyph and the URI they open.
-const SHORTCUTS: [(&str, &str); 4] = [
-    (GLYPH_CALC, "calculator:"),
-    (GLYPH_CAMERA, "ms-screenclip:"),
-    (GLYPH_CLOCK, "ms-clock:"),
-    (GLYPH_GEAR, "ms-settings:"),
+const SHORTCUTS: [(Glyph, &str); 4] = [
+    (Glyph::Calculator, "calculator:"),
+    (Glyph::Camera, "ms-screenclip:"),
+    (Glyph::Timer, "ms-clock:"),
+    (Glyph::Gear, "ms-settings:"),
 ];
 
 struct Layout {
@@ -370,26 +358,17 @@ fn draw_round_with(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: b
     draw_glyph(r, rect, glyph, size, fade(if on { on_color } else { text() }, icon_k))
 }
 
-/// A panel icon: a Segoe glyph, or the dock's SF-style vector Wi-Fi / speaker icons.
-#[derive(Clone, Copy)]
-enum Glyph {
-    Text(&'static str),
-    Wifi(sficons::Wifi),
-    /// Volume 0..1 and muted.
-    Speaker(f32, bool),
+/// Panel icons: the shared vector icon set (one grid, one stroke weight).
+type Glyph = super::ccicons::Icon;
+
+/// Draws `glyph` in a `size`-DIP icon box centred in `rect`.
+fn draw_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, rgba: u32) -> Result<()> {
+    super::ccicons::draw_in(r, glyph, rect, size, rgba)
 }
 
-fn draw_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, rgba: u32) -> Result<()> {
-    let cx = rect.x + rect.w / 2.0;
-    let cy = rect.y + rect.h / 2.0;
-    match glyph {
-        Glyph::Text(t) => r.draw_text_styled(t, rect, size, rgba, Align::Center, TextStyle::Icon),
-        Glyph::Wifi(w) => sficons::draw_wifi(r, RectF { x: cx - size / 2.0, y: cy - size / 2.0, w: size, h: size }, w, rgba),
-        Glyph::Speaker(v, m) => {
-            let w = size * 18.0 / 16.0;
-            sficons::draw_speaker(r, RectF { x: cx - w / 2.0, y: cy - size / 2.0, w, h: size }, v, m, rgba)
-        }
-    }
+/// Speaker icon for a volume level.
+fn speaker(volume: f32, muted: bool) -> Glyph {
+    Glyph::Speaker { waves: if muted { 0 } else { sficons::waves_for(volume) }, muted }
 }
 
 /// Liquid-glass tile (same material language as the dock tiles).
@@ -452,7 +431,7 @@ fn wrap_two(text: &str, width: f32, size: f32) -> (String, Option<String>) {
 /// Stadium pill with one centred glyph (network / sound shortcuts).
 fn draw_pill_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph) -> Result<()> {
     draw_module(r, rect, TILE_R)?;
-    draw_glyph(r, rect, glyph, 22.0, text())
+    draw_glyph(r, rect, glyph, 24.0, text())
 }
 
 /// Slider card background with its title and right-aligned value.
@@ -477,9 +456,9 @@ fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, left: Glyp
         r.fill_rounded_rect(RectF { w: end - bar.x, ..bar }, TRACK_H / 2.0, fade(fill(), k))?;
     }
     let slot = icon_of(s);
-    draw_glyph(r, RectF { w: END_W - 6.0, ..slot }, left, 13.0, fade(text(), k))?;
+    draw_glyph(r, RectF { w: END_W - 6.0, ..slot }, left, 16.0, fade(text(), k))?;
     let rs = RectF { x: s.x + s.w - END_W + 6.0, w: END_W - 6.0, ..slot };
-    draw_glyph(r, rs, right, 17.0, fade(text(), k))
+    draw_glyph(r, rs, right, 20.0, fade(text(), k))
 }
 
 /// Draws the whole panel into `rect`.
@@ -501,11 +480,14 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
         r,
         l.wifi,
         Toggle {
-            glyph: Glyph::Wifi(match sficons::Wifi::from_net(state.wifi, state.wifi_signal, false) {
-                // The badge already shows on/off; keep the fan full while on.
-                sficons::Wifi::Disconnected | sficons::Wifi::Ethernet if state.wifi == Some(true) => sficons::Wifi::Bars(3),
-                w => w,
-            }),
+            // Signal strength while connected; a full fan otherwise (the badge already shows on/off).
+            glyph: Glyph::Wifi {
+                bars: match (state.wifi, state.wifi_signal) {
+                    (Some(true), Some(q)) => sficons::bars_for(q),
+                    _ => 3,
+                },
+                off: false,
+            },
             label: "Wi-Fi",
             sub: &wifi_sub,
             on: state.wifi == Some(true),
@@ -517,15 +499,14 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     // (white disc, blue Ethernet glyph) while a wired adapter is connected.
     let bt_on = state.bluetooth == Some(true);
     let bt_k = if state.bluetooth.is_some() { 1.0 } else { 0.45 };
-    draw_round(r, l.bluetooth, Glyph::Text(GLYPH_BT), 22.0, bt_on, bt_k, bt_k)?;
-    let net_glyph = if state.ethernet { GLYPH_ETHERNET } else { GLYPH_NETWORK };
-    draw_round_with(r, l.net, Glyph::Text(net_glyph), 22.0, state.ethernet, ACCENT, 1.0, 1.0)?;
+    draw_round(r, l.bluetooth, Glyph::Bluetooth, 24.0, bt_on, bt_k, bt_k)?;
+    draw_round_with(r, l.net, Glyph::Network, 24.0, state.ethernet, ACCENT, 1.0, 1.0)?;
     draw_now_playing(r, l.media, media)?;
 
     // Dark mode pill (the "Focus" slot) and the two shortcut tiles.
     draw_module(r, l.dark, TILE_R)?;
     let moon = round_of(l.dark);
-    draw_round(r, moon, Glyph::Text(GLYPH_MOON), 19.0, state.dark, 1.0, 1.0)?;
+    draw_round(r, moon, Glyph::Moon, 21.0, state.dark, 1.0, 1.0)?;
     r.draw_text_styled(
         "Chế độ tối",
         RectF {
@@ -539,8 +520,8 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
         Align::Left,
         TextStyle::Bold,
     )?;
-    draw_pill_glyph(r, l.sound, Glyph::Speaker(1.0, false))?;
-    draw_pill_glyph(r, l.display, Glyph::Text(GLYPH_DISPLAY))?;
+    draw_pill_glyph(r, l.sound, speaker(1.0, false))?;
+    draw_pill_glyph(r, l.display, Glyph::Display)?;
 
     // Brightness: unsupported shows the note and a disabled, empty slider.
     let (br_frac, br_text) = match state.brightness {
@@ -548,16 +529,20 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
         None => (0.0, "Không hỗ trợ".to_string()),
     };
     draw_cap(r, l.brightness, "Màn hình", &br_text)?;
-    draw_capsule(r, slider_of(l.brightness), br_frac, state.brightness.is_some(), Glyph::Text(GLYPH_BRIGHTNESS), Glyph::Text(GLYPH_BRIGHTNESS))?;
+    draw_capsule(r, slider_of(l.brightness), br_frac, state.brightness.is_some(), Glyph::SunMin, Glyph::SunMax)?;
 
     // Volume: the small icon at left toggles mute.
     let vol = state.volume.clamp(0.0, 1.0);
     let vol_text = if state.muted { "Đã tắt tiếng".to_string() } else { format!("{}%", (vol * 100.0).round() as u32) };
-    draw_cap(r, l.volume, "Âm thanh  ›", &vol_text)?;
-    draw_capsule(r, slider_of(l.volume), vol, true, Glyph::Speaker(vol, state.muted), Glyph::Speaker(1.0, false))?;
+    draw_cap(r, l.volume, "Âm thanh", &vol_text)?;
+    // "Âm thanh ›": the chevron sits right after the measured title.
+    let head = head_of(l.volume);
+    let title_w = r.measure_text("Âm thanh", TITLE_PT, TextStyle::Bold).unwrap_or(62.0);
+    draw_glyph(r, RectF { x: head.x + title_w + 3.0, y: head.y, w: 12.0, h: head.h }, Glyph::Chevron, 12.0, sub())?;
+    draw_capsule(r, slider_of(l.volume), vol, true, speaker(0.0, state.muted), speaker(1.0, false))?;
 
     for (rc, (glyph, _)) in l.shortcuts.into_iter().zip(SHORTCUTS) {
-        draw_round(r, rc, Glyph::Text(glyph), 22.0, false, 1.0, 1.0)?;
+        draw_round(r, rc, glyph, 24.0, false, 1.0, 1.0)?;
     }
 
     // SmartDock Settings pill, like macOS "Edit Controls".
@@ -575,16 +560,17 @@ fn draw_now_playing(r: &mut Renderer, card: RectF, media: Option<&Media>) -> Res
     draw_module(r, card, CARD_R + 4.0)?;
     let art = RectF { x: card.x + 14.0, y: card.y + 14.0, w: 40.0, h: 40.0 };
     r.fill_rounded_rect_gradient(art, 8.0, 0xFF5F_6DFF, 0xFFC3_71FF)?;
-    r.draw_text("♪", art, 19.0, WHITE, Align::Center)?;
+    draw_glyph(r, art, Glyph::Music, 22.0, WHITE)?;
     let has = media.is_some_and(|m| !m.title.is_empty());
     let title = media.filter(|_| has).map_or("Không có gì đang phát", |m| m.title.as_str());
     let artist = media.filter(|_| has).map_or("Now Playing", |m| m.artist.as_str());
     let w = card.w - 26.0;
     r.draw_text_styled(title, RectF { x: card.x + 14.0, y: card.y + 60.0, w, h: 18.0 }, TITLE_PT, text(), Align::Left, TextStyle::Bold)?;
     r.draw_text(artist, RectF { x: card.x + 14.0, y: card.y + 77.0, w, h: 16.0 }, SUB_PT, sub(), Align::Left)?;
-    let glyphs = ["\u{E892}", if media.is_some_and(|m| m.playing) { "\u{E769}" } else { "\u{E768}" }, "\u{E893}"];
+    let glyphs = [Glyph::Prev, if media.is_some_and(|m| m.playing) { Glyph::Pause } else { Glyph::Play }, Glyph::Next];
     for (button, glyph) in media_buttons(card).into_iter().zip(glyphs) {
-        r.draw_text_styled(glyph, button, 18.0, fade(sub(), if has { 1.0 } else { 0.45 }), Align::Center, TextStyle::Icon)?;
+        let size = if matches!(glyph, Glyph::Prev | Glyph::Next) { 22.0 } else { 20.0 };
+        draw_glyph(r, button, glyph, size, fade(sub(), if has { 1.0 } else { 0.45 }))?;
     }
     Ok(())
 }

@@ -9,6 +9,14 @@ on:
       - "src/ui/popup.rs"
       - "src/ui/renderer.rs"
       - "src/ui/liquid.rs"
+      - "src/ui/ccicons.rs"
+      - "src/ui/svgpath.rs"
+      - "src/ui/appmenu.rs"
+      - "src/ui/popup_content.rs"
+      - "src/ui/calendar.rs"
+      - "src/ui/more_widgets.rs"
+      - "src/ui/gallery.rs"
+      - "src/ui/thumbnails.rs"
       - "render-inputs/**"
       - "src/main.rs"
       - ".github/workflows/render-control-center.yml"
@@ -67,14 +75,14 @@ jobs:
               }
             }
           }
-          function Invoke-Render([string]$Output, [string]$Wallpaper, [string]$Appearance) {
+          function Invoke-Render([string]$Output, [string]$Wallpaper, [string]$Appearance, [string]$Popup = "") {
             $outPath = [System.IO.Path]::GetFullPath($Output)
             $wallpaperPath = (Resolve-Path $Wallpaper).Path
             $stderrPath = [System.IO.Path]::ChangeExtension($outPath, ".stderr.log")
             $stdoutPath = [System.IO.Path]::ChangeExtension($outPath, ".stdout.log")
             Write-Host "Rendering $outPath from $wallpaperPath"
             $process = Start-Process -FilePath $exe `
-              -ArgumentList @("--render-cc", "`"$outPath`"", "`"$wallpaperPath`"", $Appearance) `
+              -ArgumentList $(if ($Popup) { @("--render-popup", $Popup, "`"$outPath`"", "`"$wallpaperPath`"", $Appearance) } else { @("--render-cc", "`"$outPath`"", "`"$wallpaperPath`"", $Appearance) }) `
               -RedirectStandardError $stderrPath `
               -RedirectStandardOutput $stdoutPath `
               -NoNewWindow -PassThru
@@ -99,6 +107,22 @@ jobs:
             $r = Invoke-Render "render-output\control_center_$name.png" "render-inputs\$name.jpg" $renders[$name]
             if ($r) { $failures += $r }
           }
+          $popups = @("calendar", "weather", "cpu", "ram", "media", "settings", "todo", "ai", "git", "currency", "notes",
+            "stopwatch", "worldclock", "screentime", "forecast", "appmenu", "dockmenu", "gallery")
+          foreach ($p in $popups) {
+            foreach ($wp in @("user_desktop", "dark_ui")) {
+              $r = Invoke-Render "render-output\popup_${p}_$wp.png" "render-inputs\$wp.jpg" "dark" $p
+              if ($r) { $failures += $r }
+            }
+          }
+          foreach ($p in @("calendar", "weather", "settings", "appmenu", "currency")) {
+            $r = Invoke-Render "render-output\popup_${p}_light.png" "render-inputs\light.jpg" "light" $p
+            if ($r) { $failures += $r }
+          }
+          $icons = [System.IO.Path]::GetFullPath("render-output\icons_sheet.png")
+          $process = Start-Process -FilePath $exe -ArgumentList @("--render-icons", "`"$icons`"") -NoNewWindow -PassThru
+          if (-not $process.WaitForExit(60000)) { $process.Kill($true); $failures += "timed out: icons" }
+          elseif ($process.WaitForExit() -or $process.ExitCode -ne 0) { Show-Logs $icons; $failures += "exit $($process.ExitCode) : icons" }
           if ($failures.Count -gt 0) { throw "Render failures: $($failures -join '; ')" }
       - name: Validate rendered PNGs
         shell: pwsh
@@ -109,8 +133,11 @@ jobs:
             "render-output\control_center_dark.png",
             "render-output\control_center_user_desktop.png",
             "render-output\control_center_macos_ref.png",
-            "render-output\control_center_dark_ui.png"
+            "render-output\control_center_dark_ui.png",
+            "render-output\icons_sheet.png"
           )
+          $expected += Get-ChildItem "render-output\popup_*.png" | ForEach-Object { $_.FullName }
+          if (@(Get-ChildItem "render-output\popup_*.png").Count -lt 41) { throw "Missing popup renders" }
           foreach ($path in $expected) {
             if (-not (Test-Path $path)) { throw "Missing render: $path" }
             $file = Get-Item $path

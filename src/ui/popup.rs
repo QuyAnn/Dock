@@ -206,6 +206,8 @@ pub fn show_floating_modules(anchor: RectF, width: f32, height: i32) -> Result<(
 }
 
 fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> Result<()> {
+    // Popups follow the system appearance: smoky dark or milky light glass.
+    super::glass::set_control_dark(crate::win::system::dark_mode());
     let dpi = dpi::system_dpi();
     let width_px = dpi::dip_to_px(width, dpi);
     let height_px = dpi::dip_to_px(height as f32, dpi);
@@ -234,7 +236,7 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
         }
         pw.renderer.release();
         if let Some(bg) = pw.backdrop.take() { super::glass::release_backdrop(&bg); }
-        pw.backdrop = super::glass::popup_backdrop_for(rect, monitor, dpi, floating_modules);
+        pw.backdrop = super::glass::popup_backdrop_for(rect, monitor, dpi, true);
         pw.renderer.resize(width_px, height_px, dpi);
         unsafe {
             let _ = SetWindowPos(
@@ -282,7 +284,7 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
         anchor,
         mouse_down: true,
         esc_down: true,
-        backdrop: super::glass::popup_backdrop_for(rect, monitor, dpi, floating_modules),
+        backdrop: super::glass::popup_backdrop_for(rect, monitor, dpi, true),
         floating_modules,
     };
     style_window(hwnd);
@@ -528,20 +530,17 @@ fn paint() {
             let res = pw.renderer.begin().and_then(|_| {
                 // Apple-style continuous-looking corners: the window is fully transparent and the
                 // panel is drawn (anti-aliased) with its own radius.
-                let radius = if super::glass::panel_light() { 24.0 } else { 14.0 };
-                match &backdrop {
-                    Some(bd) => {
-                        super::glass::set_backdrop(Some(bd.clone()), w, h);
-                        if !pw.floating_modules {
-                            super::glass::draw_panel_glass(&mut pw.renderer, rect, radius)?;
-                        }
-                    }
-                    None if !pw.floating_modules => super::glass::draw_panel(&mut pw.renderer, rect, radius)?,
-                    None => super::glass::set_backdrop(None, w, h),
+                let radius = if super::glass::panel_light() { 24.0 } else { 18.0 };
+                // Every popup shares the Control Center glass (captured once per open).
+                super::glass::set_backdrop(backdrop.clone(), w, h);
+                if !pw.floating_modules {
+                    super::glass::draw_popup_surface(&mut pw.renderer, rect, radius)?;
                 }
+                super::renderer::set_light_ink(!pw.floating_modules && !super::glass::control_dark());
                 if let Some(f) = PAINTER.with(Cell::get) {
                     f(&mut pw.renderer, rect);
                 }
+                super::renderer::set_light_ink(false);
                 super::glass::set_backdrop(None, w, h);
                 pw.renderer.end()
             });
