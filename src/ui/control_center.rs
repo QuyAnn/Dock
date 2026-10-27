@@ -125,17 +125,17 @@ fn output_row(rect: RectF, i: usize) -> RectF {
 fn draw_outputs(r: &mut Renderer, rect: RectF, list: &[system::AudioOutput]) -> Result<()> {
     let back = outputs_back(rect);
     draw_module(r, back, back.h / 2.0)?;
-    r.draw_text_styled("‹  Đầu ra âm thanh", RectF { x: back.x + 12.0, w: back.w - 24.0, ..back }, 12.0, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text_styled("‹  Đầu ra âm thanh", RectF { x: back.x + 12.0, w: back.w - 24.0, ..back }, 12.0, text(), Align::Left, TextStyle::Bold)?;
     if list.is_empty() {
-        return r.draw_text("Không tìm thấy thiết bị", output_row(rect, 0), 11.5, SUB, Align::Center);
+        return r.draw_text("Không tìm thấy thiết bị", output_row(rect, 0), 11.5, sub(), Align::Center);
     }
     for (i, d) in list.iter().enumerate() {
         let row = output_row(rect, i);
         draw_module(r, row, 16.0)?;
         let dot = RectF { x: row.x + 10.0, y: row.y + (row.h - 24.0) / 2.0, w: 24.0, h: 24.0 };
-        draw_glyph(r, dot, Glyph::Speaker(1.0, false), 13.0, if d.is_default { TEXT } else { SUB })?;
-        let text = RectF { x: row.x + 42.0, y: row.y, w: row.w - 42.0 - 34.0, h: row.h };
-        r.draw_text_styled(&d.name, text, 11.5, TEXT, Align::Left, if d.is_default { TextStyle::Bold } else { TextStyle::Ui })?;
+        draw_glyph(r, dot, Glyph::Speaker(1.0, false), 13.0, if d.is_default { text() } else { sub() })?;
+        let label = RectF { x: row.x + 42.0, y: row.y, w: row.w - 42.0 - 34.0, h: row.h };
+        r.draw_text_styled(&d.name, label, 11.5, text(), Align::Left, if d.is_default { TextStyle::Bold } else { TextStyle::Ui })?;
         if d.is_default {
             let c = RectF { x: row.x + row.w - 30.0, y: row.y + (row.h - 18.0) / 2.0, w: 18.0, h: 18.0 };
             r.fill_rounded_rect(c, 9.0, ACCENT)?;
@@ -204,11 +204,35 @@ const TRACK_H: f32 = 4.0;
 // Colors 0xRRGGBBAA.
 const WHITE: u32 = 0xFFFF_FFFF;
 const ACCENT: u32 = 0x0A84_FFFF; // macOS system blue #0A84FF
-const TEXT: u32 = 0xFFFF_FFFF;
-const SUB: u32 = 0xFFFF_FFA6;
-const TRACK: u32 = 0xFFFF_FF33;
-const FILL: u32 = 0xFFFF_FFF2;
-const GLYPH_DARK: u32 = 0x5555_55FF;
+
+thread_local! {
+    /// Appearance used by the palette below; set at the start of `draw` from `ControlState::dark`.
+    static DARK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+fn dark() -> bool {
+    DARK.with(|d| d.get())
+}
+
+/// Title text and glyphs: white in dark mode, near-black in light mode (macOS).
+fn text() -> u32 {
+    if dark() { 0xFFFF_FFFF } else { 0x1D1D_1FFF }
+}
+
+/// Secondary text and slider end icons.
+fn sub() -> u32 {
+    if dark() { 0xFFFF_FFB0 } else { 0x1D1D_1FA0 }
+}
+
+/// Slider track: translucent light line (darker translucent in light mode).
+fn track() -> u32 {
+    if dark() { 0xFFFF_FF40 } else { 0x0000_002A }
+}
+
+/// Slider fill: a thin solid bar.
+fn fill() -> u32 {
+    if dark() { 0xFFFF_FFFF } else { 0x2C2C_2EE6 }
+}
 
 // Segoe MDL2 Assets codepoints.
 const GLYPH_BT: &str = "\u{E702}";
@@ -314,14 +338,25 @@ fn fade(rgba: u32, k: f32) -> u32 {
 
 /// Circle button, macOS Control Center style. ON = filled white with a blue glyph;
 /// OFF = translucent liquid-glass circle with a white glyph.
+/// A rect no wider than `ROUND` is a badge inside a labelled module; a larger one is a
+/// free-standing round module, which keeps its clear glass and gets a white badge inside when on.
 fn draw_round(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, k: f32, icon_k: f32) -> Result<()> {
     let radius = rect.h / 2.0;
-    if on {
-        super::glass::draw_control_active(r, rect, radius, k)?;
-    } else {
-        super::glass::draw_control_card(r, rect, radius)?;
+    let badge_only = rect.w <= ROUND + 1.0;
+    let mut glyph_rect = rect;
+    match (on, badge_only) {
+        (true, true) => super::glass::draw_control_active(r, rect, radius, k)?,
+        (true, false) => {
+            super::glass::draw_control_card(r, rect, radius)?;
+            let badge = RectF { x: rect.x + (rect.w - ROUND) / 2.0, y: rect.y + (rect.h - ROUND) / 2.0, w: ROUND, h: ROUND };
+            super::glass::draw_control_active(r, badge, ROUND / 2.0, k)?;
+            glyph_rect = badge;
+        }
+        (false, true) => super::glass::draw_control_badge(r, rect, radius)?,
+        (false, false) => super::glass::draw_control_card(r, rect, radius)?,
     }
-    draw_glyph(r, rect, glyph, size, fade(if on { ACCENT } else { TEXT }, icon_k))
+    let size = if on && !badge_only { size.min(18.0) } else { size };
+    draw_glyph(r, glyph_rect, glyph, size, fade(if on { ACCENT } else { text() }, icon_k))
 }
 
 /// A panel icon: a Segoe glyph, or the dock's SF-style vector Wi-Fi / speaker icons.
@@ -375,22 +410,22 @@ fn draw_toggle(r: &mut Renderer, tile: RectF, t: Toggle) -> Result<()> {
     draw_round(r, round_of(tile), t.glyph, 18.0, t.on, rk, rk * icon_k)?;
     let tx = tile.x + 7.0 + ROUND + 8.0;
     let tw = (tile.x + tile.w - 7.0 - tx).max(0.0);
-    r.draw_text_styled(t.label, RectF { x: tx, y: tile.y + 7.0, w: tw, h: 16.0 }, 11.5, fade(TEXT, k), Align::Left, TextStyle::Bold)?;
-    r.draw_text(t.sub, RectF { x: tx, y: tile.y + 23.0, w: tw, h: 15.0 }, 10.0, fade(SUB, k), Align::Left)
+    r.draw_text_styled(t.label, RectF { x: tx, y: tile.y + 7.0, w: tw, h: 16.0 }, 11.5, fade(text(), k), Align::Left, TextStyle::Bold)?;
+    r.draw_text(t.sub, RectF { x: tx, y: tile.y + 23.0, w: tw, h: 15.0 }, 10.0, fade(sub(), k), Align::Left)
 }
 
 /// Stadium pill with one centred glyph (network / sound shortcuts).
 fn draw_pill_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph) -> Result<()> {
     draw_module(r, rect, TILE_R)?;
-    draw_glyph(r, rect, glyph, 18.0, TEXT)
+    draw_glyph(r, rect, glyph, 18.0, text())
 }
 
 /// Slider card background with its title and right-aligned value.
 fn draw_cap(r: &mut Renderer, card: RectF, title: &str, value: &str) -> Result<()> {
     draw_module(r, card, CARD_R)?;
     let head = head_of(card);
-    r.draw_text_styled(title, head, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(value, head, 10.5, SUB, Align::Right)
+    r.draw_text_styled(title, head, 11.5, text(), Align::Left, TextStyle::Bold)?;
+    r.draw_text(value, head, 10.5, sub(), Align::Right)
 }
 
 /// macOS slider row: small icon, thin track with white fill and a round thumb, big icon.
@@ -400,15 +435,16 @@ fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, left: Glyp
     let bar = RectF { x: t.x, y: t.y + (t.h - TRACK_H) / 2.0, w: t.w, h: TRACK_H };
     let x0 = t.x + THUMB / 2.0;
     let end = x0 + (t.w - THUMB) * frac.clamp(0.0, 1.0);
-    r.fill_rounded_rect(bar, TRACK_H / 2.0, fade(TRACK, k))?;
-    if end > bar.x {
-        r.fill_rounded_rect(RectF { w: end - bar.x, ..bar }, TRACK_H / 2.0, fade(FILL, k))?;
+    // macOS 26/27: a thin solid fill on a translucent track, no knob.
+    let end = end + THUMB / 2.0 * frac.clamp(0.0, 1.0);
+    r.fill_rounded_rect(bar, TRACK_H / 2.0, fade(track(), k))?;
+    if end > bar.x + TRACK_H {
+        r.fill_rounded_rect(RectF { w: end - bar.x, ..bar }, TRACK_H / 2.0, fade(fill(), k))?;
     }
-    r.fill_rounded_rect(RectF { x: end - THUMB / 2.0, y: t.y, w: THUMB, h: THUMB }, THUMB / 2.0, fade(WHITE, k))?;
     let slot = icon_of(s);
-    draw_glyph(r, RectF { w: END_W - 4.0, ..slot }, left, 11.0, fade(SUB, k))?;
+    draw_glyph(r, RectF { w: END_W - 4.0, ..slot }, left, 11.0, fade(sub(), k))?;
     let rs = RectF { x: s.x + s.w - END_W + 4.0, w: END_W - 4.0, ..slot };
-    draw_glyph(r, rs, right, 15.0, fade(SUB, k))
+    draw_glyph(r, rs, right, 15.0, fade(sub(), k))
 }
 
 fn radio_sub(v: Option<bool>) -> &'static str {
@@ -421,6 +457,8 @@ fn radio_sub(v: Option<bool>) -> &'static str {
 
 /// Draws the whole panel into `rect`.
 pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&Media>) -> Result<()> {
+    DARK.with(|d| d.set(state.dark));
+    super::glass::set_control_dark(state.dark);
     if let Some(done) = OUTPUTS.with(|o| o.borrow().as_ref().map(|l| draw_outputs(r, rect, l))) {
         return done;
     }
@@ -464,7 +502,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
             h: l.dark.h,
         },
         10.5,
-        TEXT,
+        text(),
         Align::Left,
         TextStyle::Bold,
     )?;
@@ -491,7 +529,7 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
 
     // SmartDock Settings pill, like macOS "Edit Controls".
     draw_module(r, l.settings, l.settings.h / 2.0)?;
-    r.draw_text_styled("Cài đặt SmartDock", l.settings, 10.5, TEXT, Align::Center, TextStyle::Bold)
+    r.draw_text_styled("Cài đặt SmartDock", l.settings, 10.5, text(), Align::Center, TextStyle::Bold)
 }
 
 /// Prev / play / next, centred along the bottom of the Now Playing tile.
@@ -509,11 +547,11 @@ fn draw_now_playing(r: &mut Renderer, card: RectF, media: Option<&Media>) -> Res
     let title = media.filter(|_| has).map_or("Không có gì đang phát", |m| m.title.as_str());
     let artist = media.filter(|_| has).map_or("Now Playing", |m| m.artist.as_str());
     let w = card.w - 20.0;
-    r.draw_text_styled(title, RectF { x: card.x + 10.0, y: card.y + 47.0, w, h: 15.0 }, 10.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(artist, RectF { x: card.x + 10.0, y: card.y + 61.0, w, h: 13.0 }, 9.5, SUB, Align::Left)?;
+    r.draw_text_styled(title, RectF { x: card.x + 10.0, y: card.y + 47.0, w, h: 15.0 }, 10.5, text(), Align::Left, TextStyle::Bold)?;
+    r.draw_text(artist, RectF { x: card.x + 10.0, y: card.y + 61.0, w, h: 13.0 }, 9.5, sub(), Align::Left)?;
     let glyphs = ["\u{E892}", if media.is_some_and(|m| m.playing) { "\u{E769}" } else { "\u{E768}" }, "\u{E893}"];
     for (button, glyph) in media_buttons(card).into_iter().zip(glyphs) {
-        r.draw_text_styled(glyph, button, 13.0, fade(TEXT, if has { 1.0 } else { 0.4 }), Align::Center, TextStyle::Icon)?;
+        r.draw_text_styled(glyph, button, 13.0, fade(text(), if has { 1.0 } else { 0.4 }), Align::Center, TextStyle::Icon)?;
     }
     Ok(())
 }

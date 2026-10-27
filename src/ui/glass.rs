@@ -48,8 +48,10 @@ pub enum Layer {
     Tile,
     /// Start / app icon plates: brightest, clearest layer.
     Plate,
-    /// Clear floating Control Center modules: lighter than data tiles, with no dock-style tint.
+    /// Clear floating Control Center modules (dark appearance): almost clear, faint white veil.
     Control,
+    /// Control Center modules in the light appearance: same clear glass, slightly brighter veil.
+    ControlLight,
 }
 
 /// Uniform corner radius for tiles and plates (continuous-looking at 34 DIP height).
@@ -120,6 +122,7 @@ pub fn draw_glass(r: &mut Renderer, rect: RectF, radius: f32, layer: Layer, hove
             match layer {
                 Layer::Plate => 0xB4AA_A04D,
                 Layer::Control => 0xFFFF_FF2A,
+                Layer::ControlLight => 0xFFFF_FF40,
                 Layer::Tile => 0x8C84_7C59,
             },
         )?,
@@ -268,8 +271,14 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     let (lift, sat, target) = match layer {
         Layer::Tile => (0.10, 1.12, 118.0),
         Layer::Plate => (0.16, 1.10, 168.0),
-        Layer::Control => (0.14, 1.08, 148.0),
+        // Control Center: a ~8% white veil, no extra saturation; dim only very bright backdrops.
+        Layer::Control => (0.08, 1.0, 170.0),
+        Layer::ControlLight => (0.16, 1.0, 255.0),
     };
+    let control = matches!(layer, Layer::Control | Layer::ControlLight);
+    // Control modules are thicker "lenses": a wider refraction band and a gentle edge brightening.
+    let (band, k) = if control { (11.0 * dpr, 7.0 * dpr) } else { (band, k) };
+    let edge_glow = if control { 0.16 } else { 0.0 };
     let mut rgb = vec![0f32; (w * h * 3) as usize];
     let mut alpha = vec![0u8; (w * h) as usize];
     let (mut lum_sum, mut lum_n) = (0f32, 0f32);
@@ -310,11 +319,13 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 let bb = sample(sx - nx * m * 0.95, sy - ny * m * 0.95);
                 [rr[0], gg[1], bb[2]]
             };
-            // Clear material: saturate slightly, then lift toward white.
+            // Clear material: saturate slightly, then lift toward white (more near the rim).
+            let edge = if depth < band { 1.0 - depth.max(0.0) / band } else { 0.0 };
+            let lift_here = lift + edge_glow * edge * edge;
             let l0 = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
             for v in &mut c {
                 *v = l0 + (*v - l0) * sat;
-                *v += (255.0 - *v) * lift;
+                *v += (255.0 - *v) * lift_here;
             }
             let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
             lum_sum += l;
@@ -352,6 +363,18 @@ pub fn set_wallpaper(wp: crate::win::wallpaper::WallpaperPixels) {
 /// Liquid Glass backdrop for a popup whose window sits at `rect` (screen px) on `monitor`.
 /// None until the wallpaper has been decoded; the popup then falls back to plain acrylic.
 pub fn popup_backdrop(rect: windows::Win32::Foundation::RECT, monitor: windows::Win32::Foundation::RECT, dpi: u32) -> Option<Arc<LiquidBitmap>> {
+    popup_backdrop_for(rect, monitor, dpi, false)
+}
+
+/// `popup_backdrop`; `control_center` selects the lightly blurred clear-glass material used by the
+/// floating Control Center modules instead of the heavy popup frost.
+pub fn popup_backdrop_for(
+    rect: windows::Win32::Foundation::RECT,
+    monitor: windows::Win32::Foundation::RECT,
+    dpi: u32,
+    control_center: bool,
+) -> Option<Arc<LiquidBitmap>> {
+    let lens = if control_center { &super::liquid::CONTROL_LENS } else { &super::liquid::FROST_LENS };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     };
@@ -372,7 +395,7 @@ pub fn popup_backdrop(rect: windows::Win32::Foundation::RECT, monitor: windows::
             w: (rect.right - rect.left) as f32,
             h: (rect.bottom - rect.top) as f32,
         };
-        return Some(Arc::new(super::liquid::render_frost(&grab, r, dpr)));
+        return Some(Arc::new(super::liquid::render_frost_with(&grab, r, dpr, lens)));
     }
     let source = WALLPAPER.lock().ok()?.clone()?;
     let wp = source.load().ok()?;
@@ -398,7 +421,7 @@ pub fn popup_backdrop(rect: windows::Win32::Foundation::RECT, monitor: windows::
         w: (rect.right - rect.left) as f32,
         h: (rect.bottom - rect.top) as f32,
     };
-    Some(Arc::new(super::liquid::render_popup(&wp, r, screen, dpi as f32 / 96.0)))
+    Some(Arc::new(super::liquid::render_popup_with(&wp, r, screen, dpi as f32 / 96.0, lens)))
 }
 
 /// Whole-popup glass for a fully transparent window: the frosted backdrop cut to a rounded shape
@@ -430,24 +453,80 @@ pub fn draw_card(r: &mut Renderer, rect: RectF, radius: f32, fallback: u32, k: f
     }
 }
 
-/// One free-floating Control Center module. This additive material is deliberately separate from
-/// dock tiles and normal popup cards, so their appearance remains unchanged.
-pub fn draw_control_card(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
-    if CTX.with(|c| c.borrow().is_some()) {
-        draw_glass(r, rect, radius, Layer::Control, false)
-    } else {
-        draw_shadow(r, rect, radius)?;
-        r.fill_rounded_rect(rect, radius, 0xFFFF_FF2A)?;
-        draw_highlights(r, rect, radius, 1.1)
-    }
+/// Appearance of the Control Center modules (true = dark). Set by `control_center::draw`.
+static CONTROL_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_control_dark(dark: bool) {
+    CONTROL_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Active Control Center toggle: an opaque white button over the same soft shadow and rim.
+fn control_dark() -> bool {
+    CONTROL_DARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// One free-floating Control Center module: macOS 26/27 clear glass. The lightly blurred backdrop
+/// shows through a faint veil, the rim refracts and brightens, and a crisp specular edge plus a
+/// very soft shadow make it read as a thick lens. Separate from dock tiles and popup cards.
+pub fn draw_control_card(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    if rect.w < 1.0 || rect.h < 1.0 {
+        return Ok(());
+    }
+    let radius = radius.min(rect.w / 2.0).min(rect.h / 2.0);
+    let dark = control_dark();
+    draw_control_shadow(r, rect, radius)?;
+    let layer = if dark { Layer::Control } else { Layer::ControlLight };
+    match piece_for(rect, radius, layer) {
+        Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
+        None => r.fill_rounded_rect(rect, radius, if dark { 0xFFFF_FF1C } else { 0xFFFF_FF38 })?,
+    }
+    draw_control_rims(r, rect, radius, if dark { 1.0 } else { 1.15 })
+}
+
+/// Crisp 1.25 px specular rim (brightest top-left, faint at the bottom), a thin inner highlight
+/// hugging the top edge, and a barely-there bottom inner shade.
+fn draw_control_rims(r: &mut Renderer, rect: RectF, radius: f32, k: f32) -> Result<()> {
+    let a = |base: f32| ((base * k).min(255.0)) as u32;
+    let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
+    // Inner top highlight: a narrow band just under the top rim.
+    let band = (h * 0.22).clamp(4.0, 14.0);
+    r.fill_rounded_rect_linear(rect, radius, (x, y), 0xFFFF_FF00 | a(30.0), (x, y + band), 0xFFFF_FF00)?;
+    // Second inner line 1 px inside the rim: thick-glass edge, bright on top, gone at the bottom.
+    let inner = RectF { x: x + 1.25, y: y + 1.25, w: (w - 2.5).max(0.0), h: (h - 2.5).max(0.0) };
+    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y), 0xFFFF_FF00 | a(46.0), (x, y + h * 0.5), 0xFFFF_FF00, 1.0)?;
+    // Bottom inner shade, very faint.
+    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y + h * 0.6), 0x0000_0000, (x, y + h), 0x0000_0018, 1.0)?;
+    // Outer specular rim: bright top/left, fading toward the bottom-right.
+    let edge = RectF { x: x + 0.25, y: y + 0.25, w: (w - 0.5).max(0.0), h: (h - 0.5).max(0.0) };
+    let reach = w.min(h * 2.2);
+    r.stroke_rounded_rect_linear(edge, radius, (x, y), 0xFFFF_FF00 | a(200.0), (x + reach * 0.45, y + h), 0xFFFF_FF00 | a(60.0), 1.25)?;
+    // Faint secondary glint at the bottom-right.
+    r.stroke_rounded_rect_linear(edge, radius, (x + w, y + h), 0xFFFF_FF00 | a(70.0), (x + w - reach * 0.5, y + h * 0.4), 0xFFFF_FF00, 1.0)
+}
+
+/// Very soft, low-opacity drop shadow (wide and faint, slightly below the module).
+fn draw_control_shadow(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    for i in 1..=6 {
+        let g = i as f32 * 1.4;
+        let sh = RectF { x: rect.x - g * 0.5, y: rect.y + 1.5 + g * 0.35, w: rect.w + g, h: rect.h + g * 0.5 };
+        r.fill_rounded_rect(sh, radius + g * 0.5, 0x0000_0006)?;
+    }
+    Ok(())
+}
+
+/// Active toggle badge: an opaque white circle (the glyph on it is system blue).
 pub fn draw_control_active(r: &mut Renderer, rect: RectF, radius: f32, opacity: f32) -> Result<()> {
-    draw_shadow(r, rect, radius)?;
     let alpha = (255.0 * opacity.clamp(0.0, 1.0)).round() as u32;
-    r.fill_rounded_rect(rect, radius, 0xFFFF_FF00 | alpha)?;
-    draw_highlights(r, rect, radius, 0.55 * opacity)
+    let sh = RectF { y: rect.y + 1.0, ..rect };
+    r.fill_rounded_rect(sh, radius, 0x0000_0000 | (alpha * 18 / 255))?;
+    r.fill_rounded_rect(rect, radius, 0xFFFF_FF00 | alpha)
+}
+
+/// Inactive badge inside a labelled module (e.g. the moon while dark mode is off): a slightly
+/// brighter clear disc with a faint rim.
+pub fn draw_control_badge(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    let fill = if control_dark() { 0xFFFF_FF1E } else { 0xFFFF_FF55 };
+    r.fill_rounded_rect(rect, radius, fill)?;
+    r.stroke_rounded_rect_linear(rect, radius, (rect.x, rect.y), 0xFFFF_FF50, (rect.x, rect.y + rect.h), 0xFFFF_FF10, 1.0)
 }
 
 /// Grabs the composed desktop (everything visible, including other apps) in `rect` (virtual-screen

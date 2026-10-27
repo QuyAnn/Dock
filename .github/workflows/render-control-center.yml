@@ -8,6 +8,8 @@ on:
       - "src/ui/glass.rs"
       - "src/ui/popup.rs"
       - "src/ui/renderer.rs"
+      - "src/ui/liquid.rs"
+      - "render-inputs/**"
       - "src/main.rs"
       - ".github/workflows/render-control-center.yml"
   workflow_dispatch:
@@ -65,14 +67,14 @@ jobs:
               }
             }
           }
-          function Invoke-Render([string]$Output, [string]$Wallpaper) {
+          function Invoke-Render([string]$Output, [string]$Wallpaper, [string]$Appearance) {
             $outPath = [System.IO.Path]::GetFullPath($Output)
             $wallpaperPath = (Resolve-Path $Wallpaper).Path
             $stderrPath = [System.IO.Path]::ChangeExtension($outPath, ".stderr.log")
             $stdoutPath = [System.IO.Path]::ChangeExtension($outPath, ".stdout.log")
             Write-Host "Rendering $outPath from $wallpaperPath"
             $process = Start-Process -FilePath $exe `
-              -ArgumentList @("--render-cc", "`"$outPath`"", "`"$wallpaperPath`"") `
+              -ArgumentList @("--render-cc", "`"$outPath`"", "`"$wallpaperPath`"", $Appearance) `
               -RedirectStandardError $stderrPath `
               -RedirectStandardOutput $stdoutPath `
               -NoNewWindow -PassThru
@@ -90,8 +92,11 @@ jobs:
             if (Test-Path $outPath) { Write-Host "PNG size: $((Get-Item $outPath).Length) bytes" }
             return $null
           }
-          foreach ($name in @("ocean", "light", "dark")) {
-            $r = Invoke-Render "render-output\control_center_$name.png" "render-inputs\$name.jpg"
+          $renders = [ordered]@{
+            "ocean" = "dark"; "light" = "light"; "dark" = "dark"; "user_desktop" = "dark"; "macos_ref" = "dark"
+          }
+          foreach ($name in $renders.Keys) {
+            $r = Invoke-Render "render-output\control_center_$name.png" "render-inputs\$name.jpg" $renders[$name]
             if ($r) { $failures += $r }
           }
           if ($failures.Count -gt 0) { throw "Render failures: $($failures -join '; ')" }
@@ -101,7 +106,9 @@ jobs:
           $expected = @(
             "render-output\control_center_ocean.png",
             "render-output\control_center_light.png",
-            "render-output\control_center_dark.png"
+            "render-output\control_center_dark.png",
+            "render-output\control_center_user_desktop.png",
+            "render-output\control_center_macos_ref.png"
           )
           foreach ($path in $expected) {
             if (-not (Test-Path $path)) { throw "Missing render: $path" }

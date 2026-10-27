@@ -234,7 +234,7 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
         }
         pw.renderer.release();
         if let Some(bg) = pw.backdrop.take() { super::glass::release_backdrop(&bg); }
-        pw.backdrop = super::glass::popup_backdrop(rect, monitor, dpi);
+        pw.backdrop = super::glass::popup_backdrop_for(rect, monitor, dpi, floating_modules);
         pw.renderer.resize(width_px, height_px, dpi);
         unsafe {
             let _ = SetWindowPos(
@@ -282,7 +282,7 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
         anchor,
         mouse_down: true,
         esc_down: true,
-        backdrop: super::glass::popup_backdrop(rect, monitor, dpi),
+        backdrop: super::glass::popup_backdrop_for(rect, monitor, dpi, floating_modules),
         floating_modules,
     };
     style_window(hwnd);

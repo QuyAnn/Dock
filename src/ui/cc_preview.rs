@@ -14,13 +14,15 @@ use super::renderer::Renderer;
 use crate::model::Media;
 use crate::win::wallpaper;
 
+/// Canvas in DIPs; rendered at 2x (192 DPI) so the glass rims compare fairly with Retina captures.
 const CANVAS_W: u32 = 720;
 const CANVAS_H: u32 = 480;
+const SCALE: u32 = 2;
 const PANEL_RIGHT: f32 = 30.0;
 const PANEL_TOP: f32 = 39.5;
 
 /// Renders the production Control Center over `wallpaper_path` with deterministic fake state.
-pub fn render(out_path: &Path, wallpaper_path: &Path) -> Result<()> {
+pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
     let log_path = out_path.with_extension("log");
     let trace = |msg: &str| {
         use std::io::Write;
@@ -36,25 +38,22 @@ pub fn render(out_path: &Path, wallpaper_path: &Path) -> Result<()> {
         return Err(Error::from(E_INVALIDARG));
     }
     trace(&format!("wallpaper decoded {source_w}x{source_h} ({} bytes)", source.len()));
-    let background = cover_crop(
-        source_w,
-        source_h,
-        &source,
-        CANVAS_W,
-        CANVAS_H,
-    );
+    let (px_w, px_h) = (CANVAS_W * SCALE, CANVAS_H * SCALE);
+    let background = cover_crop(source_w, source_h, &source, px_w, px_h);
     trace("cover crop done; rendering frost");
     let grab = ScreenGrab {
         x: 0,
         y: 0,
-        w: CANVAS_W as i32,
-        h: CANVAS_H as i32,
+        w: px_w as i32,
+        h: px_h as i32,
         rgba: background.clone(),
     };
-    let frost = Arc::new(liquid::render_frost(
+    // Same material as the live Control Center popup (`popup_backdrop_for(.., true)`).
+    let frost = Arc::new(liquid::render_frost_with(
         &grab,
-        RectF { x: 0.0, y: 0.0, w: CANVAS_W as f32, h: CANVAS_H as f32 },
-        1.0,
+        RectF { x: 0.0, y: 0.0, w: px_w as f32, h: px_h as f32 },
+        SCALE as f32,
+        &liquid::CONTROL_LENS,
     ));
     trace(&format!("frost rendered {}x{}", frost.w, frost.h));
     let state = ControlState {
@@ -65,7 +64,7 @@ pub fn render(out_path: &Path, wallpaper_path: &Path) -> Result<()> {
         wifi_signal: Some(88),
         ethernet: false,
         bluetooth: Some(true),
-        dark: true,
+        dark,
     };
     let media = Media {
         title: "Golden Hour".to_string(),
@@ -80,10 +79,10 @@ pub fn render(out_path: &Path, wallpaper_path: &Path) -> Result<()> {
     };
 
     trace("starting Direct2D/WIC render");
-    let result = Renderer::render_png(out_path, CANVAS_W, CANVAS_H, 96, |renderer| {
+    let result = Renderer::render_png(out_path, px_w, px_h, 96 * SCALE, |renderer| {
         renderer.draw_bitmap(
-            CANVAS_W,
-            CANVAS_H,
+            px_w,
+            px_h,
             &background,
             RectF { x: 0.0, y: 0.0, w: CANVAS_W as f32, h: CANVAS_H as f32 },
         )?;

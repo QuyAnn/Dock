@@ -217,8 +217,9 @@ fn render_control_center_cli() -> Option<i32> {
     if !args.get(1).is_some_and(|a| a == "--render-cc") {
         return None;
     }
-    if args.len() != 4 {
-        let msg = "Usage: smartdock.exe --render-cc <out.png> <wallpaper>\n";
+    let appearance = args.get(4).map(|a| a.to_string_lossy().to_ascii_lowercase());
+    if !(args.len() == 4 || (args.len() == 5 && matches!(appearance.as_deref(), Some("dark" | "light")))) {
+        let msg = "Usage: smartdock.exe --render-cc <out.png> <wallpaper> [dark|light]\n";
         eprint!("{msg}");
         let _ = std::fs::write("render-control-center.log", msg);
         return Some(2);
@@ -235,7 +236,7 @@ fn render_control_center_cli() -> Option<i32> {
         }
     }));
     let rendered = std::panic::catch_unwind(|| {
-        ui::cc_preview::render(&out, std::path::Path::new(&args[3]))
+        ui::cc_preview::render(&out, std::path::Path::new(&args[3]), appearance.as_deref() != Some("light"))
     });
     match rendered {
         Ok(Ok(())) => Some(0),
