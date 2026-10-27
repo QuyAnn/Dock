@@ -272,13 +272,13 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         Layer::Tile => (0.10, 1.12, 118.0),
         Layer::Plate => (0.16, 1.10, 168.0),
         // Control Center: a ~8% white veil, no extra saturation; dim only very bright backdrops.
-        Layer::Control => (0.08, 1.0, 170.0),
-        Layer::ControlLight => (0.16, 1.0, 255.0),
+        Layer::Control => (0.05, 1.0, 170.0),
+        Layer::ControlLight => (0.13, 1.0, 255.0),
     };
     let control = matches!(layer, Layer::Control | Layer::ControlLight);
     // Control modules are thicker "lenses": a wider refraction band and a gentle edge brightening.
     let (band, k) = if control { (11.0 * dpr, 7.0 * dpr) } else { (band, k) };
-    let edge_glow = if control { 0.16 } else { 0.0 };
+    let edge_glow = if control { 0.07 } else { 0.0 };
     let mut rgb = vec![0f32; (w * h * 3) as usize];
     let mut alpha = vec![0u8; (w * h) as usize];
     let (mut lum_sum, mut lum_n) = (0f32, 0f32);
@@ -489,16 +489,16 @@ fn draw_control_rims(r: &mut Renderer, rect: RectF, radius: f32, k: f32) -> Resu
     let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
     // Inner top highlight: a narrow band just under the top rim.
     let band = (h * 0.22).clamp(4.0, 14.0);
-    r.fill_rounded_rect_linear(rect, radius, (x, y), 0xFFFF_FF00 | a(30.0), (x, y + band), 0xFFFF_FF00)?;
+    r.fill_rounded_rect_linear(rect, radius, (x, y), 0xFFFF_FF00 | a(22.0), (x, y + band), 0xFFFF_FF00)?;
     // Second inner line 1 px inside the rim: thick-glass edge, bright on top, gone at the bottom.
     let inner = RectF { x: x + 1.25, y: y + 1.25, w: (w - 2.5).max(0.0), h: (h - 2.5).max(0.0) };
-    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y), 0xFFFF_FF00 | a(46.0), (x, y + h * 0.5), 0xFFFF_FF00, 1.0)?;
+    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y), 0xFFFF_FF00 | a(26.0), (x, y + h * 0.4), 0xFFFF_FF00, 1.0)?;
     // Bottom inner shade, very faint.
-    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y + h * 0.6), 0x0000_0000, (x, y + h), 0x0000_0018, 1.0)?;
+    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y + h * 0.6), 0x0000_0000, (x, y + h), 0x0000_0022, 1.0)?;
     // Outer specular rim: bright top/left, fading toward the bottom-right.
     let edge = RectF { x: x + 0.25, y: y + 0.25, w: (w - 0.5).max(0.0), h: (h - 0.5).max(0.0) };
     let reach = w.min(h * 2.2);
-    r.stroke_rounded_rect_linear(edge, radius, (x, y), 0xFFFF_FF00 | a(200.0), (x + reach * 0.45, y + h), 0xFFFF_FF00 | a(60.0), 1.25)?;
+    r.stroke_rounded_rect_linear(edge, radius, (x, y), 0xFFFF_FF00 | a(185.0), (x + reach * 0.45, y + h), 0xFFFF_FF00 | a(34.0), 1.25)?;
     // Faint secondary glint at the bottom-right.
     r.stroke_rounded_rect_linear(edge, radius, (x + w, y + h), 0xFFFF_FF00 | a(70.0), (x + w - reach * 0.5, y + h * 0.4), 0xFFFF_FF00, 1.0)
 }
