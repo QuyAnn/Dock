@@ -129,7 +129,8 @@ enum OpenPopup {
 /// Click resolved on the UI thread; side effects run after the APP borrow is released.
 enum Click {
     None,
-    Activate(isize),
+    /// One or more hwnds of the same app (taskbar-style group toggle).
+    Activate(Vec<isize>),
     /// Pinned app with no open window.
     Launch(String),
     Start,
@@ -1269,7 +1270,18 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
         match id {
             "apps" => match apps::hit_app_index(x, y, rect, &app.apps).map(|i| &app.apps.windows[i]) {
                 Some(w) if w.hwnd == 0 => Click::Launch(w.exe.clone()),
-                Some(w) => Click::Activate(w.hwnd),
+                Some(w) => {
+                    let hwnds: Vec<isize> = apps::group_windows(&app.apps, w)
+                        .into_iter()
+                        .map(|e| e.hwnd)
+                        .filter(|&h| h != 0)
+                        .collect();
+                    if hwnds.is_empty() {
+                        Click::None
+                    } else {
+                        Click::Activate(hwnds)
+                    }
+                }
                 None => Click::None,
             },
             "start" => Click::Start,
@@ -2009,7 +2021,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let click = dock_click_on(hwnd, x, y);
             log(&format!("click at ({x},{y}) -> {}", match &click {
                 Click::None => "none",
-                Click::Activate(_) => "activate",
+                Click::Activate(h) => if h.len() > 1 { "activate group" } else { "activate" },
                 Click::Launch(_) => "launch pinned",
                 Click::Start => "open Start",
                 Click::GrokBot => "grok bot",
@@ -2018,7 +2030,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }));
             match click {
                 Click::None => tasks::dismiss_start_if_open(),
-                Click::Activate(h) => tasks::activate_window(h),
+                Click::Activate(hwnds) => tasks::activate_app(&hwnds),
                 Click::Launch(exe) => tasks::launch_exe(&exe),
                 Click::Start => tasks::open_start_menu(),
                 Click::GrokBot => grokbot::open_or_focus(),

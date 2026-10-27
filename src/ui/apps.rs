@@ -1,6 +1,6 @@
-//! Apps tile: one squircle icon per open window, magnification, running dot, attention/count badge.
-//! Mirrors widgets/AppsTile.tsx and the .app/.ico/.dots/.badge rules in styles.css.
-//! Window list and attention flags come from win::tasks; icons from win::icons.
+//! Apps tile: one squircle icon per **app** (exe / AUMID), magnification, running dot, badge.
+//! Multiple windows of the same app (and notification host windows) share one slot; hover peeks
+//! and the context menu still list every window. Mirrors widgets/AppsTile.tsx grouping.
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::PI;
@@ -90,8 +90,11 @@ impl AppIcon {
 
 #[derive(Default)]
 pub struct AppsState {
+    /// One entry per icon slot (representative window of each app group), display order.
     pub windows: Vec<WindowEntry>,
-    /// Composed icons keyed by exe path. Pruned to the exes that are still open.
+    /// Every open taskbar window (including those collapsed into a group). Used by peeks/menus.
+    all: Vec<WindowEntry>,
+    /// Composed icons keyed by app identity (AUMID or exe). Pruned to live apps.
     icons: HashMap<String, AppIcon>,
     /// Pinned apps (exe path, display name). Pins with no open window get a launcher slot
     /// (`hwnd == 0`) after the running windows.
@@ -99,35 +102,86 @@ pub struct AppsState {
 }
 
 impl AppsState {
-    /// Re-reads open windows, sets their attention flags and loads any missing icons.
+    /// Re-reads open windows, groups by app identity, sets attention, loads missing icons.
     pub fn refresh(&mut self, attention: &Attention) {
-        // EnumWindows is z-order based, so activating an app otherwise moves its icon. Keep the
-        // first-seen order from the TS implementation and append only genuinely new windows.
-        let previous: HashMap<isize, usize> =
-            self.windows.iter().enumerate().map(|(i, w)| (w.hwnd, i)).collect();
-        let mut fresh: Vec<(usize, WindowEntry)> = list_windows().into_iter().enumerate().collect();
-        fresh.sort_by_key(|(seen, w)| (previous.get(&w.hwnd).copied().unwrap_or(usize::MAX), *seen));
-        self.windows = fresh.into_iter().map(|(_, w)| w).collect();
-        for w in &mut self.windows {
+        // Keep icon order stable: prefer the previous representative's slot for each app key.
+        let previous_keys: HashMap<String, usize> = self
+            .windows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (app_identity(w), i))
+            .collect();
+        let mut fresh: Vec<WindowEntry> = list_windows();
+        for w in &mut fresh {
             w.attention = attention.contains(w.hwnd);
         }
-        let launchers = pinned_launchers(&self.pins, &self.windows);
-        self.windows.extend(launchers);
+        // Stable within a refresh: first-seen z-order from EnumWindows, then prior group order.
+        let mut keyed: Vec<(usize, String, WindowEntry)> = fresh
+            .into_iter()
+            .enumerate()
+            .map(|(seen, w)| (seen, app_identity(&w), w))
+            .collect();
+        keyed.sort_by_key(|(seen, key, _)| (previous_keys.get(key).copied().unwrap_or(usize::MAX), *seen));
+
+        let mut all = Vec::with_capacity(keyed.len());
+        let mut groups: Vec<WindowEntry> = Vec::new();
+        let mut group_index: HashMap<String, usize> = HashMap::new();
+        for (_, key, w) in keyed {
+            if let Some(&gi) = group_index.get(&key) {
+                // Prefer a non-minimized / attention window as the representative.
+                let rep = &mut groups[gi];
+                if (w.attention && !rep.attention)
+                    || (!w.minimized && rep.minimized)
+                    || (rep.hwnd == 0 && w.hwnd != 0)
+                {
+                    // Keep the better title for badges when the new one carries a count.
+                    let keep_title = title_count(&rep.title).unwrap_or(0) >= title_count(&w.title).unwrap_or(0);
+                    let title = if keep_title { rep.title.clone() } else { w.title.clone() };
+                    let attention = rep.attention || w.attention;
+                    *rep = w.clone();
+                    rep.title = title;
+                    rep.attention = attention;
+                } else {
+                    rep.attention = rep.attention || w.attention;
+                    if title_count(&w.title).unwrap_or(0) > title_count(&rep.title).unwrap_or(0) {
+                        rep.title = w.title.clone();
+                    }
+                }
+                all.push(w);
+            } else {
+                group_index.insert(key, groups.len());
+                groups.push(w.clone());
+                all.push(w);
+            }
+        }
+
+        let launchers = pinned_launchers(&self.pins, &groups);
+        groups.extend(launchers);
+        self.all = all;
+        self.windows = groups;
+
         for w in &self.windows {
-            let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
-            if w.exe.is_empty() || self.icons.contains_key(key) {
+            let key = app_identity(w);
+            if (w.exe.is_empty() && w.aumid.is_empty()) || self.icons.contains_key(&key) {
                 continue;
             }
             if let Some(b) = icon_for_window(w.hwnd, &w.exe, &w.aumid, &w.package_path) {
-                self.icons.insert(key.to_owned(), AppIcon::new(b));
+                self.icons.insert(key, AppIcon::new(b));
             }
         }
-        let live: HashSet<&str> = self
-            .windows
-            .iter()
-            .map(|w| if w.aumid.is_empty() { w.exe.as_str() } else { w.aumid.as_str() })
-            .collect();
-        self.icons.retain(|k, _| live.contains(k.as_str()));
+        let live: HashSet<String> = self.windows.iter().map(app_identity).collect();
+        self.icons.retain(|k, _| live.contains(k));
+    }
+}
+
+/// Stable app identity for grouping: AUMID when present, else lowercase exe, else hwnd.
+fn app_identity(w: &WindowEntry) -> String {
+    if !w.aumid.is_empty() {
+        w.aumid.to_ascii_lowercase()
+    } else if !w.exe.is_empty() {
+        w.exe.to_ascii_lowercase()
+    } else {
+        format!("hwnd:{}", w.hwnd)
     }
 }
 
@@ -159,15 +213,15 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
         // Scales around the bottom centre; the base position never moves.
         let base_bottom = s.y + ICON_TOP + ICON;
         let ico = RectF { x: cx - size / 2.0, y: base_bottom - size, w: size, h: size };
-        let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
-        match state.icons.get(key) {
+        match state.icons.get(&app_identity(w)) {
             Some(icon) => draw_icon(r, icon, ico)?,
             None => draw_fallback(r, ico, &initial(w))?,
         }
         if w.hwnd == 0 {
             continue; // pinned launcher: no badge, no running dot
         }
-        if let Some(badge) = badge_of(w) {
+        let members = group_windows(state, w);
+        if let Some(badge) = badge_of_group(&members) {
             draw_badge(r, ico, badge, t)?;
         }
         // Small white running dot under the icon.
@@ -215,22 +269,16 @@ pub fn app_name(w: &WindowEntry) -> String {
         .unwrap_or_else(|| w.title.clone())
 }
 
-/// All listed windows that share the same exe (case-insensitive) as `w`.
+/// All open windows that belong to the same app as `w` (AUMID / exe identity).
 pub fn group_windows<'a>(state: &'a AppsState, w: &WindowEntry) -> Vec<&'a WindowEntry> {
-    if w.exe.is_empty() {
-        return state.windows.iter().filter(|o| o.hwnd == w.hwnd).collect();
-    }
-    state
-        .windows
-        .iter()
-        .filter(|o| o.exe.eq_ignore_ascii_case(&w.exe))
-        .collect()
+    let key = app_identity(w);
+    let pool = if state.all.is_empty() { &state.windows } else { &state.all };
+    pool.iter().filter(|o| app_identity(o) == key).collect()
 }
 
 /// Icon bitmap pixels for a window's cache key, if loaded.
 pub fn icon_pixels(state: &AppsState, w: &WindowEntry) -> Option<IconBitmap> {
-    let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
-    state.icons.get(key).map(AppIcon::bitmap)
+    state.icons.get(&app_identity(w)).map(AppIcon::bitmap)
 }
 
 /// Exact width of `n` app slots (no side padding), so the centre cluster is measured by what
@@ -310,11 +358,17 @@ enum Badge {
     Dot,
 }
 
-fn badge_of(w: &WindowEntry) -> Option<Badge> {
-    match title_count(&w.title) {
-        Some(n) if n > 0 => Some(Badge::Count(if n > 99 { "99+".to_owned() } else { n.to_string() })),
-        _ if w.attention => Some(Badge::Dot),
-        _ => None,
+fn badge_of_group(members: &[&WindowEntry]) -> Option<Badge> {
+    let notif = members.iter().filter_map(|w| title_count(&w.title)).max().unwrap_or(0);
+    let n = members.iter().filter(|w| w.hwnd != 0).count() as u32;
+    // Prefer an unread count from the title; otherwise show how many windows are grouped.
+    let count = notif.max(if n > 1 { n } else { 0 });
+    if count > 0 {
+        Some(Badge::Count(if count > 99 { "99+".to_owned() } else { count.to_string() }))
+    } else if members.iter().any(|w| w.attention) {
+        Some(Badge::Dot)
+    } else {
+        None
     }
 }
 
@@ -404,6 +458,7 @@ fn now_secs() -> f32 {
 mod tests {
     use super::*;
     use crate::ui::dock::{layout, Tile};
+    use std::collections::HashMap;
 
     fn entry(hwnd: isize, exe: &str) -> WindowEntry {
         WindowEntry {
@@ -488,7 +543,10 @@ mod tests {
         for &(n, w) in &[(1usize, 1920.0f32), (5, 1920.0), (12, 1920.0), (9, 2560.0)] {
             let (rects, _, apps) = centred(n, w);
             let mut state = AppsState::default();
-            state.windows = (0..n).map(|i| entry(100 + i as isize, "x.exe")).collect();
+            // Distinct exes → one slot each (same exe would collapse into a single group).
+            state.windows = (0..n)
+                .map(|i| entry(100 + i as isize, &format!("app{i}.exe")))
+                .collect();
             let rect = rects[apps];
             for i in 0..n {
                 let slot = slot_rect(rect, &state, i).expect("slot fits");
@@ -521,6 +579,47 @@ mod tests {
         assert_eq!(launchers.len(), 1, "running pin is not duplicated");
         assert_eq!(launchers[0].hwnd, 0);
         assert_eq!(launchers[0].exe, "C:\\Apps\\Notes.exe");
+    }
+
+    #[test]
+    fn same_exe_windows_collapse_to_one_icon() {
+        let mut state = AppsState::default();
+        state.all = vec![
+            entry(1, "C:\\Apps\\Zalo.exe"),
+            {
+                let mut e = entry(2, "c:\\apps\\zalo.exe");
+                e.title = "(3) Chat".into();
+                e
+            },
+            entry(3, "C:\\Apps\\idea64.exe"),
+            entry(4, "C:\\Apps\\idea64.exe"),
+        ];
+        // Simulate refresh collapse: one representative per identity.
+        let mut groups = Vec::new();
+        let mut index = HashMap::new();
+        for w in state.all.clone() {
+            let key = app_identity(&w);
+            if let Some(&i) = index.get(&key) {
+                let rep = &mut groups[i];
+                rep.attention |= w.attention;
+                if title_count(&w.title).unwrap_or(0) > title_count(&rep.title).unwrap_or(0) {
+                    rep.title = w.title.clone();
+                }
+            } else {
+                index.insert(key, groups.len());
+                groups.push(w);
+            }
+        }
+        state.windows = groups;
+        assert_eq!(state.windows.len(), 2, "Zalo + IDEA only");
+        let zalo = state.windows.iter().find(|w| w.exe.to_ascii_lowercase().contains("zalo")).unwrap();
+        let idea = state.windows.iter().find(|w| w.exe.to_ascii_lowercase().contains("idea")).unwrap();
+        assert_eq!(group_windows(&state, zalo).len(), 2);
+        assert_eq!(group_windows(&state, idea).len(), 2);
+        let badge = badge_of_group(&group_windows(&state, zalo));
+        assert!(matches!(badge, Some(Badge::Count(ref s)) if s == "3"), "unread from title wins: {badge:?}");
+        let badge = badge_of_group(&group_windows(&state, idea));
+        assert!(matches!(badge, Some(Badge::Count(ref s)) if s == "2"), "window count: {badge:?}");
     }
 }
 
