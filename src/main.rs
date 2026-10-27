@@ -3057,6 +3057,7 @@ fn handle_file_drop(hwnd: HWND, wparam: usize) {
         return;
     }
     log(&format!("filedrop: sending {} path(s) to Recycle Bin", paths.len()));
+    let paint_hwnd = hwnd.0 as isize;
     thread::spawn(move || {
         match win::shellinfo::send_to_recycle_bin(&paths) {
             Ok(n) => log(&format!("filedrop: {n} item(s) moved to Recycle Bin")),
@@ -3065,7 +3066,7 @@ fn handle_file_drop(hwnd: HWND, wparam: usize) {
         win::shellinfo::refresh();
         // SAFETY: hwnd may be gone; InvalidateRect then just fails.
         unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
+            let _ = InvalidateRect(HWND(paint_hwnd as _), None, false.into());
         }
     });
 }

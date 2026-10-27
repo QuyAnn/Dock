@@ -99,7 +99,7 @@ pub fn send_to_recycle_bin(paths: &[PathBuf]) -> Result<u32, String> {
         pFrom: PCWSTR(from.as_ptr()),
         pTo: PCWSTR::null(),
         fFlags: flags,
-        fAnyOperationsAborted: BOOL(0),
+        fAnyOperationsAborted: windows::Win32::Foundation::BOOL(0),
         hNameMappings: std::ptr::null_mut(),
         lpszProgressTitle: PCWSTR::null(),
     };
