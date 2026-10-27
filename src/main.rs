@@ -57,7 +57,7 @@ use win::{monitors, wallpaper};
 
 const DOCK_HEIGHT: f32 = dock::DOCK_H;
 const POPUP_W: f32 = 320.0;
-const CONTROL_POPUP_W: f32 = 296.0;
+const CONTROL_POPUP_W: f32 = control_center::WIDTH;
 const SETTINGS_POPUP_W: f32 = 460.0;
 /// Height used when the popup content cannot be measured yet.
 const POPUP_H_DEFAULT: f32 = 260.0;
@@ -211,6 +211,20 @@ fn default_repos() -> Vec<PathBuf> {
 }
 
 fn main() {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|a| a == "--render-cc") {
+        if args.len() != 4 {
+            show_error("Cách dùng: smartdock.exe --render-cc <out.png> <wallpaper>");
+            std::process::exit(2);
+        }
+        match ui::cc_preview::render(std::path::Path::new(&args[2]), std::path::Path::new(&args[3])) {
+            Ok(()) => return,
+            Err(e) => {
+                show_error(&format!("Không thể render Control Center:\n{e}"));
+                std::process::exit(1);
+            }
+        }
+    }
     dpi::enable_per_monitor_v2();
     appbar::recover_from_previous_crash();
 
@@ -1880,7 +1894,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             CONTROL_VIEW.with(|c| *c.borrow_mut() = state);
             control_center::hide_outputs();
             POPUP_W_CUR.with(|w| w.set(CONTROL_POPUP_W));
-            if popup::show(anchor, CONTROL_POPUP_W, control_center::HEIGHT as i32).is_ok() {
+            if popup::show_floating_modules(anchor, CONTROL_POPUP_W, control_center::HEIGHT as i32).is_ok() {
                 set_open(Some(which));
             }
         }

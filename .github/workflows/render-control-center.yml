@@ -1,0 +1,62 @@
+name: Render Control Center
+
+on:
+  pull_request:
+    paths:
+      - "src/ui/control_center.rs"
+      - "src/ui/cc_preview.rs"
+      - "src/ui/glass.rs"
+      - "src/ui/popup.rs"
+      - "src/ui/renderer.rs"
+      - "src/main.rs"
+      - ".github/workflows/render-control-center.yml"
+  workflow_dispatch:
+
+jobs:
+  render:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and test release
+        run: |
+          cargo test --release
+          cargo build --release
+      - name: Create deterministic sample wallpapers
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          New-Item -ItemType Directory -Force render-inputs, render-output | Out-Null
+          function New-Gradient([string]$Path, [string]$Top, [string]$Bottom) {
+            $bitmap = [System.Drawing.Bitmap]::new(1280, 720)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $rect = [System.Drawing.Rectangle]::new(0, 0, 1280, 720)
+            $brush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+              $rect,
+              [System.Drawing.ColorTranslator]::FromHtml($Top),
+              [System.Drawing.ColorTranslator]::FromHtml($Bottom),
+              35
+            )
+            $graphics.FillRectangle($brush, $rect)
+            $brush.Dispose()
+            $graphics.Dispose()
+            $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+            $bitmap.Dispose()
+          }
+          New-Gradient "render-inputs/ocean.jpg" "#1598A5" "#063D57"
+          New-Gradient "render-inputs/light.jpg" "#E9F6FF" "#8BC7E8"
+          New-Gradient "render-inputs/dark.jpg" "#193250" "#050A13"
+      - name: Render production Control Center
+        shell: pwsh
+        run: |
+          & .\target\release\smartdock.exe --render-cc render-output\control_center_ocean.png render-inputs\ocean.jpg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\target\release\smartdock.exe --render-cc render-output\control_center_light.png render-inputs\light.jpg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\target\release\smartdock.exe --render-cc render-output\control_center_dark.png render-inputs\dark.jpg
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: control-center-renders
+          path: render-output/*.png
+          if-no-files-found: error

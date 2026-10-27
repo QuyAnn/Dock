@@ -46,6 +46,8 @@ struct Popup {
     /// Liquid Glass backdrop cut from the wallpaper at this popup's position; None until the
     /// wallpaper is decoded (plain acrylic panel then).
     backdrop: Option<Arc<LiquidBitmap>>,
+    /// Control Center-only mode: body modules float over the transparent window without a panel.
+    floating_modules: bool,
 }
 
 impl Drop for Popup {
@@ -194,6 +196,16 @@ pub fn show_centered(width: f32, height: i32) -> Result<()> {
 /// Opens the popup above (or below, if the anchor is in the top half) `anchor`, centered on it.
 /// `anchor` and the result are in screen coordinates. Replaces any open popup.
 pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
+    show_impl(anchor, width, height, false)
+}
+
+/// Opens the shared popup window without its usual outer panel. The body painter can still sample
+/// the one cached popup backdrop, allowing independent glass modules without per-frame captures.
+pub fn show_floating_modules(anchor: RectF, width: f32, height: i32) -> Result<()> {
+    show_impl(anchor, width, height, true)
+}
+
+fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> Result<()> {
     let dpi = dpi::system_dpi();
     let width_px = dpi::dip_to_px(width, dpi);
     let height_px = dpi::dip_to_px(height as f32, dpi);
@@ -209,6 +221,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         let mut state = p.borrow_mut();
         let Some(pw) = state.as_mut() else { return false };
         pw.anchor = anchor;
+        pw.floating_modules = floating_modules;
         pw.mouse_down = true;
         pw.esc_down = true;
         // Swapping popups: take the old one off screen first so the grab behind the new one is clean.
@@ -270,6 +283,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         mouse_down: true,
         esc_down: true,
         backdrop: super::glass::popup_backdrop(rect, monitor, dpi),
+        floating_modules,
     };
     style_window(hwnd);
     POPUP.with(|p| *p.borrow_mut() = Some(pw));
@@ -518,9 +532,12 @@ fn paint() {
                 match &backdrop {
                     Some(bd) => {
                         super::glass::set_backdrop(Some(bd.clone()), w, h);
-                        super::glass::draw_panel_glass(&mut pw.renderer, rect, radius)?;
+                        if !pw.floating_modules {
+                            super::glass::draw_panel_glass(&mut pw.renderer, rect, radius)?;
+                        }
                     }
-                    None => super::glass::draw_panel(&mut pw.renderer, rect, radius)?,
+                    None if !pw.floating_modules => super::glass::draw_panel(&mut pw.renderer, rect, radius)?,
+                    None => super::glass::set_backdrop(None, w, h),
                 }
                 if let Some(f) = PAINTER.with(Cell::get) {
                     f(&mut pw.renderer, rect);

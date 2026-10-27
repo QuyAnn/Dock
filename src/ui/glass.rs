@@ -48,6 +48,8 @@ pub enum Layer {
     Tile,
     /// Start / app icon plates: brightest, clearest layer.
     Plate,
+    /// Clear floating Control Center modules: lighter than data tiles, with no dock-style tint.
+    Control,
 }
 
 /// Uniform corner radius for tiles and plates (continuous-looking at 34 DIP height).
@@ -112,7 +114,15 @@ pub fn draw_glass(r: &mut Renderer, rect: RectF, radius: f32, layer: Layer, hove
     match piece_for(rect, radius, layer) {
         Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
         // No backdrop (yet): light neutral frost rather than a dark slab.
-        None => r.fill_rounded_rect(rect, radius, if layer == Layer::Plate { 0xB4AA_A04D } else { 0x8C84_7C59 })?,
+        None => r.fill_rounded_rect(
+            rect,
+            radius,
+            match layer {
+                Layer::Plate => 0xB4AA_A04D,
+                Layer::Control => 0xFFFF_FF2A,
+                Layer::Tile => 0x8C84_7C59,
+            },
+        )?,
     }
     if layer == Layer::Tile {
         // Dock style: a tint over the glass (Glass keeps the clear material as is).
@@ -124,6 +134,9 @@ pub fn draw_glass(r: &mut Renderer, rect: RectF, radius: f32, layer: Layer, hove
         if tint != 0 {
             r.fill_rounded_rect(rect, radius, tint)?;
         }
+    } else if layer == Layer::Control {
+        // A restrained lift keeps these modules clear rather than smoky or milky.
+        r.fill_rounded_rect(rect, radius, 0xFFFF_FF10)?;
     }
     if hovered {
         // Glow: the piece lights up a little; no geometry change.
@@ -255,6 +268,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     let (lift, sat, target) = match layer {
         Layer::Tile => (0.10, 1.12, 118.0),
         Layer::Plate => (0.16, 1.10, 168.0),
+        Layer::Control => (0.14, 1.08, 148.0),
     };
     let mut rgb = vec![0f32; (w * h * 3) as usize];
     let mut alpha = vec![0u8; (w * h) as usize];
@@ -414,6 +428,26 @@ pub fn draw_card(r: &mut Renderer, rect: RectF, radius: f32, fallback: u32, k: f
         r.fill_rounded_rect(rect, radius, fallback)?;
         draw_highlights(r, rect, radius, k)
     }
+}
+
+/// One free-floating Control Center module. This additive material is deliberately separate from
+/// dock tiles and normal popup cards, so their appearance remains unchanged.
+pub fn draw_control_card(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    if CTX.with(|c| c.borrow().is_some()) {
+        draw_glass(r, rect, radius, Layer::Control, false)
+    } else {
+        draw_shadow(r, rect, radius)?;
+        r.fill_rounded_rect(rect, radius, 0xFFFF_FF2A)?;
+        draw_highlights(r, rect, radius, 1.1)
+    }
+}
+
+/// Active Control Center toggle: an opaque white button over the same soft shadow and rim.
+pub fn draw_control_active(r: &mut Renderer, rect: RectF, radius: f32, opacity: f32) -> Result<()> {
+    draw_shadow(r, rect, radius)?;
+    let alpha = (255.0 * opacity.clamp(0.0, 1.0)).round() as u32;
+    r.fill_rounded_rect(rect, radius, 0xFFFF_FF00 | alpha)?;
+    draw_highlights(r, rect, radius, 0.55 * opacity)
 }
 
 /// Grabs the composed desktop (everything visible, including other apps) in `rect` (virtual-screen

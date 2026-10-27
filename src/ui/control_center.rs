@@ -107,19 +107,25 @@ pub fn output_id(n: usize) -> Option<String> {
     OUTPUTS.with(|o| o.borrow().as_ref().and_then(|l| l.get(n).map(|d| d.id.clone())))
 }
 
-const ROW_H: f32 = 44.0;
+const OUTPUT_ROW_H: f32 = 44.0;
 
 fn outputs_back(rect: RectF) -> RectF {
     RectF { x: rect.x + PAD, y: rect.y + PAD, w: rect.w - 2.0 * PAD, h: 30.0 }
 }
 
 fn output_row(rect: RectF, i: usize) -> RectF {
-    RectF { x: rect.x + PAD, y: rect.y + PAD + 40.0 + i as f32 * (ROW_H + 6.0), w: rect.w - 2.0 * PAD, h: ROW_H }
+    RectF {
+        x: rect.x + PAD,
+        y: rect.y + PAD + 40.0 + i as f32 * (OUTPUT_ROW_H + GAP),
+        w: rect.w - 2.0 * PAD,
+        h: OUTPUT_ROW_H,
+    }
 }
 
 fn draw_outputs(r: &mut Renderer, rect: RectF, list: &[system::AudioOutput]) -> Result<()> {
     let back = outputs_back(rect);
-    r.draw_text_styled("‹  Đầu ra âm thanh", back, 13.0, TEXT, Align::Left, TextStyle::Bold)?;
+    draw_module(r, back, back.h / 2.0)?;
+    r.draw_text_styled("‹  Đầu ra âm thanh", RectF { x: back.x + 12.0, w: back.w - 24.0, ..back }, 12.0, TEXT, Align::Left, TextStyle::Bold)?;
     if list.is_empty() {
         return r.draw_text("Không tìm thấy thiết bị", output_row(rect, 0), 11.5, SUB, Align::Center);
     }
@@ -177,28 +183,25 @@ pub fn apply(action: ControlAction) -> Result<()> {
 // .cc: padding 9, gap 8. .cc-grid: 1.35fr / 1fr. Every card has a 1 px border, included in the offsets.
 
 // ---------- layout (DIPs, relative to the panel rect) ----------
-// macOS 26 style: big rounded glass tiles, stadium pills, thick slider capsules.
+// macOS 27 style: independent modules on one strict four-column grid.
 
-/// Total panel height.
-pub const HEIGHT: f32 = 454.0;
-const PAD: f32 = 12.0;
-const GAP: f32 = 10.0;
-const TILE_H: f32 = 58.0;
-const BOTTOM_H: f32 = 52.0;
-const MEDIA_H: f32 = 2.0 * TILE_H + GAP;
-const SLIDER_CARD_H: f32 = 58.0;
-const TILE_R: f32 = 26.0;
-const CARD_R: f32 = 20.0;
-const ROUND: f32 = 38.0; // icon circle inside a tile
-const CAP_INSET: f32 = 14.0;
-const END_W: f32 = 22.0; // icon slots at both ends of a slider
-const SLIDER_H: f32 = 16.0;
-const THUMB: f32 = 16.0;
-const TRACK_H: f32 = 6.0;
+/// Nominal popup dimensions. The one-DIP client inset leaves a 50-DIP grid unit at 100% scale.
+pub const WIDTH: f32 = 241.0;
+pub const HEIGHT: f32 = 401.0;
+const PAD: f32 = 8.0;
+const GAP: f32 = 8.0;
+const SLIDER_CARD_H: f32 = 56.0;
+const SETTINGS_H: f32 = 24.0;
+const TILE_R: f32 = 25.0;
+const CARD_R: f32 = 18.0;
+const ROUND: f32 = 36.0; // active circle inside a labelled two-column module
+const CAP_INSET: f32 = 12.0;
+const END_W: f32 = 20.0; // icon slots at both ends of a slider
+const SLIDER_H: f32 = 14.0;
+const THUMB: f32 = 12.0;
+const TRACK_H: f32 = 4.0;
 
 // Colors 0xRRGGBBAA.
-const CARD: u32 = 0xFFFF_FF24;
-const ROUND_BG: u32 = 0xFFFF_FF2E;
 const WHITE: u32 = 0xFFFF_FFFF;
 const ACCENT: u32 = 0x0A84_FFFF; // macOS system blue #0A84FF
 const TEXT: u32 = 0xFFFF_FFFF;
@@ -245,40 +248,40 @@ struct Layout {
 fn layout(rect: RectF) -> Layout {
     let x0 = rect.x + PAD;
     let w = rect.w - 2.0 * PAD;
-    let col = (w - GAP) / 2.0;
-    let right_x = x0 + col + GAP;
-    let small = (col - GAP) / 2.0;
+    let col = (w - 3.0 * GAP) / 4.0;
+    let span = |n: f32| n * col + (n - 1.0) * GAP;
+    let x = |column: f32| x0 + column * (col + GAP);
+    let double = span(2.0);
     let y1 = rect.y + PAD;
-    let y1b = y1 + TILE_H + GAP;
-    let y2 = y1 + MEDIA_H + GAP;
-    let y3 = y2 + TILE_H + GAP;
+    let y1b = y1 + col + GAP;
+    let y2 = y1b + col + GAP;
+    let y3 = y2 + col + GAP;
     let y4 = y3 + SLIDER_CARD_H + GAP;
     let y5 = y4 + SLIDER_CARD_H + GAP;
-    let y6 = y5 + BOTTOM_H + GAP;
-    let step = (w - BOTTOM_H) / 3.0;
+    let y6 = y5 + col + GAP;
     Layout {
-        wifi: RectF { x: x0, y: y1, w: col, h: TILE_H },
-        bluetooth: RectF { x: x0, y: y1b, w: small, h: TILE_H },
-        net: RectF { x: x0 + small + GAP, y: y1b, w: small, h: TILE_H },
-        media: RectF { x: right_x, y: y1, w: col, h: MEDIA_H },
-        dark: RectF { x: x0, y: y2, w: col, h: TILE_H },
-        sound: RectF { x: right_x, y: y2, w: small, h: TILE_H },
-        display: RectF { x: right_x + small + GAP, y: y2, w: small, h: TILE_H },
+        wifi: RectF { x: x(0.0), y: y1, w: double, h: col },
+        bluetooth: RectF { x: x(0.0), y: y1b, w: col, h: col },
+        net: RectF { x: x(1.0), y: y1b, w: col, h: col },
+        media: RectF { x: x(2.0), y: y1, w: double, h: span(2.0) },
+        dark: RectF { x: x(0.0), y: y2, w: double, h: col },
+        sound: RectF { x: x(2.0), y: y2, w: col, h: col },
+        display: RectF { x: x(3.0), y: y2, w: col, h: col },
         brightness: RectF { x: x0, y: y3, w, h: SLIDER_CARD_H },
         volume: RectF { x: x0, y: y4, w, h: SLIDER_CARD_H },
-        shortcuts: [0.0, 1.0, 2.0, 3.0].map(|i| RectF { x: x0 + i * step, y: y5, w: BOTTOM_H, h: BOTTOM_H }),
-        settings: RectF { x: rect.x + (rect.w - 150.0) / 2.0, y: y6, w: 150.0, h: 28.0 },
+        shortcuts: [0.0, 1.0, 2.0, 3.0].map(|i| RectF { x: x(i), y: y5, w: col, h: col }),
+        settings: RectF { x: rect.x + (rect.w - 136.0) / 2.0, y: y6, w: 136.0, h: SETTINGS_H },
     }
 }
 
 /// Slider row inside a slider card (below the title): icon slot, thin track, icon slot.
 fn slider_of(card: RectF) -> RectF {
-    RectF { x: card.x + CAP_INSET, y: card.y + 33.0, w: card.w - 2.0 * CAP_INSET, h: SLIDER_H }
+    RectF { x: card.x + CAP_INSET, y: card.y + 32.0, w: card.w - 2.0 * CAP_INSET, h: SLIDER_H }
 }
 
 /// Head row (title) of a slider card.
 fn head_of(card: RectF) -> RectF {
-    RectF { x: card.x + CAP_INSET, y: card.y + 9.0, w: card.w - 2.0 * CAP_INSET, h: 16.0 }
+    RectF { x: card.x + CAP_INSET, y: card.y + 8.0, w: card.w - 2.0 * CAP_INSET, h: 16.0 }
 }
 
 /// Left icon slot of a slider row (also the mute button on the volume row).
@@ -314,13 +317,9 @@ fn fade(rgba: u32, k: f32) -> u32 {
 fn draw_round(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, k: f32, icon_k: f32) -> Result<()> {
     let radius = rect.h / 2.0;
     if on {
-        r.fill_rounded_rect(rect, radius, fade(WHITE, k))?;
-        super::glass::draw_highlights(r, rect, radius, 0.5 * k)?;
-    } else if k >= 0.99 {
-        super::glass::draw_card(r, rect, radius, ROUND_BG, k)?;
+        super::glass::draw_control_active(r, rect, radius, k)?;
     } else {
-        r.fill_rounded_rect(rect, radius, fade(ROUND_BG, k))?;
-        super::glass::draw_highlights(r, rect, radius, k)?;
+        super::glass::draw_control_card(r, rect, radius)?;
     }
     draw_glyph(r, rect, glyph, size, fade(if on { ACCENT } else { TEXT }, icon_k))
 }
@@ -349,7 +348,7 @@ fn draw_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, rgba: u32)
 
 /// Liquid-glass tile (same material language as the dock tiles).
 fn draw_module(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
-    super::glass::draw_card(r, rect, radius, CARD, 0.9)
+    super::glass::draw_control_card(r, rect, radius)
 }
 
 /// One toggle tile: round button, bold label, sub text.
@@ -365,7 +364,7 @@ struct Toggle<'a> {
 
 /// Circle button of a toggle tile.
 fn round_of(tile: RectF) -> RectF {
-    RectF { x: tile.x + 8.0, y: tile.y + (tile.h - ROUND) / 2.0, w: ROUND, h: ROUND }
+    RectF { x: tile.x + 7.0, y: tile.y + (tile.h - ROUND) / 2.0, w: ROUND, h: ROUND }
 }
 
 fn draw_toggle(r: &mut Renderer, tile: RectF, t: Toggle) -> Result<()> {
@@ -374,10 +373,10 @@ fn draw_toggle(r: &mut Renderer, tile: RectF, t: Toggle) -> Result<()> {
     let icon_k = if t.on || !t.dim_off { 1.0 } else { 0.35 };
     draw_module(r, tile, TILE_R)?;
     draw_round(r, round_of(tile), t.glyph, 18.0, t.on, rk, rk * icon_k)?;
-    let tx = tile.x + 8.0 + ROUND + 9.0;
-    let tw = (tile.x + tile.w - 8.0 - tx).max(0.0);
-    r.draw_text_styled(t.label, RectF { x: tx, y: tile.y + 9.0, w: tw, h: 16.0 }, 12.0, fade(TEXT, k), Align::Left, TextStyle::Bold)?;
-    r.draw_text(t.sub, RectF { x: tx, y: tile.y + 26.0, w: tw, h: 15.0 }, 10.5, fade(SUB, k), Align::Left)
+    let tx = tile.x + 7.0 + ROUND + 8.0;
+    let tw = (tile.x + tile.w - 7.0 - tx).max(0.0);
+    r.draw_text_styled(t.label, RectF { x: tx, y: tile.y + 7.0, w: tw, h: 16.0 }, 11.5, fade(TEXT, k), Align::Left, TextStyle::Bold)?;
+    r.draw_text(t.sub, RectF { x: tx, y: tile.y + 23.0, w: tw, h: 15.0 }, 10.0, fade(SUB, k), Align::Left)
 }
 
 /// Stadium pill with one centred glyph (network / sound shortcuts).
@@ -458,8 +457,13 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     draw_round(r, moon, Glyph::Text(GLYPH_MOON), 16.0, state.dark, 1.0, 1.0)?;
     r.draw_text_styled(
         "Chế độ tối",
-        RectF { x: moon.x + ROUND + 9.0, y: l.dark.y, w: l.dark.w - ROUND - 26.0, h: l.dark.h },
-        12.0,
+        RectF {
+            x: moon.x + ROUND + 6.0,
+            y: l.dark.y,
+            w: (l.dark.x + l.dark.w) - (moon.x + ROUND + 6.0) - 7.0,
+            h: l.dark.h,
+        },
+        10.5,
         TEXT,
         Align::Left,
         TextStyle::Bold,
@@ -493,23 +497,23 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
 /// Prev / play / next, centred along the bottom of the Now Playing tile.
 fn media_buttons(card: RectF) -> [RectF; 3] {
     let cx = card.x + card.w / 2.0;
-    [-1.0, 0.0, 1.0].map(|i| RectF { x: cx + i * 38.0 - 15.0, y: card.y + card.h - 34.0, w: 30.0, h: 26.0 })
+    [-1.0, 0.0, 1.0].map(|i| RectF { x: cx + i * 32.0 - 12.0, y: card.y + card.h - 31.0, w: 24.0, h: 24.0 })
 }
 
 fn draw_now_playing(r: &mut Renderer, card: RectF, media: Option<&Media>) -> Result<()> {
     draw_module(r, card, CARD_R + 2.0)?;
-    let art = RectF { x: card.x + 12.0, y: card.y + 12.0, w: 40.0, h: 40.0 };
-    r.fill_rounded_rect_gradient(art, 9.0, 0xFF5F_6DFF, 0xFFC3_71FF)?;
-    r.draw_text("♪", art, 18.0, WHITE, Align::Center)?;
+    let art = RectF { x: card.x + 10.0, y: card.y + 10.0, w: 34.0, h: 34.0 };
+    r.fill_rounded_rect_gradient(art, 8.0, 0xFF5F_6DFF, 0xFFC3_71FF)?;
+    r.draw_text("♪", art, 16.0, WHITE, Align::Center)?;
     let has = media.is_some_and(|m| !m.title.is_empty());
     let title = media.filter(|_| has).map_or("Không có gì đang phát", |m| m.title.as_str());
     let artist = media.filter(|_| has).map_or("Now Playing", |m| m.artist.as_str());
-    let w = card.w - 24.0;
-    r.draw_text_styled(title, RectF { x: card.x + 12.0, y: card.y + 56.0, w, h: 16.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(artist, RectF { x: card.x + 12.0, y: card.y + 71.0, w, h: 14.0 }, 10.0, SUB, Align::Left)?;
+    let w = card.w - 20.0;
+    r.draw_text_styled(title, RectF { x: card.x + 10.0, y: card.y + 47.0, w, h: 15.0 }, 10.5, TEXT, Align::Left, TextStyle::Bold)?;
+    r.draw_text(artist, RectF { x: card.x + 10.0, y: card.y + 61.0, w, h: 13.0 }, 9.5, SUB, Align::Left)?;
     let glyphs = ["\u{E892}", if media.is_some_and(|m| m.playing) { "\u{E769}" } else { "\u{E768}" }, "\u{E893}"];
     for (button, glyph) in media_buttons(card).into_iter().zip(glyphs) {
-        r.draw_text_styled(glyph, button, 14.0, fade(TEXT, if has { 1.0 } else { 0.4 }), Align::Center, TextStyle::Icon)?;
+        r.draw_text_styled(glyph, button, 13.0, fade(TEXT, if has { 1.0 } else { 0.4 }), Align::Center, TextStyle::Icon)?;
     }
     Ok(())
 }
@@ -637,9 +641,64 @@ pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<Con
 mod settings_route_tests {
     use super::*;
 
+    fn nominal_rect() -> RectF {
+        RectF { x: 0.5, y: 0.5, w: WIDTH - 1.0, h: HEIGHT - 1.0 }
+    }
+
+    fn close(a: f32, b: f32) {
+        assert!((a - b).abs() < 0.01, "{a} != {b}");
+    }
+
+    #[test]
+    fn control_center_uses_an_even_four_column_grid() {
+        let rect = nominal_rect();
+        let l = layout(rect);
+        let unit = l.shortcuts[0].w;
+
+        for circle in [l.bluetooth, l.net, l.sound, l.display, l.shortcuts[0], l.shortcuts[1], l.shortcuts[2], l.shortcuts[3]] {
+            close(circle.w, unit);
+            close(circle.h, unit);
+        }
+        for pair in [l.wifi, l.dark] {
+            close(pair.w, 2.0 * unit + GAP);
+            close(pair.h, unit);
+        }
+        close(l.media.w, 2.0 * unit + GAP);
+        close(l.media.h, 2.0 * unit + GAP);
+
+        for pair in l.shortcuts.windows(2) {
+            close(pair[1].x - (pair[0].x + pair[0].w), GAP);
+        }
+        close(l.net.x - (l.bluetooth.x + l.bluetooth.w), GAP);
+        close(l.media.x - (l.wifi.x + l.wifi.w), GAP);
+        close(l.brightness.y - (l.dark.y + l.dark.h), GAP);
+        close(l.volume.y - (l.brightness.y + l.brightness.h), GAP);
+        close(l.shortcuts[0].y - (l.volume.y + l.volume.h), GAP);
+        close(l.wifi.x, l.brightness.x);
+        close(l.display.x + l.display.w, l.brightness.x + l.brightness.w);
+        assert!(l.settings.y + l.settings.h <= rect.y + rect.h);
+    }
+
+    #[test]
+    fn hit_testing_tracks_the_new_module_rects() {
+        let rect = nominal_rect();
+        let l = layout(rect);
+        let state = ControlState { wifi: Some(true), bluetooth: Some(true), brightness: Some(75), ..Default::default() };
+        let center = |r: RectF| (r.x + r.w / 2.0, r.y + r.h / 2.0);
+
+        let (x, y) = center(l.bluetooth);
+        assert!(matches!(hit_test(x, y, rect, &state), Some(ControlAction::ToggleBluetooth)));
+        let (x, y) = center(l.net);
+        assert!(matches!(hit_test(x, y, rect, &state), Some(ControlAction::OpenNetworkSettings)));
+        let (x, y) = center(l.dark);
+        assert!(matches!(hit_test(x, y, rect, &state), Some(ControlAction::ToggleDark)));
+        let (x, y) = center(l.settings);
+        assert!(matches!(hit_test(x, y, rect, &state), Some(ControlAction::OpenSmartDockSettings)));
+    }
+
     #[test]
     fn dock_layout_cc_settings_pill_opens_smartdock_settings_and_dark_pill_still_toggles() {
-        let rect = RectF { x: 0.5, y: 0.5, w: 339.0, h: HEIGHT - 1.0 };
+        let rect = nominal_rect();
         let l = layout(rect);
         assert!(l.settings.y + l.settings.h <= rect.y + rect.h);
         let state = ControlState::default();
