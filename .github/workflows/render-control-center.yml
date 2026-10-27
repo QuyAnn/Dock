@@ -15,6 +15,7 @@ on:
 jobs:
   render:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -55,7 +56,12 @@ jobs:
             $wallpaperPath = (Resolve-Path $Wallpaper).Path
             $process = Start-Process -FilePath $exe `
               -ArgumentList @("--render-cc", $outPath, $wallpaperPath) `
-              -Wait -PassThru
+              -PassThru
+            if (-not $process.WaitForExit(60000)) {
+              $process.Kill($true)
+              throw "Control Center render timed out after 60 seconds: $Output"
+            }
+            $process.Refresh()
             if ($process.ExitCode -ne 0) {
               $log = [System.IO.Path]::ChangeExtension($outPath, ".log")
               if (Test-Path $log) { Get-Content $log | Write-Error }

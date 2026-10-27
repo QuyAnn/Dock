@@ -210,35 +210,43 @@ fn default_repos() -> Vec<PathBuf> {
     Vec::new()
 }
 
-fn main() {
+/// Handles the developer-only offscreen renderer before any SmartDock/DPI/appbar/window setup.
+/// Returning `Some` means the process must terminate immediately with that exit code.
+fn render_control_center_cli() -> Option<i32> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    if args.get(1).is_some_and(|a| a == "--render-cc") {
-        if args.len() != 4 {
-            let _ = std::fs::write(
-                "render-control-center.log",
-                "Cách dùng: smartdock.exe --render-cc <out.png> <wallpaper>\n",
-            );
-            show_error("Cách dùng: smartdock.exe --render-cc <out.png> <wallpaper>");
-            std::process::exit(2);
+    if !args.get(1).is_some_and(|a| a == "--render-cc") {
+        return None;
+    }
+    if args.len() != 4 {
+        let msg = "Usage: smartdock.exe --render-cc <out.png> <wallpaper>\n";
+        eprint!("{msg}");
+        let _ = std::fs::write("render-control-center.log", msg);
+        return Some(2);
+    }
+    let out = std::path::PathBuf::from(&args[2]);
+    let rendered = std::panic::catch_unwind(|| {
+        ui::cc_preview::render(&out, std::path::Path::new(&args[3]))
+    });
+    match rendered {
+        Ok(Ok(())) => Some(0),
+        Ok(Err(e)) => {
+            let msg = format!("Control Center render failed: {e}\n");
+            eprint!("{msg}");
+            let _ = std::fs::write(out.with_extension("log"), msg);
+            Some(1)
         }
-        let out = std::path::PathBuf::from(&args[2]);
-        let rendered = std::panic::catch_unwind(|| {
-            ui::cc_preview::render(&out, std::path::Path::new(&args[3]))
-        });
-        match rendered {
-            Ok(Ok(())) => return,
-            Ok(Err(e)) => {
-                let msg = format!("Không thể render Control Center:\n{e}");
-                let _ = std::fs::write(out.with_extension("log"), &msg);
-                show_error(&msg);
-            }
-            Err(_) => {
-                let msg = "Control Center renderer panicked before producing the PNG.";
-                let _ = std::fs::write(out.with_extension("log"), msg);
-                show_error(msg);
-            }
+        Err(_) => {
+            let msg = "Control Center renderer panicked before producing the PNG.\n";
+            eprint!("{msg}");
+            let _ = std::fs::write(out.with_extension("log"), msg);
+            Some(1)
         }
-        std::process::exit(1);
+    }
+}
+
+fn main() {
+    if let Some(code) = render_control_center_cli() {
+        std::process::exit(code);
     }
     dpi::enable_per_monitor_v2();
     appbar::recover_from_previous_crash();
