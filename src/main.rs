@@ -167,7 +167,8 @@ fn set_open(which: Option<OpenPopup>) {
 /// Click resolved on the UI thread; side effects run after the APP borrow is released.
 enum Click {
     None,
-    Activate(isize),
+    /// One or more hwnds of the same app (taskbar-style group toggle).
+    Activate(Vec<isize>),
     /// Pinned app with no open window.
     Launch(String),
     Start,
@@ -1711,14 +1712,34 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
                 // Closed since the last refresh: the entry still holds a dead handle, so a pinned app
                 // relaunches (as its launcher would) and an unpinned one just waits for the refresh.
                 // SAFETY: IsWindow on a possibly stale handle just returns false.
-                Some(w) if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(w.hwnd as _)) }.as_bool() => {
+                Some(w)
+                    if !unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(w.hwnd as _))
+                    }
+                    .as_bool() =>
+                {
                     if app.apps.pins.iter().any(|(exe, _)| exe.eq_ignore_ascii_case(&w.exe)) {
                         Click::Launch(w.exe.clone())
                     } else {
                         Click::None
                     }
                 }
-                Some(w) => Click::Activate(w.hwnd),
+                Some(w) => {
+                    let hwnds: Vec<isize> = apps::group_windows(&app.apps, w)
+                        .into_iter()
+                        .map(|e| e.hwnd)
+                        .filter(|&h| h != 0)
+                        // Drop members that closed between refresh and click.
+                        .filter(|&h| unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(h as _)).as_bool()
+                        })
+                        .collect();
+                    if hwnds.is_empty() {
+                        Click::None
+                    } else {
+                        Click::Activate(hwnds)
+                    }
+                }
                 None => Click::None,
             },
             "start" => Click::Start,
@@ -3175,7 +3196,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let click = dock_click_on(hwnd, x, y);
             log(&format!("[{}] click at ({x},{y}) -> {}", chrono::Local::now().format("%H:%M:%S%.3f"), match &click {
                 Click::None => "none",
-                Click::Activate(_) => "activate",
+                Click::Activate(h) => if h.len() > 1 { "activate group" } else { "activate" },
                 Click::Launch(_) => "launch pinned",
                 Click::Start => "open Start",
                 Click::GrokBot => "grok bot",
@@ -3192,7 +3213,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             match click {
                 Click::None => tasks::dismiss_start_if_open(),
-                Click::Activate(h) => tasks::activate_window(h),
+                Click::Activate(hwnds) => tasks::activate_app(&hwnds),
                 Click::Launch(exe) => tasks::launch_exe(&exe),
                 Click::Start => tasks::open_start_menu(),
                 Click::Search => tasks::open_search(),
