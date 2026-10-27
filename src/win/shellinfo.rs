@@ -1,14 +1,18 @@
 //! Small shell readings for the Recycle Bin, Downloads and To-do widgets. The readings are
 //! refreshed by the data thread (`refresh`) and read by the UI without blocking.
-use std::path::PathBuf;
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::UI::Shell::{SHEmptyRecycleBinW, SHQueryRecycleBinW, SHERB_NOSOUND, SHQUERYRBINFO};
+use windows::Win32::UI::Shell::{
+    SHEmptyRecycleBinW, SHFileOperationW, SHQueryRecycleBinW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
+    FOF_NOERRORUI, FO_DELETE, SHERB_NOSOUND, SHFILEOPSTRUCTW, SHQUERYRBINFO,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct Info {
@@ -68,6 +72,43 @@ pub fn empty_bin() {
     unsafe {
         let _ = SHEmptyRecycleBinW(None, PCWSTR::null(), SHERB_NOSOUND);
     }
+}
+
+/// Sends files/folders to the Recycle Bin (`FO_DELETE` + `FOF_ALLOWUNDO`). Blocking; call off the UI thread.
+pub fn send_to_recycle_bin(paths: &[PathBuf]) -> Result<u32, String> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let mut from: Vec<u16> = Vec::new();
+    let mut n = 0u32;
+    for p in paths {
+        if !p.as_os_str().is_empty() && (p.is_file() || p.is_dir() || Path::new(p).exists()) {
+            from.extend(p.as_os_str().encode_wide());
+            from.push(0);
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return Err("Không có tệp hợp lệ để xoá".to_owned());
+    }
+    from.push(0); // double-NUL terminator required by SHFileOperationW
+    let flags = (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_NOERRORUI.0) as u16;
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: HWND::default(),
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        pTo: PCWSTR::null(),
+        fFlags: flags,
+        fAnyOperationsAborted: BOOL(0),
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: PCWSTR::null(),
+    };
+    // SAFETY: `from` outlives the call; paths are absolute Explorer drops.
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code != 0 || op.fAnyOperationsAborted.as_bool() {
+        return Err(format!("Không đưa được vào thùng rác (mã {code})"));
+    }
+    Ok(n)
 }
 
 /// Current clipboard text, trimmed to one line of at most 120 characters.

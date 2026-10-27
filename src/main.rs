@@ -23,7 +23,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, SetLastError, BOOL, E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WIN32_ERROR, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -529,6 +529,7 @@ fn build_secondary_docks(
             );
         }
         ui::renderer::apply_dock_no_chrome(hwnd);
+        win::filedrop::enable(hwnd);
         let renderer = Renderer::new(hwnd, pixel_w, window_h, dpi_value);
         log(&format!(
             "secondary dock on monitor ({},{}..{},{}) hwnd={:?} (hidden until painted)",
@@ -643,6 +644,8 @@ fn run() -> windows::core::Result<()> {
     }
     // No acrylic and no rounding/border: the bar is invisible, only the tiles are drawn.
     ui::renderer::apply_dock_no_chrome(hwnd);
+    // Explorer may drop files onto the Recycle Bin tile at the end of the centre cluster.
+    win::filedrop::enable(hwnd);
 
     let shell_msg = tasks::register_shell_hook(hwnd);
     SHELL_MSG.with(|m| m.set(shell_msg));
@@ -3026,6 +3029,47 @@ fn client_point(lparam: LPARAM) -> (f32, f32) {
     (dpi::px_to_dip(x, dpi_value), dpi::px_to_dip(y, dpi_value))
 }
 
+/// Explorer dropped files on a dock HWND: only the Recycle Bin tile accepts them.
+fn handle_file_drop(hwnd: HWND, wparam: usize) {
+    let (pt, paths) = win::filedrop::take_from_wparam(wparam);
+    if paths.is_empty() {
+        return;
+    }
+    let over_trash = APP.with(|a| {
+        let Ok(slot) = a.try_borrow() else { return false };
+        let Some(app) = slot.as_ref() else { return false };
+        let (tiles, dpi_value) = if app.hwnd == hwnd {
+            (&app.tiles, app.dpi)
+        } else if let Some(sec) = app.secondaries.iter().find(|s| s.hwnd == hwnd) {
+            (&sec.tiles, sec.dpi)
+        } else {
+            return false;
+        };
+        let x = dpi::px_to_dip(pt.x, dpi_value);
+        let y = dpi::px_to_dip(pt.y, dpi_value);
+        tiles.iter().any(|(id, r)| *id == "trash" && dock::hit_test(x, y, &[*r]).is_some())
+    });
+    if !over_trash {
+        log(&format!(
+            "filedrop: ignored {} path(s) (drop was not on the Recycle Bin icon)",
+            paths.len()
+        ));
+        return;
+    }
+    log(&format!("filedrop: sending {} path(s) to Recycle Bin", paths.len()));
+    thread::spawn(move || {
+        match win::shellinfo::send_to_recycle_bin(&paths) {
+            Ok(n) => log(&format!("filedrop: {n} item(s) moved to Recycle Bin")),
+            Err(e) => log(&format!("filedrop: {e}")),
+        }
+        win::shellinfo::refresh();
+        // SAFETY: hwnd may be gone; InvalidateRect then just fails.
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+    });
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Returning TRUE from WM_NCCREATE tells Windows to continue creating the window. Letting
     // DefWindowProc answer it made CreateWindowExW fail for this window class.
@@ -3053,6 +3097,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         return LRESULT(0);
     }
     match msg {
+        m if win::filedrop::is_drop_message(m) => {
+            handle_file_drop(hwnd, wparam.0);
+            LRESULT(0)
+        }
         WM_TIMER => {
             match wparam.0 {
                 TIMER_REFRESH => {

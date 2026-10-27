@@ -422,6 +422,7 @@ fn draw_shadow(r: &mut Renderer, shadow: &(u32, u32, Vec<u8>), src_w: u32, ico: 
 }
 
 /// What the badge shows: a count from the window title, or a pulsing dot for attention.
+#[derive(Debug)]
 enum Badge {
     Count(String),
     Dot,
@@ -669,12 +670,12 @@ mod tests {
             entry(4, "C:\\Apps\\idea64.exe"),
         ];
         // Simulate refresh collapse: one representative per identity.
-        let mut groups = Vec::new();
-        let mut index = HashMap::new();
+        let mut groups: Vec<WindowEntry> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         for w in state.all.clone() {
             let key = app_identity(&w);
             if let Some(&i) = index.get(&key) {
-                let rep = &mut groups[i];
+                let rep: &mut WindowEntry = &mut groups[i];
                 rep.attention |= w.attention;
                 if title_count(&w.title).unwrap_or(0) > title_count(&rep.title).unwrap_or(0) {
                     rep.title = w.title.clone();
