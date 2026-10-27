@@ -68,7 +68,7 @@ pub const FROST_LENS: LensOptions =
 /// Control Center modules (macOS 26/27 clear glass): only a light blur, so the shapes and highlights
 /// behind each module stay readable, and almost no saturation boost (no colour cast).
 pub const CONTROL_LENS: LensOptions =
-    LensOptions { radius: 8.0, band: 1.0, strength: 0.0, blur: 4.0, saturate: 1.12, aberration: 0.0 };
+    LensOptions { radius: 8.0, band: 1.0, strength: 0.0, blur: 16.0, saturate: 1.25, aberration: 0.0 };
 
 /// Frosted backdrop from the wallpaper alone (used until a live screen grab is possible).
 pub fn render_popup(wallpaper: &WallpaperPixels, rect: RectF, screen: (i32, i32), dpr: f32) -> LiquidBitmap {

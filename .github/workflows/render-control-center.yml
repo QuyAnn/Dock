@@ -93,7 +93,7 @@ jobs:
             return $null
           }
           $renders = [ordered]@{
-            "ocean" = "dark"; "light" = "light"; "dark" = "dark"; "user_desktop" = "dark"; "macos_ref" = "dark"
+            "ocean" = "dark"; "light" = "light"; "dark" = "dark"; "user_desktop" = "dark"; "macos_ref" = "dark"; "dark_ui" = "dark"
           }
           foreach ($name in $renders.Keys) {
             $r = Invoke-Render "render-output\control_center_$name.png" "render-inputs\$name.jpg" $renders[$name]
@@ -108,7 +108,8 @@ jobs:
             "render-output\control_center_light.png",
             "render-output\control_center_dark.png",
             "render-output\control_center_user_desktop.png",
-            "render-output\control_center_macos_ref.png"
+            "render-output\control_center_macos_ref.png",
+            "render-output\control_center_dark_ui.png"
           )
           foreach ($path in $expected) {
             if (-not (Test-Path $path)) { throw "Missing render: $path" }

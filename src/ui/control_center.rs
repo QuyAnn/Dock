@@ -19,6 +19,8 @@ pub struct ControlState {
     pub wifi: Option<bool>,     // None when there is no Wi-Fi radio
     pub wifi_signal: Option<u8>, // WLAN signal quality 0..=100 while connected
     pub ethernet: bool,         // wired adapter with a cable connected
+    /// Connected Wi-Fi network name. Read only while the full panel is open (cached otherwise).
+    pub ssid: Option<String>,
     pub bluetooth: Option<bool>, // None when there is no Bluetooth radio
     pub dark: bool,
 }
@@ -34,6 +36,7 @@ impl ControlState {
             wifi: system::wifi_enabled(),
             wifi_signal: system::wifi_signal(),
             ethernet: system::ethernet_connected(),
+            ssid: None, // filled by the first full-panel refresh
             bluetooth: system::bluetooth_enabled(),
             dark: system::dark_mode(),
         }
@@ -49,6 +52,8 @@ impl ControlState {
         self.wifi_signal = system::wifi_signal();
         self.ethernet = system::ethernet_connected();
         if full_panel {
+            // SSID: one WLAN query per panel refresh, only while the Control Center is open.
+            self.ssid = if self.wifi_signal.is_some() { system::wifi_ssid() } else { None };
             self.brightness = system::get_brightness();
             self.bluetooth = system::bluetooth_enabled();
             self.dark = system::dark_mode();
@@ -185,21 +190,26 @@ pub fn apply(action: ControlAction) -> Result<()> {
 // ---------- layout (DIPs, relative to the panel rect) ----------
 // macOS 27 style: independent modules on one strict four-column grid.
 
-/// Nominal popup dimensions. The one-DIP client inset leaves a 50-DIP grid unit at 100% scale.
-pub const WIDTH: f32 = 241.0;
-pub const HEIGHT: f32 = 401.0;
+/// Nominal popup dimensions. The one-DIP client inset leaves a 60-DIP grid unit (11-DIP gaps) at
+/// 100% scale, the macOS 27 proportions: tall capsules, big badges and type.
+pub const WIDTH: f32 = 290.0;
+pub const HEIGHT: f32 = 471.0;
 const PAD: f32 = 8.0;
-const GAP: f32 = 8.0;
-const SLIDER_CARD_H: f32 = 56.0;
-const SETTINGS_H: f32 = 24.0;
-const TILE_R: f32 = 25.0;
-const CARD_R: f32 = 18.0;
-const ROUND: f32 = 36.0; // active circle inside a labelled two-column module
-const CAP_INSET: f32 = 12.0;
-const END_W: f32 = 20.0; // icon slots at both ends of a slider
-const SLIDER_H: f32 = 14.0;
-const THUMB: f32 = 12.0;
-const TRACK_H: f32 = 4.0;
+const GAP: f32 = 11.0;
+const SLIDER_CARD_H: f32 = 60.0;
+const SETTINGS_H: f32 = 28.0;
+const SETTINGS_W: f32 = 160.0;
+const TILE_R: f32 = 30.0;
+const CARD_R: f32 = 22.0;
+const ROUND: f32 = 40.0; // white badge inside a labelled two-column module
+const BADGE_INSET: f32 = 10.0;
+const CAP_INSET: f32 = 14.0;
+const END_W: f32 = 24.0; // icon slots at both ends of a slider
+const SLIDER_H: f32 = 18.0;
+const THUMB: f32 = 0.0; // no knob: the fill ends exactly at the value
+const TRACK_H: f32 = 4.5;
+const TITLE_PT: f32 = 14.0;
+const SUB_PT: f32 = 12.5;
 
 // Colors 0xRRGGBBAA.
 const WHITE: u32 = 0xFFFF_FFFF;
@@ -237,6 +247,7 @@ fn fill() -> u32 {
 // Segoe MDL2 Assets codepoints.
 const GLYPH_BT: &str = "\u{E702}";
 const GLYPH_BRIGHTNESS: &str = "\u{E706}";
+const GLYPH_ETHERNET: &str = "\u{E839}";
 const GLYPH_NETWORK: &str = "\u{E774}";
 const GLYPH_MOON: &str = "\u{E708}";
 const GLYPH_GEAR: &str = "\u{E713}";
@@ -294,18 +305,18 @@ fn layout(rect: RectF) -> Layout {
         brightness: RectF { x: x0, y: y3, w, h: SLIDER_CARD_H },
         volume: RectF { x: x0, y: y4, w, h: SLIDER_CARD_H },
         shortcuts: [0.0, 1.0, 2.0, 3.0].map(|i| RectF { x: x(i), y: y5, w: col, h: col }),
-        settings: RectF { x: rect.x + (rect.w - 136.0) / 2.0, y: y6, w: 136.0, h: SETTINGS_H },
+        settings: RectF { x: rect.x + (rect.w - SETTINGS_W) / 2.0, y: y6, w: SETTINGS_W, h: SETTINGS_H },
     }
 }
 
 /// Slider row inside a slider card (below the title): icon slot, thin track, icon slot.
 fn slider_of(card: RectF) -> RectF {
-    RectF { x: card.x + CAP_INSET, y: card.y + 32.0, w: card.w - 2.0 * CAP_INSET, h: SLIDER_H }
+    RectF { x: card.x + CAP_INSET, y: card.y + 33.0, w: card.w - 2.0 * CAP_INSET, h: SLIDER_H }
 }
 
 /// Head row (title) of a slider card.
 fn head_of(card: RectF) -> RectF {
-    RectF { x: card.x + CAP_INSET, y: card.y + 8.0, w: card.w - 2.0 * CAP_INSET, h: 16.0 }
+    RectF { x: card.x + CAP_INSET, y: card.y + 9.0, w: card.w - 2.0 * CAP_INSET, h: 20.0 }
 }
 
 /// Left icon slot of a slider row (also the mute button on the volume row).
@@ -339,24 +350,17 @@ fn fade(rgba: u32, k: f32) -> u32 {
 /// Circle button, macOS Control Center style. ON = filled white with a blue glyph;
 /// OFF = translucent liquid-glass circle with a white glyph.
 /// A rect no wider than `ROUND` is a badge inside a labelled module; a larger one is a
-/// free-standing round module, which keeps its clear glass and gets a white badge inside when on.
+/// free-standing round module: smoky glass when off, a solid white disc when on (macOS 27).
+/// Either way the "on" glyph is system blue.
 fn draw_round(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, k: f32, icon_k: f32) -> Result<()> {
     let radius = rect.h / 2.0;
     let badge_only = rect.w <= ROUND + 1.0;
-    let mut glyph_rect = rect;
     match (on, badge_only) {
-        (true, true) => super::glass::draw_control_active(r, rect, radius, k)?,
-        (true, false) => {
-            super::glass::draw_control_card(r, rect, radius)?;
-            let badge = RectF { x: rect.x + (rect.w - ROUND) / 2.0, y: rect.y + (rect.h - ROUND) / 2.0, w: ROUND, h: ROUND };
-            super::glass::draw_control_active(r, badge, ROUND / 2.0, k)?;
-            glyph_rect = badge;
-        }
+        (true, _) => super::glass::draw_control_active(r, rect, radius, k)?,
         (false, true) => super::glass::draw_control_badge(r, rect, radius)?,
         (false, false) => super::glass::draw_control_card(r, rect, radius)?,
     }
-    let size = if on && !badge_only { size.min(18.0) } else { size };
-    draw_glyph(r, glyph_rect, glyph, size, fade(if on { ACCENT } else { text() }, icon_k))
+    draw_glyph(r, rect, glyph, size, fade(if on { ACCENT } else { text() }, icon_k))
 }
 
 /// A panel icon: a Segoe glyph, or the dock's SF-style vector Wi-Fi / speaker icons.
@@ -399,7 +403,7 @@ struct Toggle<'a> {
 
 /// Circle button of a toggle tile.
 fn round_of(tile: RectF) -> RectF {
-    RectF { x: tile.x + 7.0, y: tile.y + (tile.h - ROUND) / 2.0, w: ROUND, h: ROUND }
+    RectF { x: tile.x + BADGE_INSET, y: tile.y + (tile.h - ROUND) / 2.0, w: ROUND, h: ROUND }
 }
 
 fn draw_toggle(r: &mut Renderer, tile: RectF, t: Toggle) -> Result<()> {
@@ -407,25 +411,49 @@ fn draw_toggle(r: &mut Renderer, tile: RectF, t: Toggle) -> Result<()> {
     let rk = if t.enabled { k } else { k * 0.45 };
     let icon_k = if t.on || !t.dim_off { 1.0 } else { 0.35 };
     draw_module(r, tile, TILE_R)?;
-    draw_round(r, round_of(tile), t.glyph, 18.0, t.on, rk, rk * icon_k)?;
-    let tx = tile.x + 7.0 + ROUND + 8.0;
-    let tw = (tile.x + tile.w - 7.0 - tx).max(0.0);
-    r.draw_text_styled(t.label, RectF { x: tx, y: tile.y + 7.0, w: tw, h: 16.0 }, 11.5, fade(text(), k), Align::Left, TextStyle::Bold)?;
-    r.draw_text(t.sub, RectF { x: tx, y: tile.y + 23.0, w: tw, h: 15.0 }, 10.0, fade(sub(), k), Align::Left)
+    draw_round(r, round_of(tile), t.glyph, 20.0, t.on, rk, rk * icon_k)?;
+    let tx = tile.x + BADGE_INSET + ROUND + 10.0;
+    let tw = (tile.x + tile.w - 8.0 - tx).max(0.0);
+    let (line1, line2) = wrap_two(t.sub, tw, SUB_PT);
+    let title_y = if line2.is_some() { tile.y + 7.0 } else { tile.y + 12.0 };
+    r.draw_text_styled(t.label, RectF { x: tx, y: title_y, w: tw, h: 18.0 }, TITLE_PT, fade(text(), k), Align::Left, TextStyle::Bold)?;
+    r.draw_text(&line1, RectF { x: tx, y: title_y + 18.0, w: tw, h: 16.0 }, SUB_PT, fade(sub(), k), Align::Left)?;
+    if let Some(line2) = line2 {
+        r.draw_text(&line2, RectF { x: tx, y: title_y + 32.0, w: tw, h: 16.0 }, SUB_PT, fade(sub(), k), Align::Left)?;
+    }
+    Ok(())
+}
+
+/// Splits a subtitle into at most two lines for a `width`-DIP column (macOS wraps the SSID).
+/// Breaks at the last space that fits, else mid-word; the renderer ellipsizes line two.
+fn wrap_two(text: &str, width: f32, size: f32) -> (String, Option<String>) {
+    let cap = ((width / (size * 0.55)).floor() as usize).max(4);
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= cap {
+        return (text.to_string(), None);
+    }
+    let cut = chars[..=cap.min(chars.len() - 1)]
+        .iter()
+        .rposition(|c| *c == ' ')
+        .filter(|&i| i > 0)
+        .unwrap_or(cap);
+    let first: String = chars[..cut].iter().collect();
+    let rest: String = chars[cut..].iter().collect();
+    (first.trim_end().to_string(), Some(rest.trim_start().to_string()))
 }
 
 /// Stadium pill with one centred glyph (network / sound shortcuts).
 fn draw_pill_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph) -> Result<()> {
     draw_module(r, rect, TILE_R)?;
-    draw_glyph(r, rect, glyph, 18.0, text())
+    draw_glyph(r, rect, glyph, 22.0, text())
 }
 
 /// Slider card background with its title and right-aligned value.
 fn draw_cap(r: &mut Renderer, card: RectF, title: &str, value: &str) -> Result<()> {
     draw_module(r, card, CARD_R)?;
     let head = head_of(card);
-    r.draw_text_styled(title, head, 11.5, text(), Align::Left, TextStyle::Bold)?;
-    r.draw_text(value, head, 10.5, sub(), Align::Right)
+    r.draw_text_styled(title, head, TITLE_PT, text(), Align::Left, TextStyle::Bold)?;
+    r.draw_text(value, head, SUB_PT, sub(), Align::Right)
 }
 
 /// macOS slider row: small icon, thin track with white fill and a round thumb, big icon.
@@ -442,17 +470,9 @@ fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, left: Glyp
         r.fill_rounded_rect(RectF { w: end - bar.x, ..bar }, TRACK_H / 2.0, fade(fill(), k))?;
     }
     let slot = icon_of(s);
-    draw_glyph(r, RectF { w: END_W - 4.0, ..slot }, left, 11.0, fade(sub(), k))?;
-    let rs = RectF { x: s.x + s.w - END_W + 4.0, w: END_W - 4.0, ..slot };
-    draw_glyph(r, rs, right, 15.0, fade(sub(), k))
-}
-
-fn radio_sub(v: Option<bool>) -> &'static str {
-    match v {
-        Some(true) => "Bật",
-        Some(false) => "Tắt",
-        None => "Không có",
-    }
+    draw_glyph(r, RectF { w: END_W - 6.0, ..slot }, left, 13.0, fade(text(), k))?;
+    let rs = RectF { x: s.x + s.w - END_W + 6.0, w: END_W - 6.0, ..slot };
+    draw_glyph(r, rs, right, 17.0, fade(text(), k))
 }
 
 /// Draws the whole panel into `rect`.
@@ -464,44 +484,50 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     }
     let l = layout(rect);
 
-    // Wired only: the tile reports the cable instead of the Wi-Fi radio.
-    let wired = sficons::Wifi::from_net(state.wifi, state.wifi_signal, state.ethernet) == sficons::Wifi::Ethernet;
+    // Wi-Fi tile: always the Wi-Fi radio, subtitled with the network name like macOS.
+    let wifi_sub = match state.wifi {
+        Some(true) => state.ssid.clone().unwrap_or_else(|| "Chưa kết nối".to_string()),
+        Some(false) => "Tắt".to_string(),
+        None => "Không có".to_string(),
+    };
     draw_toggle(
         r,
         l.wifi,
         Toggle {
-            glyph: Glyph::Wifi(match sficons::Wifi::from_net(state.wifi, state.wifi_signal, state.ethernet) {
-                // The round button already shows on/off; keep the fan full while on.
-                sficons::Wifi::Disconnected if state.wifi == Some(true) => sficons::Wifi::Bars(3),
+            glyph: Glyph::Wifi(match sficons::Wifi::from_net(state.wifi, state.wifi_signal, false) {
+                // The badge already shows on/off; keep the fan full while on.
+                sficons::Wifi::Disconnected | sficons::Wifi::Ethernet if state.wifi == Some(true) => sficons::Wifi::Bars(3),
                 w => w,
             }),
-            label: if wired { "Ethernet" } else { "Wi-Fi" },
-            sub: if wired { "Đã kết nối" } else { radio_sub(state.wifi) },
-            on: wired || state.wifi == Some(true),
-            enabled: wired || state.wifi.is_some(),
-            dim_off: !wired,
+            label: "Wi-Fi",
+            sub: &wifi_sub,
+            on: state.wifi == Some(true),
+            enabled: state.wifi.is_some(),
+            dim_off: true,
         },
     )?;
-    // Bluetooth and network: two round buttons under the Wi-Fi tile.
+    // Bluetooth and network: two round buttons under the Wi-Fi tile. The network button lights up
+    // (white disc, blue Ethernet glyph) while a wired adapter is connected.
     let bt_on = state.bluetooth == Some(true);
     let bt_k = if state.bluetooth.is_some() { 1.0 } else { 0.45 };
-    draw_round(r, l.bluetooth, Glyph::Text(GLYPH_BT), 20.0, bt_on, bt_k, bt_k)?;
-    draw_round(r, l.net, Glyph::Text(GLYPH_NETWORK), 20.0, false, 1.0, 1.0)?;
+    draw_round(r, l.bluetooth, Glyph::Text(GLYPH_BT), 22.0, bt_on, bt_k, bt_k)?;
+    let net_glyph = if state.ethernet { GLYPH_ETHERNET } else { GLYPH_NETWORK };
+    draw_round(r, l.net, Glyph::Text(net_glyph), 22.0, state.ethernet, 1.0, 1.0)?;
     draw_now_playing(r, l.media, media)?;
 
     // Dark mode pill (the "Focus" slot) and the two shortcut tiles.
     draw_module(r, l.dark, TILE_R)?;
     let moon = round_of(l.dark);
-    draw_round(r, moon, Glyph::Text(GLYPH_MOON), 16.0, state.dark, 1.0, 1.0)?;
+    draw_round(r, moon, Glyph::Text(GLYPH_MOON), 19.0, state.dark, 1.0, 1.0)?;
     r.draw_text_styled(
         "Chế độ tối",
         RectF {
-            x: moon.x + ROUND + 6.0,
+            x: moon.x + ROUND + 10.0,
             y: l.dark.y,
-            w: (l.dark.x + l.dark.w) - (moon.x + ROUND + 6.0) - 7.0,
+            w: (l.dark.x + l.dark.w) - (moon.x + ROUND + 10.0) - 8.0,
             h: l.dark.h,
         },
-        10.5,
+        TITLE_PT,
         text(),
         Align::Left,
         TextStyle::Bold,
@@ -524,34 +550,34 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     draw_capsule(r, slider_of(l.volume), vol, true, Glyph::Speaker(vol, state.muted), Glyph::Speaker(1.0, false))?;
 
     for (rc, (glyph, _)) in l.shortcuts.into_iter().zip(SHORTCUTS) {
-        draw_round(r, rc, Glyph::Text(glyph), 18.0, false, 1.0, 1.0)?;
+        draw_round(r, rc, Glyph::Text(glyph), 22.0, false, 1.0, 1.0)?;
     }
 
     // SmartDock Settings pill, like macOS "Edit Controls".
     draw_module(r, l.settings, l.settings.h / 2.0)?;
-    r.draw_text_styled("Cài đặt SmartDock", l.settings, 10.5, text(), Align::Center, TextStyle::Bold)
+    r.draw_text_styled("Cài đặt SmartDock", l.settings, 12.5, text(), Align::Center, TextStyle::Bold)
 }
 
 /// Prev / play / next, centred along the bottom of the Now Playing tile.
 fn media_buttons(card: RectF) -> [RectF; 3] {
     let cx = card.x + card.w / 2.0;
-    [-1.0, 0.0, 1.0].map(|i| RectF { x: cx + i * 32.0 - 12.0, y: card.y + card.h - 31.0, w: 24.0, h: 24.0 })
+    [-1.0, 0.0, 1.0].map(|i| RectF { x: cx + i * 38.0 - 16.0, y: card.y + card.h - 40.0, w: 32.0, h: 30.0 })
 }
 
 fn draw_now_playing(r: &mut Renderer, card: RectF, media: Option<&Media>) -> Result<()> {
-    draw_module(r, card, CARD_R + 2.0)?;
-    let art = RectF { x: card.x + 10.0, y: card.y + 10.0, w: 34.0, h: 34.0 };
+    draw_module(r, card, CARD_R + 4.0)?;
+    let art = RectF { x: card.x + 14.0, y: card.y + 14.0, w: 40.0, h: 40.0 };
     r.fill_rounded_rect_gradient(art, 8.0, 0xFF5F_6DFF, 0xFFC3_71FF)?;
-    r.draw_text("♪", art, 16.0, WHITE, Align::Center)?;
+    r.draw_text("♪", art, 19.0, WHITE, Align::Center)?;
     let has = media.is_some_and(|m| !m.title.is_empty());
     let title = media.filter(|_| has).map_or("Không có gì đang phát", |m| m.title.as_str());
     let artist = media.filter(|_| has).map_or("Now Playing", |m| m.artist.as_str());
-    let w = card.w - 20.0;
-    r.draw_text_styled(title, RectF { x: card.x + 10.0, y: card.y + 47.0, w, h: 15.0 }, 10.5, text(), Align::Left, TextStyle::Bold)?;
-    r.draw_text(artist, RectF { x: card.x + 10.0, y: card.y + 61.0, w, h: 13.0 }, 9.5, sub(), Align::Left)?;
+    let w = card.w - 26.0;
+    r.draw_text_styled(title, RectF { x: card.x + 14.0, y: card.y + 60.0, w, h: 18.0 }, TITLE_PT, text(), Align::Left, TextStyle::Bold)?;
+    r.draw_text(artist, RectF { x: card.x + 14.0, y: card.y + 77.0, w, h: 16.0 }, SUB_PT, sub(), Align::Left)?;
     let glyphs = ["\u{E892}", if media.is_some_and(|m| m.playing) { "\u{E769}" } else { "\u{E768}" }, "\u{E893}"];
     for (button, glyph) in media_buttons(card).into_iter().zip(glyphs) {
-        r.draw_text_styled(glyph, button, 13.0, fade(text(), if has { 1.0 } else { 0.4 }), Align::Center, TextStyle::Icon)?;
+        r.draw_text_styled(glyph, button, 18.0, fade(sub(), if has { 1.0 } else { 0.45 }), Align::Center, TextStyle::Icon)?;
     }
     Ok(())
 }
@@ -745,5 +771,13 @@ mod settings_route_tests {
         assert!(matches!(hit, Some(ControlAction::OpenSmartDockSettings)), "{hit:?}");
         let other = hit_test(l.dark.x + 20.0, l.dark.y + 20.0, rect, &state);
         assert!(matches!(other, Some(ControlAction::ToggleDark)), "{other:?}");
+    }
+
+    #[test]
+    fn wifi_subtitle_wraps_long_ssids_onto_two_lines() {
+        assert_eq!(wrap_two("BnK_5G", 70.0, 12.5), ("BnK_5G".to_string(), None));
+        let (a, b) = wrap_two("Slice Of Heaven Guest", 70.0, 12.5);
+        assert_eq!(a, "Slice Of");
+        assert_eq!(b.as_deref(), Some("Heaven Guest"));
     }
 }

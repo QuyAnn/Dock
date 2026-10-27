@@ -15,8 +15,8 @@ use crate::model::Media;
 use crate::win::wallpaper;
 
 /// Canvas in DIPs; rendered at 2x (192 DPI) so the glass rims compare fairly with Retina captures.
-const CANVAS_W: u32 = 720;
-const CANVAS_H: u32 = 480;
+const CANVAS_W: u32 = 810;
+const CANVAS_H: u32 = 540;
 const SCALE: u32 = 2;
 const PANEL_RIGHT: f32 = 30.0;
 const PANEL_TOP: f32 = 39.5;
@@ -62,7 +62,8 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
         brightness: Some(75),
         wifi: Some(true),
         wifi_signal: Some(88),
-        ethernet: false,
+        ethernet: true,
+        ssid: Some("BnK_5G".to_string()),
         bluetooth: Some(true),
         dark,
     };

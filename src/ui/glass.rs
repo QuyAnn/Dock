@@ -272,13 +272,21 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         Layer::Tile => (0.10, 1.12, 118.0),
         Layer::Plate => (0.16, 1.10, 168.0),
         // Control Center: a ~8% white veil, no extra saturation; dim only very bright backdrops.
-        Layer::Control => (0.05, 1.0, 170.0),
-        Layer::ControlLight => (0.13, 1.0, 255.0),
+        Layer::Control => (0.0, 1.08, 150.0),
+        Layer::ControlLight => (0.0, 1.05, 255.0),
     };
     let control = matches!(layer, Layer::Control | Layer::ControlLight);
     // Control modules are thicker "lenses": a wider refraction band and a gentle edge brightening.
-    let (band, k) = if control { (11.0 * dpr, 7.0 * dpr) } else { (band, k) };
-    let edge_glow = if control { 0.07 } else { 0.0 };
+    let (band, k) = if control { (11.0 * dpr, 9.0 * dpr) } else { (band, k) };
+    let edge_glow = if control { 0.0 } else { 0.0 };
+    // Control material (macOS 27): smoky dark (or milky light) veil over the heavily blurred
+    // backdrop, then a thick-glass bevel lit from the top-left.
+    let (veil, veil_a) = match layer {
+        Layer::Control => ([74.0f32, 74.0, 80.0], 0.56f32),
+        Layer::ControlLight => ([246.0f32, 246.0, 250.0], 0.30f32),
+        _ => ([0.0f32; 3], 0.0f32),
+    };
+    let dark_ctl = layer == Layer::Control;
     let mut rgb = vec![0f32; (w * h * 3) as usize];
     let mut alpha = vec![0u8; (w * h) as usize];
     let (mut lum_sum, mut lum_n) = (0f32, 0f32);
@@ -326,6 +334,39 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
             for v in &mut c {
                 *v = l0 + (*v - l0) * sat;
                 *v += (255.0 - *v) * lift_here;
+            }
+            if control {
+                for (v, g) in c.iter_mut().zip(veil) {
+                    *v += (g - *v) * veil_a;
+                }
+                // Outward normal of the nearest edge (corners/caps use the radial direction).
+                let (mut nx, mut ny) = if qx > 0.0 && qy > 0.0 {
+                    (mx / outside.max(1e-3), my / outside.max(1e-3))
+                } else if qx > qy {
+                    (1.0, 0.0)
+                } else {
+                    (0.0, 1.0)
+                };
+                nx *= if lx < 0.0 { -1.0 } else { 1.0 };
+                ny *= if ly < 0.0 { -1.0 } else { 1.0 };
+                let d = depth.max(0.0) / dpr; // DIPs from the edge
+                // Facing the light (top-left) vs. its reflection (bottom-right).
+                let lit = -(nx * 0.42 + ny * 0.91);
+                let top = lit.max(0.0);
+                let bottom = (-lit).max(0.0);
+                // Specular rim: a bright soft line ~2-3 DIP wide, strongest on top, weaker below.
+                let rim = (-d / 1.1).exp() * (top.powf(1.4) * 0.62 + bottom.powf(1.6) * 0.42);
+                // Bottom inner glow: a lighter band rising ~6 DIP from the lower edge.
+                let glow = if ny > 0.0 { ny.powf(2.0) * (1.0 - d / 7.0).max(0.0).powf(1.5) * 0.16 } else { 0.0 };
+                // Thick-glass sides: darker toward the middle of the left/right edges.
+                let side = (1.0 - top - bottom).clamp(0.0, 1.0) * (1.0 - d / 6.0).max(0.0) * 0.20;
+                // Dark outer contour right at the silhouette, under the specular.
+                let contour = (1.0 - d / 0.9).max(0.0) * (1.0 - top * 0.8) * if dark_ctl { 0.45 } else { 0.18 };
+                let add = (rim + glow).min(0.85);
+                let mul = 1.0 - side - contour;
+                for v in &mut c {
+                    *v = (*v * mul) + (255.0 - *v * mul) * add;
+                }
             }
             let l = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
             lum_sum += l;
@@ -381,7 +422,7 @@ pub fn popup_backdrop_for(
     // Live frost, as on macOS: grab what is really behind the popup (plus the blur margin), blur and
     // saturate it. The popup window must not be on screen yet.
     let dpr = dpi as f32 / 96.0;
-    let margin = ((super::liquid::FROST_LENS.blur * 3.0 + 8.0) * dpr).ceil() as i32;
+    let margin = ((lens.blur * 3.0 + 8.0) * dpr).ceil() as i32;
     let around = windows::Win32::Foundation::RECT {
         left: rect.left - margin,
         top: rect.top - margin,
@@ -487,20 +528,12 @@ pub fn draw_control_card(r: &mut Renderer, rect: RectF, radius: f32) -> Result<(
 fn draw_control_rims(r: &mut Renderer, rect: RectF, radius: f32, k: f32) -> Result<()> {
     let a = |base: f32| ((base * k).min(255.0)) as u32;
     let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
-    // Inner top highlight: a narrow band just under the top rim.
-    let band = (h * 0.22).clamp(4.0, 14.0);
-    r.fill_rounded_rect_linear(rect, radius, (x, y), 0xFFFF_FF00 | a(22.0), (x, y + band), 0xFFFF_FF00)?;
-    // Second inner line 1 px inside the rim: thick-glass edge, bright on top, gone at the bottom.
-    let inner = RectF { x: x + 1.25, y: y + 1.25, w: (w - 2.5).max(0.0), h: (h - 2.5).max(0.0) };
-    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y), 0xFFFF_FF00 | a(26.0), (x, y + h * 0.4), 0xFFFF_FF00, 1.0)?;
-    // Bottom inner shade, very faint.
-    r.stroke_rounded_rect_linear(inner, (radius - 1.25).max(0.0), (x, y + h * 0.6), 0x0000_0000, (x, y + h), 0x0000_0030, 1.5)?;
-    // Outer specular rim: bright top/left, fading toward the bottom-right.
-    let edge = RectF { x: x + 0.25, y: y + 0.25, w: (w - 0.5).max(0.0), h: (h - 0.5).max(0.0) };
+    // The bevel itself is rendered into the CPU piece; add only a crisp hairline specular that
+    // is bright at the top-left, faint at the sides and picks up again at the bottom-right.
+    let edge = RectF { x: x + 0.5, y: y + 0.5, w: (w - 1.0).max(0.0), h: (h - 1.0).max(0.0) };
     let reach = w.min(h * 2.2);
-    r.stroke_rounded_rect_linear(edge, radius, (x, y), 0xFFFF_FF00 | a(190.0), (x + reach * 0.35, y + h * 0.95), 0xFFFF_FF00 | a(18.0), 1.25)?;
-    // Faint secondary glint at the bottom-right.
-    r.stroke_rounded_rect_linear(edge, radius, (x + w, y + h), 0xFFFF_FF00 | a(80.0), (x + w - reach * 0.4, y + h * 0.5), 0xFFFF_FF00, 1.0)
+    r.stroke_rounded_rect_linear(edge, (radius - 0.5).max(0.0), (x, y), 0xFFFF_FF00 | a(150.0), (x + reach * 0.3, y + h * 0.8), 0xFFFF_FF00, 0.75)?;
+    r.stroke_rounded_rect_linear(edge, (radius - 0.5).max(0.0), (x + w, y + h), 0xFFFF_FF00 | a(90.0), (x + w - reach * 0.3, y + h * 0.3), 0xFFFF_FF00, 0.75)
 }
 
 /// Very soft, low-opacity drop shadow (wide and faint, slightly below the module).
@@ -524,7 +557,7 @@ pub fn draw_control_active(r: &mut Renderer, rect: RectF, radius: f32, opacity: 
 /// Inactive badge inside a labelled module (e.g. the moon while dark mode is off): a slightly
 /// brighter clear disc with a faint rim.
 pub fn draw_control_badge(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
-    let fill = if control_dark() { 0xFFFF_FF1E } else { 0xFFFF_FF55 };
+    let fill = if control_dark() { 0xFFFF_FF24 } else { 0xFFFF_FF66 };
     r.fill_rounded_rect(rect, radius, fill)?;
     r.stroke_rounded_rect_linear(rect, radius, (rect.x, rect.y), 0xFFFF_FF50, (rect.x, rect.y + rect.h), 0xFFFF_FF10, 1.0)
 }
