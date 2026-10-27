@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::io::Write;
 
 use windows::core::{Error, Result};
 use windows::Win32::Foundation::E_INVALIDARG;
@@ -21,7 +22,22 @@ const PANEL_TOP: f32 = 39.5;
 
 /// Renders the production Control Center over `wallpaper_path` with deterministic fake state.
 pub fn render(out_path: &Path, wallpaper_path: &Path) -> Result<()> {
+    let mut trace = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_path.with_extension("log"))
+        .ok();
+    macro_rules! trace {
+        ($message:expr) => {
+            if let Some(file) = trace.as_mut() {
+                let _ = writeln!(file, "render-cc: {}", $message);
+                let _ = file.flush();
+            }
+        };
+    }
+    trace!("decoding wallpaper");
     let (source_w, source_h, source) = wallpaper::thumbnail(wallpaper_path, 1920)?;
+    trace!("wallpaper decoded");
     if source_w == 0 || source_h == 0 {
         return Err(Error::from(E_INVALIDARG));
     }
@@ -32,6 +48,7 @@ pub fn render(out_path: &Path, wallpaper_path: &Path) -> Result<()> {
         CANVAS_W,
         CANVAS_H,
     );
+    trace!("wallpaper cover crop complete");
     let grab = ScreenGrab {
         x: 0,
         y: 0,
@@ -44,6 +61,7 @@ pub fn render(out_path: &Path, wallpaper_path: &Path) -> Result<()> {
         RectF { x: 0.0, y: 0.0, w: CANVAS_W as f32, h: CANVAS_H as f32 },
         1.0,
     ));
+    trace!("frost backdrop complete");
     let state = ControlState {
         volume: 0.60,
         muted: false,
@@ -66,6 +84,7 @@ pub fn render(out_path: &Path, wallpaper_path: &Path) -> Result<()> {
         h: control_center::HEIGHT - 1.0,
     };
 
+    trace!("starting WIC render");
     Renderer::render_png(out_path, CANVAS_W, CANVAS_H, 96, |renderer| {
         renderer.draw_bitmap(
             CANVAS_W,
