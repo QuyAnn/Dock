@@ -245,6 +245,64 @@ pub fn set_mute(mute: bool) -> Result<()> {
     unsafe { vol.SetMute(if mute { TRUE } else { FALSE }, ptr::null()) }
 }
 
+// ---------- microphone (default capture endpoint) ----------
+
+fn capture_volume() -> Result<IAudioEndpointVolume> {
+    init_com();
+    // SAFETY: COM is initialized on this thread.
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let device = enumerator.GetDefaultAudioEndpoint(windows::Win32::Media::Audio::eCapture, eConsole)?;
+        device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+    }
+}
+
+/// Mute state of the default microphone; None when there is no capture device.
+pub fn mic_muted() -> Option<bool> {
+    let vol = capture_volume().ok()?;
+    // SAFETY: vol is a live IAudioEndpointVolume.
+    unsafe { vol.GetMute().ok().map(|m| m.0 != 0) }
+}
+
+pub fn set_mic_mute(mute: bool) -> Result<()> {
+    let vol = capture_volume()?;
+    // SAFETY: vol is live; a null event context is allowed.
+    unsafe { vol.SetMute(if mute { TRUE } else { FALSE }, ptr::null()) }
+}
+
+// ---------- session ----------
+
+/// Locks the workstation (same as Win+L).
+pub fn lock_screen() -> Result<()> {
+    // SAFETY: plain Win32 call.
+    unsafe { windows::Win32::System::Shutdown::LockWorkStation() }
+}
+
+/// Puts the PC to sleep (not hibernate).
+pub fn sleep_now() -> Result<()> {
+    // SAFETY: plain Win32 call; returns FALSE on failure.
+    let ok = unsafe { windows::Win32::System::Power::SetSuspendState(false, false, false) };
+    if ok.as_bool() { Ok(()) } else { Err(E_FAIL.into()) }
+}
+
+/// Opens the Windows clipboard history (Win+V) for the foreground window.
+pub fn clipboard_history() -> Result<()> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN,
+    };
+    const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
+    let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() },
+        },
+    };
+    let inputs = [key(VK_LWIN, false), key(VK_V, false), key(VK_V, true), key(VK_LWIN, true)];
+    // SAFETY: the inputs array is valid for the call.
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent == inputs.len() as u32 { Ok(()) } else { Err(E_FAIL.into()) }
+}
+
 // ---------- brightness (DDC/CI, primary monitor) ----------
 
 /// Runs `f` with the first physical monitor of the primary display, then destroys the handles.

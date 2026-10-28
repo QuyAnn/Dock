@@ -479,6 +479,8 @@ pub struct Settings {
     pub currency_from: String,
     pub currency_to: String,
     pub currency_amount: f64,
+    /// Control Center modules in order (Edit Controls); None is the default layout.
+    pub cc_modules: Option<Vec<String>>,
 }
 
 impl Default for Settings {
@@ -511,6 +513,7 @@ impl Default for Settings {
             currency_from: "USD".into(),
             currency_to: "VND".into(),
             currency_amount: 1.0,
+            cc_modules: None,
         }
     }
 }

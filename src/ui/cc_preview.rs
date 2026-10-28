@@ -16,7 +16,7 @@ use crate::win::wallpaper;
 
 /// Canvas in DIPs; rendered at 2x (192 DPI) so the glass rims compare fairly with Retina captures.
 const CANVAS_W: u32 = 810;
-const CANVAS_H: u32 = 540;
+const MIN_CANVAS_H: u32 = 540;
 const SCALE: u32 = 2;
 const PANEL_RIGHT: f32 = 30.0;
 const PANEL_TOP: f32 = 39.5;
@@ -32,13 +32,25 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
             let _ = f.flush();
         }
     };
-    trace(&format!("decoding wallpaper {}", wallpaper_path.display()));
+    // SMARTDOCK_CC_MODULES=wifi,mic,... renders a customized layout; SMARTDOCK_CC_EDIT=1 renders
+    // edit mode; SMARTDOCK_CC_DRAG=from,to also shows `from` mid-drag over `to`.
+    let modules: Option<Vec<String>> = std::env::var("SMARTDOCK_CC_MODULES")
+        .ok()
+        .map(|v| v.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect());
+    control_center::set_modules(modules.as_deref());
+    control_center::set_max_height(f32::MAX);
+    if std::env::var_os("SMARTDOCK_CC_EDIT").is_some() {
+        control_center::begin_edit();
+    }
+    let panel_h = control_center::height();
+    let canvas_h = MIN_CANVAS_H.max((panel_h + 2.0 * PANEL_TOP).ceil() as u32);
+        trace(&format!("decoding wallpaper {}", wallpaper_path.display()));
     let (source_w, source_h, source) = wallpaper::thumbnail(wallpaper_path, 1920)?;
     if source_w == 0 || source_h == 0 {
         return Err(Error::from(E_INVALIDARG));
     }
     trace(&format!("wallpaper decoded {source_w}x{source_h} ({} bytes)", source.len()));
-    let (px_w, px_h) = (CANVAS_W * SCALE, CANVAS_H * SCALE);
+    let (px_w, px_h) = (CANVAS_W * SCALE, canvas_h * SCALE);
     let background = cover_crop(source_w, source_h, &source, px_w, px_h);
     trace("cover crop done; rendering frost");
     let grab = ScreenGrab {
@@ -52,7 +64,7 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
     let full = RectF { x: 0.0, y: 0.0, w: px_w as f32, h: px_h as f32 };
     let mut frost = liquid::render_frost_with(&grab, full, SCALE as f32, &liquid::CONTROL_LENS);
     // Live popups measure only the area behind the panel; do the same here.
-    let behind = RectF { x: (CANVAS_W as f32 - PANEL_RIGHT - control_center::WIDTH) * SCALE as f32, y: PANEL_TOP * SCALE as f32, w: control_center::WIDTH * SCALE as f32, h: control_center::HEIGHT * SCALE as f32 };
+    let behind = RectF { x: (CANVAS_W as f32 - PANEL_RIGHT - control_center::WIDTH) * SCALE as f32, y: PANEL_TOP * SCALE as f32, w: control_center::WIDTH * SCALE as f32, h: panel_h * SCALE as f32 };
     if bright_behind(&frost, behind) {
         let detail = liquid::render_frost_with(&grab, full, SCALE as f32, &liquid::BRIGHT_DETAIL_LENS);
         if detail.w == frost.w && detail.h == frost.h {
@@ -71,6 +83,7 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
         ssid: Some("BnK_5G".to_string()),
         bluetooth: Some(true),
         dark,
+        mic_muted: Some(true),
     };
     let media = Media {
         title: "Golden Hour".to_string(),
@@ -81,7 +94,7 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
         x: CANVAS_W as f32 - PANEL_RIGHT - control_center::WIDTH + 0.5,
         y: PANEL_TOP,
         w: control_center::WIDTH - 1.0,
-        h: control_center::HEIGHT - 1.0,
+        h: panel_h - 1.0,
     };
 
     // SMARTDOCK_CC_OUTPUTS=1 renders the sound-output sub-page instead of the main modules.
@@ -92,17 +105,22 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
             crate::win::system::AudioOutput { id: "c".into(), name: "LG HDR 4K (NVIDIA High Definition Audio)".into(), is_default: false },
         ]);
     }
+    if let Ok(spec) = std::env::var("SMARTDOCK_CC_DRAG") {
+        if let Some((from, to)) = spec.split_once(',') {
+            control_center::preview_drag(panel, from.trim(), to.trim());
+        }
+    }
     trace("starting Direct2D/WIC render");
     let result = Renderer::render_png(out_path, px_w, px_h, 96 * SCALE, |renderer| {
         renderer.draw_bitmap(
             px_w,
             px_h,
             &background,
-            RectF { x: 0.0, y: 0.0, w: CANVAS_W as f32, h: CANVAS_H as f32 },
+            RectF { x: 0.0, y: 0.0, w: CANVAS_W as f32, h: canvas_h as f32 },
         )?;
-        super::glass::set_backdrop(Some(frost.clone()), CANVAS_W as f32, CANVAS_H as f32);
+        super::glass::set_backdrop(Some(frost.clone()), CANVAS_W as f32, canvas_h as f32);
         let result = control_center::draw(renderer, panel, &state, Some(&media));
-        super::glass::set_backdrop(None, CANVAS_W as f32, CANVAS_H as f32);
+        super::glass::set_backdrop(None, CANVAS_W as f32, canvas_h as f32);
         result
     });
     trace(&format!("render_png returned {result:?}"));
@@ -263,7 +281,7 @@ pub fn render_popup(
         return Err(Error::from(E_INVALIDARG));
     }
     let canvas_w = (CANVAS_W as f32).max(w + 2.0 * PANEL_RIGHT);
-    let canvas_h = (CANVAS_H as f32).max(h + 2.0 * PANEL_TOP);
+    let canvas_h = (MIN_CANVAS_H as f32).max(h + 2.0 * PANEL_TOP);
     let (px_w, px_h) = ((canvas_w * SCALE as f32) as u32, (canvas_h * SCALE as f32) as u32);
     let background = cover_crop(source_w, source_h, &source, px_w, px_h);
     let grab = ScreenGrab { x: 0, y: 0, w: px_w as i32, h: px_h as i32, rgba: background.clone() };

@@ -155,6 +155,28 @@ jobs:
             if ($r) { $failures += $r }
           }
           Remove-Item Env:SMARTDOCK_CC_OUTPUTS
+          # Edit Controls: edit mode, a module mid-drag, and a customized layout.
+          $custom = "wifi,media,bluetooth,mic,dark,lock,sleep,brightness,volume,airplane,nightlight,focus,hotspot,clipboard,taskmanager,explorer,batterysaver"
+          foreach ($wp in @("user_desktop", "white_ide")) {
+            foreach ($mode in @("light", "dark")) {
+              $env:SMARTDOCK_CC_EDIT = "1"
+              $r = Invoke-Render "render-output\cc_edit_${wp}_$mode.png" "render-inputs\$wp.jpg" $mode
+              if ($r) { $failures += $r }
+              $env:SMARTDOCK_CC_DRAG = "timer,bluetooth"
+              $r = Invoke-Render "render-output\cc_edit_drag_${wp}_$mode.png" "render-inputs\$wp.jpg" $mode
+              if ($r) { $failures += $r }
+              Remove-Item Env:SMARTDOCK_CC_DRAG
+              Remove-Item Env:SMARTDOCK_CC_EDIT
+              $env:SMARTDOCK_CC_MODULES = $custom
+              $r = Invoke-Render "render-output\cc_custom_${wp}_$mode.png" "render-inputs\$wp.jpg" $mode
+              if ($r) { $failures += $r }
+              $env:SMARTDOCK_CC_EDIT = "1"
+              $r = Invoke-Render "render-output\cc_custom_edit_${wp}_$mode.png" "render-inputs\$wp.jpg" $mode
+              if ($r) { $failures += $r }
+              Remove-Item Env:SMARTDOCK_CC_EDIT
+              Remove-Item Env:SMARTDOCK_CC_MODULES
+            }
+          }
           $popups = @("calendar", "weather", "cpu", "ram", "media", "settings", "todo", "ai", "git", "currency", "notes",
             "stopwatch", "worldclock", "screentime", "forecast", "appmenu", "dockmenu", "gallery")
           foreach ($p in $popups) {
@@ -186,6 +208,8 @@ jobs:
           )
           $expected += Get-ChildItem "render-output\popup_*.png" | ForEach-Object { $_.FullName }
           if (@(Get-ChildItem "render-output\popup_*.png").Count -lt 41) { throw "Missing popup renders" }
+          $expected += Get-ChildItem "render-output\cc_*.png" | ForEach-Object { $_.FullName }
+          if (@(Get-ChildItem "render-output\cc_edit*.png").Count -lt 8 -or @(Get-ChildItem "render-output\cc_custom*.png").Count -lt 8) { throw "Missing Edit Controls renders" }
           foreach ($path in $expected) {
             if (-not (Test-Path $path)) { throw "Missing render: $path" }
             $file = Get-Item $path

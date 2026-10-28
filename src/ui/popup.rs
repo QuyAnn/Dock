@@ -68,6 +68,7 @@ thread_local! {
     static DRAG: Cell<Option<fn(DragPhase, f32, f32) -> bool>> = const { Cell::new(None) };
     static TICK: Cell<Option<fn()>> = const { Cell::new(None) };
     static RCLICK: Cell<Option<fn(f32, f32)>> = const { Cell::new(None) };
+    static ESC: Cell<Option<fn() -> bool>> = const { Cell::new(None) };
     /// True between a captured mouse-down and its mouse-up.
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
     static LAST_POS: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
@@ -89,6 +90,37 @@ pub enum DragPhase {
 /// every WM_MOUSEMOVE (`Move`) and the release (`Up`) go to it instead of the click handler.
 pub fn set_drag_handler(f: fn(DragPhase, f32, f32) -> bool) {
     DRAG.with(|c| c.set(Some(f)));
+}
+
+/// Called on an Esc press before the popup closes; returning true keeps it open (the handler
+/// consumed Esc, e.g. to leave Control Center edit mode).
+pub fn set_esc_handler(f: fn() -> bool) {
+    ESC.with(|c| c.set(Some(f)));
+}
+
+/// Anchor of the open (or last shown) popup, in screen pixels.
+pub fn anchor() -> Option<RectF> {
+    POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|pw| pw.anchor)))
+}
+
+/// Client size of the popup window in DIPs.
+pub fn size_dip() -> Option<(f32, f32)> {
+    POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|pw| pw.renderer.size())))
+}
+
+/// Tallest popup (DIPs) that fits between `anchor` and the far screen edge.
+pub fn max_height_for(anchor: RectF) -> f32 {
+    let dpi = dpi::system_dpi();
+    let monitor = monitor_rect(anchor);
+    let margin = dpi::dip_to_px(MARGIN, dpi);
+    let gap = dpi::dip_to_px(GAP, dpi);
+    let below = anchor.y + anchor.h / 2.0 < (monitor.top + monitor.bottom) as f32 / 2.0;
+    let px = if below {
+        monitor.bottom - margin - ((anchor.y + anchor.h).round() as i32 + gap)
+    } else {
+        anchor.y.round() as i32 - gap - (monitor.top + margin)
+    };
+    px.max(1) as f32 * 96.0 / dpi as f32
 }
 
 /// Receives right clicks (button up) inside the popup, in client DIPs.
@@ -566,12 +598,13 @@ fn poll() {
         f();
     }
     let close = POPUP.with(|p| {
-        let Ok(mut g) = p.try_borrow_mut() else { return false };
-        let Some(pw) = g.as_mut() else { return false };
+        let Ok(mut g) = p.try_borrow_mut() else { return None };
+        let Some(pw) = g.as_mut() else { return None };
 
         let esc = key_down(VK_ESCAPE);
         let mouse = key_down(VK_LBUTTON) || key_down(VK_RBUTTON) || key_down(VK_MBUTTON);
-        let mut close = esc && !pw.esc_down;
+        let esc_edge = esc && !pw.esc_down;
+        let mut close = esc_edge;
         if mouse && !pw.mouse_down {
             let mut pt = POINT::default();
             let mut rc = RECT::default();
@@ -588,8 +621,14 @@ fn poll() {
         }
         pw.esc_down = esc;
         pw.mouse_down = mouse;
-        close
+        if esc_edge && close { Some(true) } else if close { Some(false) } else { None }
     });
+    // Esc first goes to the handler (outside the POPUP borrow: it may resize the popup).
+    let close = match close {
+        Some(true) => !ESC.with(Cell::get).is_some_and(|f| f()),
+        Some(false) => true,
+        None => false,
+    };
     if close {
         hide();
     }

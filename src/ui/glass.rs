@@ -759,6 +759,12 @@ fn draw_light_rims(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
 
 /// Bright-backdrop panel shadow: soft but visible all around, a little heavier below, so the
 /// panel lifts off a white page.
+/// Soft lift shadow under a module being dragged in Control Center edit mode.
+pub fn draw_drag_shadow(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    draw_soft_panel_shadow(r, rect, radius)?;
+    draw_soft_panel_shadow(r, rect, radius)
+}
+
 fn draw_soft_panel_shadow(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
     for i in 1..=5 {
         let g = i as f32 * 1.1;

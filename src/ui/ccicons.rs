@@ -54,10 +54,23 @@ pub enum Icon {
     /// Left-pointing chevron (sub-page back button).
     Back,
     Music,
+    // Edit Controls additions (hand-drawn on the same grid; see the consts at the end).
+    Airplane,
+    NightLight,
+    Focus,
+    BatterySaver,
+    /// `muted` adds a slash.
+    Mic { muted: bool },
+    Lock,
+    Sleep,
+    Clipboard,
+    TaskManager,
+    Folder,
+    Hotspot,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 22] = [
+    pub const ALL: [Icon; 34] = [
         Icon::Wifi { bars: 3, off: false },
         Icon::Wifi { bars: 2, off: false },
         Icon::Wifi { bars: 1, off: false },
@@ -80,6 +93,18 @@ impl Icon {
         Icon::Play,
         Icon::Next,
         Icon::Music,
+        Icon::Airplane,
+        Icon::NightLight,
+        Icon::Focus,
+        Icon::BatterySaver,
+        Icon::Mic { muted: false },
+        Icon::Mic { muted: true },
+        Icon::Lock,
+        Icon::Sleep,
+        Icon::Clipboard,
+        Icon::TaskManager,
+        Icon::Folder,
+        Icon::Hotspot,
     ];
 }
 
@@ -122,8 +147,25 @@ fn layers(icon: Icon) -> (Vec<(Part, f32)>, f32, f32) {
             };
             (v, 12.0 - (2.0 + right) / 2.0, 0.0)
         }
+        Icon::Mic { muted } => {
+            let mut v: Vec<(Part, f32)> = vec![(MIC, 1.0)];
+            if muted {
+                v.push((WIFI_SLASH, 1.0));
+            }
+            (v, 0.0, 0.0)
+        }
         other => {
             let p: Part = match other {
+                Icon::Airplane => AIRPLANE,
+                Icon::NightLight => NIGHT_LIGHT,
+                Icon::Focus => FOCUS,
+                Icon::BatterySaver => BATTERY_SAVER,
+                Icon::Lock => LOCK,
+                Icon::Sleep => SLEEP,
+                Icon::Clipboard => CLIPBOARD,
+                Icon::TaskManager => TASK_MANAGER,
+                Icon::Folder => FOLDER,
+                Icon::Hotspot => HOTSPOT,
                 Icon::Bluetooth => BLUETOOTH,
                 Icon::Network => NETWORK,
                 Icon::Moon => MOON,
@@ -207,3 +249,16 @@ pub const PAUSE: &[(&str, K)] = &[("M7.2 4.6H8.6A1.4 1.4 0 0 1 10 6V18A1.4 1.4 0
 pub const CHEVRON: &[(&str, K)] = &[("M9 5.4L15.6 12L9 18.6", K::Stroke)];
 pub const BACK: &[(&str, K)] = &[("M15 5.4L8.4 12L15 18.6", K::Stroke)];
 pub const MUSIC: &[(&str, K)] = &[("M9.2 17.6V6.4L19.4 4.2V15.6", K::Stroke), ("M3.9 17.6A2.7 2.7 0 1 0 9.3 17.6A2.7 2.7 0 1 0 3.9 17.6ZM14.1 15.6A2.7 2.7 0 1 0 19.5 15.6A2.7 2.7 0 1 0 14.1 15.6Z", K::Fill)];
+
+// Edit Controls icons, drawn by hand on the same 24-unit grid and stroke weight.
+pub const AIRPLANE: &[(&str, K)] = &[("M12 2.6C12.9 2.6 13.4 3.6 13.4 4.6V9.4L21 14V16.2L13.4 13.8V18.4L15.6 20V21.6L12 20.6L8.4 21.6V20L10.6 18.4V13.8L3 16.2V14L10.6 9.4V4.6C10.6 3.6 11.1 2.6 12 2.6Z", K::Round)];
+pub const NIGHT_LIGHT: &[(&str, K)] = &[("M19.2 14.4A7.6 7.6 0 1 1 9.6 4.8A6 6 0 0 0 19.2 14.4Z", K::Stroke), ("M17.4 2.8V6.6M15.5 4.7H19.3", K::Stroke)];
+pub const FOCUS: &[(&str, K)] = &[("M3.6 12A8.4 8.4 0 1 0 20.4 12A8.4 8.4 0 1 0 3.6 12Z", K::Stroke), ("M8.9 12A3.1 3.1 0 1 0 15.1 12A3.1 3.1 0 1 0 8.9 12Z", K::Fill)];
+pub const BATTERY_SAVER: &[(&str, K)] = &[("M4.6 7H16.4A2.2 2.2 0 0 1 18.6 9.2V14.8A2.2 2.2 0 0 1 16.4 17H4.6A2.2 2.2 0 0 1 2.4 14.8V9.2A2.2 2.2 0 0 1 4.6 7Z", K::Stroke), ("M20.4 10.2V13.8", K::Stroke), ("M7 14.6C7 11.4 9.2 9.6 13.6 9.4C13.6 13 11.6 14.6 7 14.6Z", K::Fill)];
+pub const MIC: &[(&str, K)] = &[("M12 2.8A3 3 0 0 1 15 5.8V11.4A3 3 0 0 1 9 11.4V5.8A3 3 0 0 1 12 2.8Z", K::Stroke), ("M5.6 11A6.4 6.4 0 0 0 18.4 11M12 17.4V21M8.6 21H15.4", K::Stroke)];
+pub const LOCK: &[(&str, K)] = &[("M7.6 10.4H16.4A2.6 2.6 0 0 1 19 13V18.4A2.6 2.6 0 0 1 16.4 21H7.6A2.6 2.6 0 0 1 5 18.4V13A2.6 2.6 0 0 1 7.6 10.4Z", K::Stroke), ("M8 10.4V7.4A4 4 0 0 1 16 7.4V10.4", K::Stroke), ("M10.6 15.6A1.4 1.4 0 1 0 13.4 15.6A1.4 1.4 0 1 0 10.6 15.6Z", K::Fill)];
+pub const SLEEP: &[(&str, K)] = &[("M3.4 11.6H9.4L3.4 19.4H9.4M12.6 3.6H20.6L12.6 14.2H20.6", K::Stroke)];
+pub const CLIPBOARD: &[(&str, K)] = &[("M8.2 4.6H7.6A2.6 2.6 0 0 0 5 7.2V18.8A2.6 2.6 0 0 0 7.6 21.4H16.4A2.6 2.6 0 0 0 19 18.8V7.2A2.6 2.6 0 0 0 16.4 4.6H15.8", K::Stroke), ("M9.8 2.6H14.2A1.4 1.4 0 0 1 15.6 4V5.4A1.4 1.4 0 0 1 14.2 6.8H9.8A1.4 1.4 0 0 1 8.4 5.4V4A1.4 1.4 0 0 1 9.8 2.6Z", K::Stroke), ("M8.8 11.4H15.2M8.8 15.4H13", K::Stroke)];
+pub const TASK_MANAGER: &[(&str, K)] = &[("M5.2 4H18.8A2.6 2.6 0 0 1 21.4 6.6V17.4A2.6 2.6 0 0 1 18.8 20H5.2A2.6 2.6 0 0 1 2.6 17.4V6.6A2.6 2.6 0 0 1 5.2 4Z", K::Stroke), ("M5.8 12.6H8.8L10.6 8.6L13.4 16L15.2 11.8H18.2", K::Stroke)];
+pub const FOLDER: &[(&str, K)] = &[("M2.8 7.2A2.2 2.2 0 0 1 5 5H9.4L11.4 7.2H19A2.2 2.2 0 0 1 21.2 9.4V17A2.2 2.2 0 0 1 19 19.2H5A2.2 2.2 0 0 1 2.8 17Z", K::Stroke), ("M2.8 10.4H21.2", K::Stroke)];
+pub const HOTSPOT: &[(&str, K)] = &[("M10.1 12.8A1.9 1.9 0 1 0 13.9 12.8A1.9 1.9 0 1 0 10.1 12.8Z", K::Fill), ("M8.6 9.4A4.8 4.8 0 0 0 8.6 16.2M15.4 9.4A4.8 4.8 0 0 1 15.4 16.2M5.6 6.4A9 9 0 0 0 5.6 19.2M18.4 6.4A9 9 0 0 1 18.4 19.2", K::Stroke)];

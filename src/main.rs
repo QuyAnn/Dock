@@ -750,6 +750,7 @@ fn run() -> windows::core::Result<()> {
     popup::set_drag_handler(on_popup_drag);
     popup::set_tick_handler(on_popup_tick);
     popup::set_rclick_handler(on_popup_rclick);
+    popup::set_esc_handler(on_popup_esc);
     win::system::watch_volume();
 
     let shared = Arc::new(Shared {
@@ -1976,7 +1977,12 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             CONTROL_VIEW.with(|c| *c.borrow_mut() = state);
             control_center::hide_outputs();
             POPUP_W_CUR.with(|w| w.set(CONTROL_POPUP_W));
-            if popup::show_floating_modules(anchor, CONTROL_POPUP_W, control_center::HEIGHT as i32).is_ok() {
+            // Saved Edit Controls layout; the height follows it, capped to the screen.
+            let modules = APP.with(|a| a.borrow().as_ref().and_then(|app| app.shared.settings.lock().unwrap().cc_modules.clone()));
+            control_center::cancel_edit();
+            control_center::set_modules(modules.as_deref());
+            control_center::set_max_height(popup::max_height_for(anchor));
+            if popup::show_floating_modules(anchor, CONTROL_POPUP_W, control_center::height() as i32).is_ok() {
                 set_open(Some(which));
             }
         }
@@ -2173,7 +2179,11 @@ fn paint_popup(r: &mut Renderer, rect: RectF) {
 }
 
 fn popup_rect() -> RectF {
-    let h = if CONTROL_VIEW.with(|c| c.borrow().is_some()) { control_center::HEIGHT } else { POPUP_H_CUR.with(Cell::get) };
+    let h = if CONTROL_VIEW.with(|c| c.borrow().is_some()) {
+        popup::size_dip().map_or_else(control_center::height, |(_, h)| h)
+    } else {
+        POPUP_H_CUR.with(Cell::get)
+    };
     RectF { x: 0.5, y: 0.5, w: POPUP_W_CUR.with(Cell::get) - 1.0, h: h - 1.0 }
 }
 
@@ -2267,7 +2277,36 @@ fn on_popup_click(x: f32, y: f32) {
                     }
                     return;
                 }
+                control_center::ControlAction::LockScreen
+                | control_center::ControlAction::SleepNow
+                | control_center::ControlAction::ClipboardHistory => {
+                    // Get out of the way first (Win+V targets the window under the popup).
+                    popup::hide();
+                    thread::spawn(move || {
+                        if action == control_center::ControlAction::ClipboardHistory {
+                            thread::sleep(std::time::Duration::from_millis(120));
+                        }
+                        let _ = control_center::apply(action);
+                    });
+                    return;
+                }
+                control_center::ControlAction::ToggleMic => {
+                    CONTROL_VIEW.with(|c| {
+                        if let Some(st) = c.borrow_mut().as_mut() {
+                            st.mic_muted = st.mic_muted.map(|m| !m);
+                        }
+                    });
+                    popup::repaint_now();
+                }
                 _ => {}
+            }
+            if control_center::apply_edit(action) {
+                log(&format!("control: edit {action:?}"));
+                if action == control_center::ControlAction::EditDone {
+                    save_cc_modules();
+                }
+                resize_control_popup();
+                return;
             }
             if action == control_center::ControlAction::OpenSmartDockSettings {
                 log("settings: opened from the Control Center gear");
@@ -2489,11 +2528,54 @@ fn on_popup_click(x: f32, y: f32) {
     }
 }
 
-/// Right-click inside the popup (only the tray overflow uses it).
+/// Right-click inside the popup: tray overflow menu, or Control Center edit mode.
 fn on_popup_rclick(x: f32, y: f32) {
     if OPEN.with(Cell::get) == Some(OpenPopup::Tray) && trayview::on_click(x, y, trayview::Button::Right) {
         close_tray_popup();
+        return;
     }
+    if CONTROL_VIEW.with(|c| c.borrow().is_some()) && !control_center::outputs_open() && !control_center::editing() {
+        log("control: edit mode (right-click)");
+        control_center::begin_edit();
+        resize_control_popup();
+    }
+}
+
+/// Esc in the Control Center: leaves edit mode (discarding it) instead of closing the panel.
+fn on_popup_esc() -> bool {
+    if CONTROL_VIEW.with(|c| c.borrow().is_some()) && control_center::editing() {
+        control_center::cancel_edit();
+        resize_control_popup();
+        return true;
+    }
+    false
+}
+
+/// Re-fits the Control Center window after its content height changed (edit mode, add/remove).
+fn resize_control_popup() {
+    let h = control_center::height();
+    let current = popup::size_dip().map(|(_, h)| h);
+    if current.is_none_or(|c| (c - h).abs() > 0.5) {
+        if let Some(anchor) = popup::anchor() {
+            let _ = popup::show_floating_modules(anchor, CONTROL_POPUP_W, h as i32);
+        }
+    }
+    popup::repaint_now();
+}
+
+/// Persists the Control Center layout (None = default) to settings.json.
+fn save_cc_modules() {
+    let keys = control_center::module_keys();
+    APP.with(|a| {
+        let slot = a.borrow();
+        let Some(app) = slot.as_ref() else { return };
+        let mut guard = app.shared.settings.lock().unwrap();
+        let settings = Arc::make_mut(&mut guard);
+        if settings.cc_modules != keys {
+            settings.cc_modules = keys;
+            let _ = settings::save(settings);
+        }
+    });
 }
 
 fn close_tray_popup() {
@@ -2588,6 +2670,8 @@ fn on_popup_hidden() {
     set_open(None);
     thumbnails::set_suppressed(false);
     CONTROL_VIEW.with(|c| *c.borrow_mut() = None);
+    // Closing the panel mid-edit discards the edit (only "Xong" saves).
+    control_center::cancel_edit();
     glass::set_panel_light(false);
     appmenu::clear();
 }
@@ -2604,6 +2688,22 @@ thread_local! {
 /// immediately and the system value is applied live (coalesced to ~30 Hz off the UI thread).
 fn on_popup_drag(phase: popup::DragPhase, x: f32, _y: f32) -> bool {
     let rect = popup_rect();
+    if CONTROL_VIEW.with(|c| c.borrow().is_some()) && control_center::editing() {
+        let lite = match phase {
+            popup::DragPhase::Down => control_center::DragPhaseLite::Down,
+            popup::DragPhase::Move => control_center::DragPhaseLite::Move,
+            popup::DragPhase::Up => control_center::DragPhaseLite::Up,
+        };
+        let handled = control_center::edit_drag(lite, x, _y, rect);
+        if handled {
+            popup::repaint_now();
+            if phase == popup::DragPhase::Up {
+                // Reordering can change the row count.
+                resize_control_popup();
+            }
+        }
+        return handled;
+    }
     if OPEN.with(Cell::get) == Some(OpenPopup::Widget("brightness")) {
         let handled = ui::more_widgets::brightness_drag(phase, x, _y, rect);
         if handled { popup::repaint_now(); }
@@ -2664,7 +2764,13 @@ fn on_popup_wheel(x: f32, y: f32, notches: f32) {
     }
     let rect = popup_rect();
     let Some(state) = CONTROL_VIEW.with(|c| c.borrow().clone()) else { return };
-    let Some(slider) = control_center::slider_card_at(x, y, rect) else { return };
+    let Some(slider) = control_center::slider_card_at(x, y, rect) else {
+        // Content taller than the screen allows: the wheel scrolls the panel.
+        if control_center::scroll_by(-notches * 40.0, rect) {
+            popup::repaint_now();
+        }
+        return;
+    };
     let action = match slider {
         control_center::Slider::Volume => {
             control_center::ControlAction::SetVolume((state.volume + notches * 0.05).clamp(0.0, 1.0))
@@ -2789,6 +2895,7 @@ fn on_popup_tick() {
                         st.wifi = sh.wifi;
                         st.bluetooth = sh.bluetooth;
                         st.dark = sh.dark;
+                        st.mic_muted = sh.mic_muted;
                         st.brightness = sh.brightness;
                         changed = true;
                     }
