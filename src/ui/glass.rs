@@ -359,7 +359,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         // Control Center: a ~8% white veil, no extra saturation; dim only very bright backdrops.
         Layer::Control => (0.0, 1.08, 150.0),
         // Light clear glass (macOS 27): lightly greyed, dimmed only as far as white ink needs.
-        Layer::ControlLight => (0.0, 1.06, 152.0),
+        Layer::ControlLight => (0.0, 1.06, 145.0),
         Layer::CcPanel => (0.0, 1.06, 175.0),
         Layer::CcPanelLight => (0.0, 1.04, 255.0),
         Layer::ControlInk | Layer::CcPanelInk | Layer::PopupLight => (0.0, 1.04, 255.0),
@@ -384,7 +384,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         // Light glass stays milky; over very bright content it adds a touch of grey body so the
         // module edge and the dark ink still separate from a white page.
         // Clear light glass: a thin neutral-grey veil, so the blurred backdrop shows through.
-        Layer::ControlLight => ([124.0, 122.0, 121.0], 0.34),
+        Layer::ControlLight => ([118.0, 114.0, 113.0], 0.42),
         // The panel is a lighter smoke than the modules (~30%), thickening on bright content so the
         // modules on top still read as darker, distinct pieces.
         Layer::CcPanel => {
@@ -392,7 +392,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
             ([g, g, g + 6.0], 0.30 + 0.32 * bright)
         }
         // Barely-there panel: a slight grey, the tiles dominate.
-        Layer::CcPanelLight => ([124.0, 122.0, 121.0], 0.10),
+        Layer::CcPanelLight => ([124.0, 122.0, 121.0], 0.06),
         Layer::ControlInk => ([206.0, 206.0, 211.0], 0.36),
         Layer::CcPanelInk => ([238.0, 238.0, 241.0], 0.22),
         _ => ([0.0f32; 3], 0.0f32),
@@ -472,9 +472,11 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 // Bottom inner glow: a lighter band rising ~6 DIP from the lower edge.
                 let glow = if ny > 0.0 { ny.powf(2.0) * (1.0 - d / 7.0).max(0.0).powf(1.5) * 0.16 } else { 0.0 };
                 // Thick-glass sides: darker toward the middle of the left/right edges.
-                let side = (1.0 - top - bottom).clamp(0.0, 1.0) * (1.0 - d / 6.0).max(0.0) * 0.20;
+                // Pale (dark-ink) glass over white pages keeps the shading light, or it turns puffy.
+                let pale = matches!(layer, Layer::ControlInk | Layer::CcPanelInk);
+                let side = (1.0 - top - bottom).clamp(0.0, 1.0) * (1.0 - d / 6.0).max(0.0) * if pale { 0.07 } else { 0.20 };
                 // Dark outer contour right at the silhouette, under the specular.
-                let contour = (1.0 - d / 0.9).max(0.0) * (1.0 - top * 0.8) * if dark_ctl { 0.45 } else { 0.18 };
+                let contour = (1.0 - d / 0.9).max(0.0) * (1.0 - top * 0.8) * if dark_ctl { 0.45 } else if pale { 0.08 } else { 0.18 };
                 let add = ((rim + glow) * spec_k).min(0.85);
                 let mul = 1.0 - side - contour;
                 for v in &mut c {
@@ -674,7 +676,7 @@ pub fn draw_control_panel(r: &mut Renderer, rect: RectF, radius: f32) -> Result<
         Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
         None => r.fill_rounded_rect(rect, radius, if dark { 0x2C2C_30A0 } else { 0x7C7A_7814 })?,
     }
-    draw_control_rims(r, rect, radius, if dark { 0.7 } else if ink { 0.8 } else { 0.45 })
+    draw_control_rims(r, rect, radius, if dark { 0.7 } else if ink { 0.8 } else { 0.35 })
 }
 
 /// Shared surface for every popup panel (widget/data popups, menus, calendar, gallery, tray):
@@ -757,8 +759,14 @@ fn draw_control_shadow(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()>
 pub fn draw_control_active(r: &mut Renderer, rect: RectF, radius: f32, opacity: f32) -> Result<()> {
     let alpha = (255.0 * opacity.clamp(0.0, 1.0)).round() as u32;
     if !control_dark() {
-        // Light appearance: no shadow under the white disc.
-        return r.fill_rounded_rect(rect, radius, 0xFFFF_FF00 | alpha);
+        // Light appearance: no shadow under the white disc; over a white page a hairline keeps
+        // it apart from the pale glass.
+        r.fill_rounded_rect(rect, radius, 0xFFFF_FF00 | alpha)?;
+        if control_ink_dark() {
+            let e = RectF { x: rect.x + 0.5, y: rect.y + 0.5, w: rect.w - 1.0, h: rect.h - 1.0 };
+            r.stroke_rounded_rect(e, (radius - 0.5).max(0.0), alpha * 0x1C / 0xFF, 1.0)?;
+        }
+        return Ok(());
     }
     let sh = RectF { y: rect.y + 1.0, ..rect };
     r.fill_rounded_rect(sh, radius, 0x0000_0000 | (alpha * 18 / 255))?;

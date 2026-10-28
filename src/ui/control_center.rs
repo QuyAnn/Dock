@@ -446,7 +446,7 @@ fn draw_toggle(r: &mut Renderer, tile: RectF, t: Toggle) -> Result<()> {
     let tw = (tile.x + tile.w - 8.0 - tx).max(0.0);
     let (line1, line2) = wrap_two(t.sub, tw, SUB_PT);
     let title_y = if line2.is_some() { tile.y + 7.0 } else { tile.y + 12.0 };
-    r.draw_text_styled(t.label, RectF { x: tx, y: title_y, w: tw, h: 18.0 }, TITLE_PT, fade(text(), k), Align::Left, TextStyle::Bold)?;
+    r.draw_text_styled(t.label, RectF { x: tx, y: title_y, w: tw, h: 18.0 }, TITLE_PT, fade(text(), k), Align::Left, TextStyle::SemiBold)?;
     r.draw_text(&line1, RectF { x: tx, y: title_y + 18.0, w: tw, h: 16.0 }, SUB_PT, fade(sub(), k), Align::Left)?;
     if let Some(line2) = line2 {
         r.draw_text(&line2, RectF { x: tx, y: title_y + 32.0, w: tw, h: 16.0 }, SUB_PT, fade(sub(), k), Align::Left)?;
@@ -482,7 +482,7 @@ fn draw_pill_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph) -> Result<()> {
 fn draw_cap(r: &mut Renderer, card: RectF, title: &str, value: &str) -> Result<()> {
     draw_module(r, card, CARD_R)?;
     let head = head_of(card);
-    r.draw_text_styled(title, head, TITLE_PT, text(), Align::Left, TextStyle::Bold)?;
+    r.draw_text_styled(title, head, TITLE_PT, text(), Align::Left, TextStyle::SemiBold)?;
     r.draw_text(value, head, SUB_PT, sub(), Align::Right)
 }
 
@@ -574,7 +574,7 @@ fn draw_panel(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option
         12.5,
         text(),
         Align::Left,
-        TextStyle::Bold,
+        TextStyle::SemiBold,
     )?;
     draw_pill_glyph(r, l.sound, speaker(1.0, false))?;
     draw_pill_glyph(r, l.display, Glyph::Display)?;
@@ -593,7 +593,7 @@ fn draw_panel(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option
     draw_cap(r, l.volume, "Âm thanh", &vol_text)?;
     // "Âm thanh ›": the chevron sits right after the measured title.
     let head = head_of(l.volume);
-    let title_w = r.measure_text("Âm thanh", TITLE_PT, TextStyle::Bold).unwrap_or(62.0);
+    let title_w = r.measure_text("Âm thanh", TITLE_PT, TextStyle::SemiBold).unwrap_or(62.0);
     draw_glyph(r, RectF { x: head.x + title_w + 3.0, y: head.y, w: 12.0, h: head.h }, Glyph::Chevron, 12.0, sub())?;
     draw_capsule(r, slider_of(l.volume), vol, true, speaker(0.0, state.muted), speaker(1.0, false))?;
 
@@ -603,7 +603,7 @@ fn draw_panel(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option
 
     // SmartDock Settings pill, like macOS "Edit Controls".
     draw_module(r, l.settings, l.settings.h / 2.0)?;
-    r.draw_text_styled("Cài đặt SmartDock", l.settings, 12.5, text(), Align::Center, TextStyle::Bold)
+    r.draw_text_styled("Cài đặt SmartDock", l.settings, 12.5, text(), Align::Center, TextStyle::SemiBold)
 }
 
 /// Prev / play / next, centred along the bottom of the Now Playing tile.
@@ -621,7 +621,7 @@ fn draw_now_playing(r: &mut Renderer, card: RectF, media: Option<&Media>) -> Res
     let title = media.filter(|_| has).map_or("Không có gì đang phát", |m| m.title.as_str());
     let artist = media.filter(|_| has).map_or("Now Playing", |m| m.artist.as_str());
     let w = card.w - 26.0;
-    r.draw_text_styled(title, RectF { x: card.x + 14.0, y: card.y + 60.0, w, h: 18.0 }, TITLE_PT, text(), Align::Left, TextStyle::Bold)?;
+    r.draw_text_styled(title, RectF { x: card.x + 14.0, y: card.y + 60.0, w, h: 18.0 }, TITLE_PT, text(), Align::Left, TextStyle::SemiBold)?;
     r.draw_text(artist, RectF { x: card.x + 14.0, y: card.y + 77.0, w, h: 16.0 }, SUB_PT, sub(), Align::Left)?;
     let glyphs = [Glyph::Prev, if media.is_some_and(|m| m.playing) { Glyph::Pause } else { Glyph::Play }, Glyph::Next];
     for (button, glyph) in media_buttons(card).into_iter().zip(glyphs) {
