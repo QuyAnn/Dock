@@ -359,7 +359,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         // Control Center: a ~8% white veil, no extra saturation; dim only very bright backdrops.
         Layer::Control => (0.0, 1.08, 150.0),
         // Light clear glass (macOS 27): lightly greyed, dimmed only as far as white ink needs.
-        Layer::ControlLight => (0.0, 1.06, 145.0),
+        Layer::ControlLight => (0.0, 1.06, 138.0),
         Layer::CcPanel => (0.0, 1.06, 175.0),
         Layer::CcPanelLight => (0.0, 1.04, 255.0),
         Layer::ControlInk | Layer::CcPanelInk | Layer::PopupLight => (0.0, 1.04, 255.0),
@@ -384,7 +384,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         // Light glass stays milky; over very bright content it adds a touch of grey body so the
         // module edge and the dark ink still separate from a white page.
         // Clear light glass: a thin neutral-grey veil, so the blurred backdrop shows through.
-        Layer::ControlLight => ([118.0, 114.0, 113.0], 0.42),
+        Layer::ControlLight => ([100.0, 97.0, 96.0], 0.48),
         // The panel is a lighter smoke than the modules (~30%), thickening on bright content so the
         // modules on top still read as darker, distinct pieces.
         Layer::CcPanel => {
