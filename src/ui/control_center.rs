@@ -255,24 +255,30 @@ fn dark() -> bool {
     DARK.with(|d| d.get())
 }
 
-/// Title text and glyphs: white in dark mode, near-black in light mode (macOS).
+/// White ink on the clear glass (both appearances, as on macOS 27). The light appearance falls
+/// back to dark ink only over a near-white backdrop, where white would be unreadable.
+fn white_ink() -> bool {
+    dark() || !super::glass::control_ink_dark()
+}
+
+/// Title text and glyphs.
 fn text() -> u32 {
-    if dark() { 0xFFFF_FFFF } else { 0x1D1D_1FFF }
+    if white_ink() { 0xFFFF_FFFF } else { 0x1D1D_1FFF }
 }
 
 /// Secondary text and slider end icons.
 fn sub() -> u32 {
-    if dark() { 0xFFFF_FFB0 } else { 0x1D1D_1FA0 }
+    if white_ink() { 0xFFFF_FFC0 } else { 0x1D1D_1FA8 }
 }
 
-/// Slider track: translucent light line (darker translucent in light mode).
+/// Slider track: translucent line.
 fn track() -> u32 {
-    if dark() { 0xFFFF_FF40 } else { 0x0000_0017 }
+    if white_ink() { 0xFFFF_FF3C } else { 0x0000_001C }
 }
 
-/// Slider fill: a thin solid bar.
+/// Slider fill: a solid bar.
 fn fill() -> u32 {
-    if dark() { 0xFFFF_FFFF } else { 0x7C7C_80FF }
+    if white_ink() { 0xFFFF_FFFF } else { 0x5A5A_5FFF }
 }
 
 /// Bottom shortcut circles: glyph and the URI they open.
@@ -373,7 +379,7 @@ fn fade(rgba: u32, k: f32) -> u32 {
 /// Either way the "on" glyph is system blue.
 fn draw_round(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: bool, k: f32, icon_k: f32) -> Result<()> {
     // Badges and indicators glow system blue; a free-standing toggle shows a dark glyph on white.
-    let on_color = if rect.w <= ROUND + 1.0 { ACCENT } else { 0x1C1C_1EFF };
+    let on_color = ACCENT;
     draw_round_with(r, rect, glyph, size, on, on_color, k, icon_k)
 }
 
@@ -386,16 +392,19 @@ fn draw_round_with(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: b
         (false, true) => super::glass::draw_control_badge(r, rect, radius)?,
         (false, false) => super::glass::draw_control_card(r, rect, radius)?,
     }
-    // Light appearance: "on" is a blue disc, so its glyph is white.
-    let on_color = if dark() { on_color } else { WHITE };
     draw_glyph(r, rect, glyph, size, fade(if on { on_color } else { text() }, icon_k))
 }
 
 /// Panel icons: the shared vector icon set (one grid, one stroke weight).
 type Glyph = super::ccicons::Icon;
 
-/// Draws `glyph` in a `size`-DIP icon box centred in `rect`.
+/// Draws `glyph` in a `size`-DIP icon box centred in `rect`. White ink gets the same very
+/// subtle drop shadow as the text (macOS lifts white glyphs off the glass).
 fn draw_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, rgba: u32) -> Result<()> {
+    if super::renderer::text_shadow_for(rgba) {
+        let a = ((rgba & 0xFF) * 0x30 / 0xFF).max(1);
+        super::ccicons::draw_in(r, glyph, RectF { y: rect.y + 0.6, ..rect }, size, a)?;
+    }
     super::ccicons::draw_in(r, glyph, rect, size, rgba)
 }
 
@@ -500,6 +509,14 @@ fn draw_capsule(r: &mut Renderer, s: RectF, frac: f32, enabled: bool, left: Glyp
 pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&Media>) -> Result<()> {
     DARK.with(|d| d.set(state.dark));
     super::glass::set_control_dark(state.dark);
+    super::glass::update_control_ink(rect);
+    super::renderer::set_text_shadow(white_ink());
+    let result = draw_panel(r, rect, state, media);
+    super::renderer::set_text_shadow(false);
+    result
+}
+
+fn draw_panel(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&Media>) -> Result<()> {
     if let Some(done) = OUTPUTS.with(|o| o.borrow().as_ref().map(|l| draw_outputs(r, rect, l))) {
         return done;
     }

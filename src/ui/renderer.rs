@@ -490,8 +490,17 @@ impl Renderer {
         let (style, rgba) = popup_text(style, rgba);
         let format = text_format(size, align, style)?;
         let (rt, brush) = self.parts()?;
-        Self::set_color(brush, rgba);
         let wide: Vec<u16> = text.encode_utf16().collect();
+        if text_shadow_for(rgba) {
+            // Very subtle drop shadow under white ink on clear glass.
+            Self::set_color(brush, ((rgba & 0xFF) * 0x38 / 0xFF).max(1));
+            let sr = d2d_rect(RectF { y: rect.y + 0.6, ..rect });
+            // SAFETY: slices and rect live for the call.
+            unsafe {
+                rt.DrawText(&wide, &format, &sr, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL)
+            };
+        }
+        Self::set_color(brush, rgba);
         let r = d2d_rect(rect);
         // SAFETY: slices and rect live for the call.
         unsafe {
@@ -1039,6 +1048,21 @@ thread_local! {
 
 /// Enables the popup text weights (see `popup_text`) for subsequent text draws and measurements.
 /// Set only while popup panels paint their content, so the dock bar keeps its own type.
+thread_local! {
+    static TEXT_SHADOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enables the subtle drop shadow under light (white-ish) text and glyphs.
+pub fn set_text_shadow(on: bool) {
+    TEXT_SHADOW.with(|c| c.set(on));
+}
+
+/// True when `rgba` should get the subtle shadow (shadow enabled and the ink is near-white).
+pub fn text_shadow_for(rgba: u32) -> bool {
+    let (r, g, b) = (rgba >> 24, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF);
+    TEXT_SHADOW.with(std::cell::Cell::get) && r > 0xD0 && g > 0xD0 && b > 0xD0
+}
+
 pub fn set_popup_text(on: bool) {
     POPUP_TEXT.with(|c| c.set(on));
 }

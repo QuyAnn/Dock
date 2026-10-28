@@ -125,6 +125,10 @@ jobs:
             $r = Invoke-Render "render-output\control_center_$name.png" "render-inputs\$name.jpg" $renders[$name]
             if ($r) { $failures += $r }
           }
+          foreach ($mode in @("dark", "light")) {
+            $r = Invoke-Render "render-output\control_center_macos27_replica_$mode.png" "render-inputs\macos27_replica.jpg" $mode
+            if ($r) { $failures += $r }
+          }
           foreach ($name in @("user_desktop", "dark_ui")) {
             $r = Invoke-Render "render-output\control_center_${name}_light.png" "render-inputs\$name.jpg" "light"
             if ($r) { $failures += $r }

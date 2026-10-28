@@ -56,6 +56,13 @@ pub enum Layer {
     CcPanel,
     /// The Control Center panel in the light appearance: a subtle milky veil.
     CcPanelLight,
+    /// Light Control Center modules over a very bright backdrop (white page): a pale grey glass
+    /// so the dark ink fallback stays legible.
+    ControlInk,
+    /// The light Control Center panel over a very bright backdrop.
+    CcPanelInk,
+    /// Light-appearance popups (dark ink): flat milky frost.
+    PopupLight,
 }
 
 /// Uniform corner radius for tiles and plates (continuous-looking at 34 DIP height).
@@ -128,7 +135,10 @@ pub fn draw_glass(r: &mut Renderer, rect: RectF, radius: f32, layer: Layer, hove
                 Layer::Control => 0xFFFF_FF2A,
                 Layer::ControlLight => 0xFFFF_FF40,
                 Layer::CcPanel => 0x2C2C_3070,
-                Layer::CcPanelLight => 0xF2F2_F680,
+                Layer::CcPanelLight => 0x7C7A_7814,
+                Layer::ControlInk => 0xE6E6_EAD0,
+                Layer::CcPanelInk => 0xF4F4_F6C0,
+                Layer::PopupLight => 0xF2F2_F6E8,
                 Layer::Tile => 0x8C84_7C59,
             },
         )?,
@@ -320,8 +330,8 @@ fn backdrop_brightness(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32) ->
 /// CPU render of one glass piece (straight RGBA, `pw` x `ph`).
 #[allow(clippy::too_many_arguments)]
 fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f32, dpr: f32, layer: Layer) -> Piece {
-    if matches!(layer, Layer::ControlLight | Layer::CcPanelLight) {
-        return render_light_piece(bg, px, py, pw, ph, radius, layer == Layer::ControlLight);
+    if layer == Layer::PopupLight {
+        return render_light_piece(bg, px, py, pw, ph, radius, false);
     }
     let (w, h) = (pw as u32, ph as u32);
     let band = 7.0 * dpr;
@@ -348,18 +358,20 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         Layer::Plate => (0.16, 1.10, 168.0),
         // Control Center: a ~8% white veil, no extra saturation; dim only very bright backdrops.
         Layer::Control => (0.0, 1.08, 150.0),
-        Layer::ControlLight => (0.0, 1.05, 255.0),
+        // Light clear glass (macOS 27): lightly greyed, dimmed only as far as white ink needs.
+        Layer::ControlLight => (0.0, 1.06, 152.0),
         Layer::CcPanel => (0.0, 1.06, 175.0),
         Layer::CcPanelLight => (0.0, 1.04, 255.0),
+        Layer::ControlInk | Layer::CcPanelInk | Layer::PopupLight => (0.0, 1.04, 255.0),
     };
-    let control = matches!(layer, Layer::Control | Layer::ControlLight | Layer::CcPanel | Layer::CcPanelLight);
+    let control = !matches!(layer, Layer::Tile | Layer::Plate);
     // Control modules are thicker "lenses": a wider refraction band and a gentle edge brightening.
     let (band, k) = if control { (11.0 * dpr, 9.0 * dpr) } else { (band, k) };
     let edge_glow = if control { 0.0 } else { 0.0 };
     // Control material (macOS 27): smoky dark (or milky light) veil over the heavily blurred
     // backdrop, then a thick-glass bevel lit from the top-left.
     let dark_ctl = matches!(layer, Layer::Control | Layer::CcPanel);
-    let panel = matches!(layer, Layer::CcPanel | Layer::CcPanelLight);
+    let panel = matches!(layer, Layer::CcPanel | Layer::CcPanelLight | Layer::CcPanelInk);
     // Backdrop brightness under this piece (0 = dark window, 1 = white document). Dark glass must
     // stay smoky over bright content: the veil thickens and darkens and the speculars calm down,
     // so a module over a white IDE reads like the same module over a dark window.
@@ -371,20 +383,18 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         }
         // Light glass stays milky; over very bright content it adds a touch of grey body so the
         // module edge and the dark ink still separate from a white page.
-        Layer::ControlLight => {
-            let g = 246.0 - 16.0 * bright;
-            ([g, g, g + 4.0], 0.30 + 0.12 * bright)
-        }
+        // Clear light glass: a thin neutral-grey veil, so the blurred backdrop shows through.
+        Layer::ControlLight => ([124.0, 122.0, 121.0], 0.34),
         // The panel is a lighter smoke than the modules (~30%), thickening on bright content so the
         // modules on top still read as darker, distinct pieces.
         Layer::CcPanel => {
             let g = 58.0 - 18.0 * bright;
             ([g, g, g + 6.0], 0.30 + 0.32 * bright)
         }
-        Layer::CcPanelLight => {
-            let g = 244.0 - 10.0 * bright;
-            ([g, g, g + 4.0], 0.20 + 0.10 * bright)
-        }
+        // Barely-there panel: a slight grey, the tiles dominate.
+        Layer::CcPanelLight => ([124.0, 122.0, 121.0], 0.10),
+        Layer::ControlInk => ([206.0, 206.0, 211.0], 0.36),
+        Layer::CcPanelInk => ([238.0, 238.0, 241.0], 0.22),
         _ => ([0.0f32; 3], 0.0f32),
     };
     let spec_k = (if dark_ctl { 1.0 - 0.45 * bright } else { 1.0 }) * if panel { 0.6 } else { 1.0 };
@@ -608,6 +618,27 @@ pub fn set_control_dark(dark: bool) {
     CONTROL_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Light Control Center over a very bright backdrop: dark ink instead of white.
+static CONTROL_INK_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn control_ink_dark() -> bool {
+    CONTROL_INK_DARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Decides the ink for the light Control Center from the backdrop under `rect` (DIPs): white ink
+/// on clear glass unless the backdrop is a near-white page, where white would be unreadable.
+pub fn update_control_ink(rect: RectF) {
+    let ink = !control_dark()
+        && CTX.with(|c| {
+            c.borrow().as_ref().is_some_and(|ctx| {
+                let (px, py) = ((rect.x * ctx.sx) as i32, (rect.y * ctx.sy) as i32);
+                let (pw, ph) = ((rect.w * ctx.sx) as i32, (rect.h * ctx.sy) as i32);
+                backdrop_brightness(&ctx.bg, px, py, pw, ph) > 0.86
+            })
+        });
+    CONTROL_INK_DARK.store(ink, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn control_dark() -> bool {
     CONTROL_DARK.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -628,17 +659,22 @@ pub fn draw_control_panel(r: &mut Renderer, rect: RectF, radius: f32) -> Result<
     }
     let radius = radius.min(rect.w / 2.0).min(rect.h / 2.0);
     let dark = control_dark();
+    let ink = control_ink_dark();
     if dark {
         draw_control_shadow(r, rect, radius)?;
-    } else {
+    } else if ink {
         draw_soft_panel_shadow(r, rect, radius)?;
     }
-    let layer = if dark { Layer::CcPanel } else { Layer::CcPanelLight };
+    let layer = match (dark, ink) {
+        (true, _) => Layer::CcPanel,
+        (false, false) => Layer::CcPanelLight,
+        (false, true) => Layer::CcPanelInk,
+    };
     match piece_for(rect, radius, layer) {
         Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
-        None => r.fill_rounded_rect(rect, radius, if dark { 0x2C2C_30A0 } else { 0xF2F2_F6B0 })?,
+        None => r.fill_rounded_rect(rect, radius, if dark { 0x2C2C_30A0 } else { 0x7C7A_7814 })?,
     }
-    if dark { draw_control_rims(r, rect, radius, 0.7) } else { draw_light_rims(r, rect, radius) }
+    draw_control_rims(r, rect, radius, if dark { 0.7 } else if ink { 0.8 } else { 0.45 })
 }
 
 /// Shared surface for every popup panel (widget/data popups, menus, calendar, gallery, tray):
@@ -660,16 +696,17 @@ fn draw_glass_surface(r: &mut Renderer, rect: RectF, radius: f32, shadow: bool, 
         draw_control_shadow(r, rect, radius)?;
     }
     // Light popups are panels (light frost); light Control Center modules are flat tiles.
-    let layer = match (dark, panel) {
-        (true, _) => Layer::Control,
-        (false, true) => Layer::CcPanelLight,
-        (false, false) => Layer::ControlLight,
+    let layer = match (dark, panel, control_ink_dark()) {
+        (true, _, _) => Layer::Control,
+        (false, true, _) => Layer::PopupLight,
+        (false, false, false) => Layer::ControlLight,
+        (false, false, true) => Layer::ControlInk,
     };
     match piece_for(rect, radius, layer) {
         Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
         None => r.fill_rounded_rect(rect, radius, if dark { 0x2C2C_30E0 } else { 0xF2F2_F6E8 })?,
     }
-    if dark { draw_control_rims(r, rect, radius, 1.0) } else { draw_light_rims(r, rect, radius) }
+    if layer == Layer::PopupLight { draw_light_rims(r, rect, radius) } else { draw_control_rims(r, rect, radius, if dark { 1.0 } else { 1.25 }) }
 }
 
 /// Light appearance rim: a crisp 1 px white highlight strongest at the top-left and a faint
@@ -720,8 +757,8 @@ fn draw_control_shadow(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()>
 pub fn draw_control_active(r: &mut Renderer, rect: RectF, radius: f32, opacity: f32) -> Result<()> {
     let alpha = (255.0 * opacity.clamp(0.0, 1.0)).round() as u32;
     if !control_dark() {
-        // Light appearance: a flat system-blue disc (the glyph on it is white), as on macOS.
-        return r.fill_rounded_rect(rect, radius, 0x0A84_FF00 | alpha);
+        // Light appearance: no shadow under the white disc.
+        return r.fill_rounded_rect(rect, radius, 0xFFFF_FF00 | alpha);
     }
     let sh = RectF { y: rect.y + 1.0, ..rect };
     r.fill_rounded_rect(sh, radius, 0x0000_0000 | (alpha * 18 / 255))?;
@@ -731,8 +768,8 @@ pub fn draw_control_active(r: &mut Renderer, rect: RectF, radius: f32, opacity: 
 /// Inactive badge inside a labelled module (e.g. the moon while dark mode is off): a slightly
 /// brighter clear disc with a faint rim.
 pub fn draw_control_badge(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
-    if !control_dark() {
-        // Light appearance: a flat, faintly darker disc; no white puff or rim.
+    if !control_dark() && control_ink_dark() {
+        // Dark-ink fallback over a white page: a flat, faintly darker disc.
         return r.fill_rounded_rect(rect, radius, 0x0000_0010);
     }
     r.fill_rounded_rect(rect, radius, 0xFFFF_FF24)?;
