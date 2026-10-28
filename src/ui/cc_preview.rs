@@ -110,6 +110,9 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
             control_center::preview_drag(panel, from.trim(), to.trim());
         }
     }
+    if let Some(scale) = live_scale() {
+        return render_live(out_path, &background, px_w, px_h, scale, panel_h, &state, &media);
+    }
     trace("starting Direct2D/WIC render");
     let result = Renderer::render_png(out_path, px_w, px_h, 96 * SCALE, |renderer| {
         renderer.draw_bitmap(
@@ -125,6 +128,88 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
     });
     trace(&format!("render_png returned {result:?}"));
     result
+}
+
+/// `SMARTDOCK_CC_LIVE=<scale>` (e.g. 1, 1.25, 1.5): render exactly like the live popup on a display
+/// at that scale instead of the 2x full-canvas preview.
+fn live_scale() -> Option<f32> {
+    let v = std::env::var("SMARTDOCK_CC_LIVE").ok()?;
+    let s: f32 = v.trim().parse().unwrap_or(1.0);
+    Some(s.clamp(1.0, 4.0))
+}
+
+/// Live-path replica: the desktop at `scale` (physical px = DIP * scale), a popup window of the
+/// Control Center's size whose backdrop is built by the same calls as `glass::popup_backdrop_for`
+/// (`render_frost_with(CONTROL_LENS)` over the window rect + `add_bright_detail`), the panel painted
+/// into that window at (0.5, 0.5) like `popup::paint`, then composited where the window sits.
+#[allow(clippy::too_many_arguments)]
+fn render_live(
+    out_path: &Path,
+    background_2x: &[u8],
+    w2: u32,
+    h2: u32,
+    scale: f32,
+    panel_h: f32,
+    state: &ControlState,
+    media: &Media,
+) -> Result<()> {
+    let canvas_h = h2 as f32 / SCALE as f32;
+    let (px_w, px_h) = ((CANVAS_W as f32 * scale).round() as u32, (canvas_h * scale).round() as u32);
+    // The desktop as a screen at this scale would show it (box-downsampled from the 2x crop).
+    let mut desk = vec![0u8; (px_w * px_h * 4) as usize];
+    let k = SCALE as f32 / scale;
+    for y in 0..px_h {
+        for x in 0..px_w {
+            let (sx0, sy0) = (x as f32 * k, y as f32 * k);
+            let mut acc = [0f32; 4];
+            let mut n = 0f32;
+            let mut yy = sy0;
+            while yy < sy0 + k - 1e-3 {
+                let mut xx = sx0;
+                while xx < sx0 + k - 1e-3 {
+                    let (ix, iy) = ((xx as u32).min(w2 - 1), (yy as u32).min(h2 - 1));
+                    let o = ((iy * w2 + ix) * 4) as usize;
+                    for c in 0..4 {
+                        acc[c] += background_2x[o + c] as f32;
+                    }
+                    n += 1.0;
+                    xx += 1.0;
+                }
+                yy += 1.0;
+            }
+            let o = ((y * px_w + x) * 4) as usize;
+            for c in 0..4 {
+                desk[o + c] = (acc[c] / n.max(1.0)).round() as u8;
+            }
+        }
+    }
+    let to_px = |dip: f32| (dip * scale).round() as i32;
+    let (wx, wy) = (to_px(CANVAS_W as f32 - PANEL_RIGHT - control_center::WIDTH), to_px(PANEL_TOP - 0.5));
+    let (ww, wh) = (to_px(control_center::WIDTH), to_px(panel_h));
+    let grab = ScreenGrab { x: 0, y: 0, w: px_w as i32, h: px_h as i32, rgba: desk.clone() };
+    let win = RectF { x: wx as f32, y: wy as f32, w: ww as f32, h: wh as f32 };
+    let mut frost = liquid::render_frost_with(&grab, win, scale, &liquid::CONTROL_LENS);
+    liquid::add_bright_detail(&mut frost, &grab, win, scale);
+    let frost = Arc::new(frost);
+    let dpi = (96.0 * scale).round() as u32;
+    let (w, h) = (ww as f32 / scale, wh as f32 / scale);
+    let tmp = out_path.with_extension("window.png");
+    Renderer::render_png(&tmp, ww as u32, wh as u32, dpi, |r| {
+        super::glass::set_backdrop(Some(frost.clone()), w, h);
+        let panel = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
+        let res = control_center::draw(r, panel, state, Some(media));
+        super::glass::set_backdrop(None, w, h);
+        res
+    })?;
+    let (tw, th, win_px) = wallpaper::thumbnail(&tmp, (ww.max(wh)) as u32)?;
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(tmp.with_extension("log"));
+    // Composite at 1:1 device pixels (96 DPI target in px units).
+    let canvas = (px_w as f32 / scale, px_h as f32 / scale);
+    Renderer::render_png(out_path, px_w, px_h, dpi, |r| {
+        r.draw_bitmap(px_w, px_h, &desk, RectF { x: 0.0, y: 0.0, w: canvas.0, h: canvas.1 })?;
+        r.draw_bitmap(tw, th, &win_px, RectF { x: wx as f32 / scale, y: wy as f32 / scale, w, h })
+    })
 }
 
 /// Same test as `liquid::add_bright_detail`, over the panel area of the full-canvas preview frost.

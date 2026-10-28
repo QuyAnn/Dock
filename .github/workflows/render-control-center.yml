@@ -77,6 +77,42 @@ jobs:
           $bitmap.Save("render-inputs/white_ide.jpg", [System.Drawing.Imaging.ImageFormat]::Jpeg)
           $bitmap.Dispose()
           New-Gradient "render-inputs/dark.jpg" "#193250" "#050A13"
+          # A light web page like a real browser at 100%: white page, grey nav, cards with real
+          # body text, a teal image block and a blue button (drawn at 2x so text is ~14 px at 1x).
+          $bitmap = [System.Drawing.Bitmap]::new(1620, 1140)
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+          $graphics.Clear([System.Drawing.Color]::White)
+          $graphics.FillRectangle([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(248, 248, 249)), 0, 0, 1620, 96)
+          $graphics.FillRectangle([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(229, 231, 235)), 0, 96, 1620, 2)
+          $graphics.FillRectangle([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(246, 247, 248)), 0, 98, 330, 1042)
+          $title = [System.Drawing.Font]::new("Segoe UI Semibold", 22, [System.Drawing.GraphicsUnit]::Pixel)
+          $titleBig = [System.Drawing.Font]::new("Segoe UI Semibold", 30, [System.Drawing.GraphicsUnit]::Pixel)
+          $body = [System.Drawing.Font]::new("Segoe UI", 26, [System.Drawing.GraphicsUnit]::Pixel)
+          $dark = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(32, 33, 36))
+          $grey = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(95, 99, 104))
+          $line = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(229, 231, 235), 2)
+          $card = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(250, 250, 251))
+          $teal = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(47, 111, 115))
+          $blue = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(26, 115, 232))
+          $graphics.DrawString("Trang chủ   Tin tức   Thể thao   Công nghệ   Giải trí   Đời sống", $title, $dark, 360, 32)
+          foreach ($i in 0..13) { $graphics.DrawString(("Mục điều hướng {0}" -f ($i + 1)), $body, $grey, 36, 130 + $i * 62) }
+          $texts = @("Không có gì đáng lo ngại khi cập nhật bản mới nhất,",
+                     "các thay đổi đã được kiểm thử trên nhiều cấu hình máy",
+                     "khác nhau và cho kết quả ổn định trong suốt tuần qua.",
+                     "Xem thêm chi tiết trong phần ghi chú phát hành bên dưới.")
+          for ($c = 0; $c -lt 4; $c++) {
+            $y = 130 + $c * 252
+            $graphics.FillRectangle($card, 370, $y, 1210, 228)
+            $graphics.DrawRectangle($line, 370, $y, 1210, 228)
+            $graphics.FillRectangle($teal, 392, $y + 22, 180, 184)
+            $graphics.DrawString(("Bài viết nổi bật số {0}: cập nhật giao diện" -f ($c + 1)), $titleBig, $dark, 600, $y + 20)
+            for ($k = 0; $k -lt 4; $k++) { $graphics.DrawString($texts[$k] + " " + $texts[($k + $c) % 4], $body, $grey, 600, $y + 70 + $k * 36) }
+            if ($c -eq 1) { $graphics.FillRectangle($blue, 1180, $y + 168, 200, 44) }
+          }
+          $graphics.Dispose()
+          $bitmap.Save("render-inputs/web_page.jpg", [System.Drawing.Imaging.ImageFormat]::Jpeg)
+          $bitmap.Dispose()
       - name: Render production Control Center
         shell: pwsh
         env:
@@ -178,6 +214,23 @@ jobs:
               Remove-Item Env:SMARTDOCK_CC_EDIT
               Remove-Item Env:SMARTDOCK_CC_MODULES
             }
+          }
+          # Live-path replica (SMARTDOCK_CC_LIVE=<display scale>): same capture scale, popup-local
+          # backdrop and blur as the real popup on a 100% / 125% / 150% screen.
+          foreach ($wp in @("web_page", "user_mint", "white_ide", "wp_white", "user_desktop")) {
+            foreach ($sc in @("1", "1.25", "1.5")) {
+              $env:SMARTDOCK_CC_LIVE = $sc
+              $tag = $sc.Replace(".", "")
+              foreach ($mode in @("light", "dark")) {
+                $r = Invoke-Render "render-output\cc_live_${wp}_${mode}_$tag.png" "render-inputs\$wp.jpg" $mode
+                if ($r) { $failures += $r }
+              }
+              Remove-Item Env:SMARTDOCK_CC_LIVE
+            }
+          }
+          foreach ($mode in @("light", "dark")) {
+            $r = Invoke-Render "render-output\wall_web_page_$mode.png" "render-inputs\web_page.jpg" $mode
+            if ($r) { $failures += $r }
           }
           $popups = @("calendar", "weather", "cpu", "ram", "media", "settings", "todo", "ai", "git", "currency", "notes",
             "stopwatch", "worldclock", "screentime", "forecast", "appmenu", "dockmenu", "gallery")

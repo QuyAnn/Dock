@@ -367,7 +367,10 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     // Control modules are thicker "lenses": a wider refraction band and a gentle edge brightening.
     // Pale glass over bright pages: clearly translucent, with the strong lens of the clear glass.
     let pale = matches!(layer, Layer::ControlInk | Layer::CcPanelInk);
-    let (band, k) = if layer == Layer::ControlLight || pale {
+    let (band, k) = if pale {
+        // Bright-page glass: a thin lens at the rim only; a deep band reads as a puffy bubble.
+        (8.0 * dpr, 6.0 * dpr)
+    } else if layer == Layer::ControlLight {
         // Light clear glass: a stronger lens so the backdrop visibly bends at the rim (macOS 27).
         (12.0 * dpr, 13.0 * dpr)
     } else if control {
@@ -414,7 +417,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         // Bright-page glass: thin neutral tints, so the page (and its own colour, e.g. a mint
         // wallpaper) shows through clearly. Modules are a touch darker than the panel (not more
         // opaque), and their rims and lens band carry the shape.
-        Layer::ControlInk => ([200.0, 200.0, 206.0], 0.14),
+        Layer::ControlInk => ([200.0, 200.0, 206.0], 0.10),
         Layer::CcPanelInk => ([250.0, 250.0, 252.0], 0.22),
         _ => ([0.0f32; 3], 0.0f32),
     };
@@ -474,7 +477,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 // so a coloured page stays its colour under the module instead of turning grey.
                 if matches!(layer, Layer::ControlInk) {
                     for v in &mut c {
-                        *v *= 0.94;
+                        *v *= 0.965;
                     }
                 }
                 for (v, g) in c.iter_mut().zip(veil) {
@@ -507,7 +510,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 // Pale glass: a soft white sheen fading out over the top ~30% (thickness, no blobs).
                 let sheen = if pale {
                     let ty = (j as f32 + 0.5) / ph as f32 / 0.3;
-                    (1.0 - ty).max(0.0).powf(1.6) * if panel { 0.05 } else { 0.10 }
+                    (1.0 - ty).max(0.0).powf(1.6) * if panel { 0.0 } else { 0.04 }
                 } else {
                     0.0
                 };
@@ -789,9 +792,9 @@ fn draw_ink_rims(r: &mut Renderer, rect: RectF, radius: f32, contour: u32) -> Re
     let edge = RectF { x: x + 0.5, y: y + 0.5, w: (w - 1.0).max(0.0), h: (h - 1.0).max(0.0) };
     // Contour a touch heavier at the bottom (thickness), lighter at the lit top.
     r.stroke_rounded_rect_linear(edge, (radius - 0.5).max(0.0), (x, y), contour & !0xFF | (contour & 0xFF) * 3 / 5, (x, y + h), contour, 1.0)?;
-    // Crisp specular just inside the silhouette, bright on top, gone by mid-height.
+    // Crisp specular just inside the silhouette, bright on top, gone by a third of the height.
     let inner = RectF { x: x + 1.5, y: y + 1.5, w: (w - 3.0).max(0.0), h: (h - 3.0).max(0.0) };
-    r.stroke_rounded_rect_linear(inner, (radius - 1.5).max(0.0), (x, y), 0xFFFF_FFF0, (x, y + h * 0.5), 0xFFFF_FF00, 1.0)
+    r.stroke_rounded_rect_linear(inner, (radius - 1.5).max(0.0), (x, y), 0xFFFF_FFC8, (x, y + h * 0.38), 0xFFFF_FF00, 1.0)
 }
 
 /// Crisp 1.25 px specular rim (brightest top-left, faint at the bottom), a thin inner highlight
