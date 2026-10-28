@@ -320,12 +320,25 @@ fn layout_vertical(edge: AbEdge, left: &[Tile], center: &[Tile], right: &[Tile],
         out.push(rect(cell, y));
         y += cell.1 + ZONE_GAP;
     }
-    // Right zone: packed to the bottom; the tiles nearest the end (clock, Control Center) win.
+    // Right zone: packed to the bottom. When it does not all fit, the Control Center, tray
+    // chevron and clock keep their place first, then the tiles nearest the end.
+    let budget = (length - ROW_PAD) - bottom_limit;
+    let essential = |t: &Tile| matches!(t.id, "cc" | "chevron" | "clock");
+    let mut keep = vec![false; right.len()];
+    let mut used = 0.0;
+    let order = (0..right.len()).rev().filter(|&i| essential(&right[i])).chain((0..right.len()).rev().filter(|&i| !essential(&right[i])));
+    for i in order {
+        let need = side_cell(&right[i]).1 + if used > 0.0 { ZONE_GAP } else { 0.0 };
+        if used + need <= budget {
+            keep[i] = true;
+            used += need;
+        }
+    }
     let mut placed = vec![RectF::default(); right.len()];
     let mut end = length - ROW_PAD;
     for (i, t) in right.iter().enumerate().rev() {
         let cell = side_cell(t);
-        if end - cell.1 >= bottom_limit {
+        if keep[i] {
             placed[i] = rect(cell, end - cell.1);
             end -= cell.1 + ZONE_GAP;
         } else {
@@ -953,6 +966,12 @@ mod tests {
                 // Clock (last right tile) is kept at the bottom.
                 let clock = rects[rects.len() - 1];
                 assert!(clock.h > 0.0 && (clock.y + clock.h - (len - ROW_PAD)).abs() < 0.01);
+                // The Control Center / tray chevron keep their place before optional widgets.
+                for id in ["cc", "chevron"] {
+                    if let Some(i) = r.iter().position(|t| t.id == id) {
+                        assert!(rects[l.len() + c.len() + i].h > 0.0, "{edge:?} len={len} {id} dropped");
+                    }
+                }
             }
         }
         // Tiles rise away from the screen edge.
