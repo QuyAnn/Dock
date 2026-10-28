@@ -414,8 +414,8 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         // Bright-page glass: thin neutral tints, so the page (and its own colour, e.g. a mint
         // wallpaper) shows through clearly. Modules are a touch darker than the panel (not more
         // opaque), and their rims and lens band carry the shape.
-        Layer::ControlInk => ([178.0, 180.0, 188.0], 0.24),
-        Layer::CcPanelInk => ([250.0, 250.0, 252.0], 0.26),
+        Layer::ControlInk => ([200.0, 200.0, 206.0], 0.14),
+        Layer::CcPanelInk => ([250.0, 250.0, 252.0], 0.22),
         _ => ([0.0f32; 3], 0.0f32),
     };
     let spec_k = (if dark_ctl { 1.0 - 0.45 * bright } else { 1.0 }) * if panel { 0.6 } else { 1.0 };
@@ -470,6 +470,13 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 *v += (255.0 - *v) * lift_here;
             }
             if control {
+                // Bright-page modules: a hue-keeping shade (multiply) does most of the darkening,
+                // so a coloured page stays its colour under the module instead of turning grey.
+                if matches!(layer, Layer::ControlInk) {
+                    for v in &mut c {
+                        *v *= 0.94;
+                    }
+                }
                 for (v, g) in c.iter_mut().zip(veil) {
                     *v += (g - *v) * veil_a;
                 }
