@@ -58,6 +58,8 @@ jobs:
           }
           New-Gradient "render-inputs/ocean.jpg" "#1598A5" "#063D57"
           New-Gradient "render-inputs/light.jpg" "#E9F6FF" "#8BC7E8"
+          # Plain pale mint desktop (a user's real backdrop): pastel, luminance ~225-240.
+          New-Gradient "render-inputs/user_mint.jpg" "#E6F2E7" "#D8E4DC"
           # A bright light-theme editor: white page, grey gutter, dark code lines long enough to run
           # under the Control Center (worst case for dark glass; show-through for the pale glass).
           $bitmap = [System.Drawing.Bitmap]::new(1280, 720)
@@ -127,7 +129,7 @@ jobs:
           }
           # Wallpaper matrix: every test backdrop in both appearances.
           foreach ($wp in @("wp_black", "wp_white", "wp_lightgrey", "wp_grey", "wp_colorful", "wp_city", "wp_sky", "wp_navy", "wp_nature", "wp_bloom",
-                            "user_desktop", "macos27_replica", "white_ide", "dark_ui")) {
+                            "user_desktop", "macos27_replica", "white_ide", "dark_ui", "user_mint")) {
             foreach ($mode in @("light", "dark")) {
               $r = Invoke-Render "render-output\wall_${wp}_$mode.png" "render-inputs\$wp.jpg" $mode
               if ($r) { $failures += $r }

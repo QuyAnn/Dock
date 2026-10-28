@@ -411,10 +411,11 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         }
         // Barely-there panel: a slight grey, the tiles dominate.
         Layer::CcPanelLight => ([124.0, 122.0, 121.0], 0.06),
-        // Bright-page glass: thin grey tints, so the blurred page shows through. Modules carry
-        // more grey than the panel so they separate from it.
-        Layer::ControlInk => ([196.0, 196.0, 203.0], 0.42),
-        Layer::CcPanelInk => ([236.0, 236.0, 240.0], 0.50),
+        // Bright-page glass: thin neutral tints, so the page (and its own colour, e.g. a mint
+        // wallpaper) shows through clearly. Modules are a touch darker than the panel (not more
+        // opaque), and their rims and lens band carry the shape.
+        Layer::ControlInk => ([178.0, 180.0, 188.0], 0.24),
+        Layer::CcPanelInk => ([250.0, 250.0, 252.0], 0.26),
         _ => ([0.0f32; 3], 0.0f32),
     };
     let spec_k = (if dark_ctl { 1.0 - 0.45 * bright } else { 1.0 }) * if panel { 0.6 } else { 1.0 };
@@ -499,7 +500,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 // Pale glass: a soft white sheen fading out over the top ~30% (thickness, no blobs).
                 let sheen = if pale {
                     let ty = (j as f32 + 0.5) / ph as f32 / 0.3;
-                    (1.0 - ty).max(0.0).powf(1.6) * if panel { 0.16 } else { 0.30 }
+                    (1.0 - ty).max(0.0).powf(1.6) * if panel { 0.05 } else { 0.10 }
                 } else {
                     0.0
                 };
@@ -742,7 +743,7 @@ fn draw_glass_surface(r: &mut Renderer, rect: RectF, radius: f32, shadow: bool, 
         None => r.fill_rounded_rect(rect, radius, if dark { 0x2C2C_30E0 } else { 0xF2F2_F6E8 })?,
     }
     if layer == Layer::ControlInk {
-        return draw_ink_rims(r, rect, radius, 0x0000_0016);
+        return draw_ink_rims(r, rect, radius, 0x0000_001E);
     }
     if layer == Layer::PopupLight { draw_light_rims(r, rect, radius) } else { draw_control_rims(r, rect, radius, if dark { 1.0 } else { 1.25 }) }
 }
