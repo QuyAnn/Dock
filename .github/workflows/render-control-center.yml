@@ -77,6 +77,40 @@ jobs:
           $bitmap.Save("render-inputs/white_ide.jpg", [System.Drawing.Imaging.ImageFormat]::Jpeg)
           $bitmap.Dispose()
           New-Gradient "render-inputs/dark.jpg" "#193250" "#050A13"
+          # Mixed backdrops: dark app UI with a white browser/tab strip on top (~20%), and a variant
+          # with a white band across the middle. Drawn at 2x.
+          function New-Mixed([string]$Path, [int]$BandTop, [int]$BandH) {
+            $bitmap = [System.Drawing.Bitmap]::new(1620, 1140)
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+            $graphics.Clear([System.Drawing.Color]::FromArgb(32, 33, 36))
+            $f = [System.Drawing.Font]::new("Segoe UI", 26, [System.Drawing.GraphicsUnit]::Pixel)
+            $light = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(200, 202, 206))
+            $dim = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(130, 134, 140))
+            $row = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(45, 46, 50))
+            $green = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(46, 125, 50))
+            for ($i = 0; $i -lt 16; $i++) {
+              $y = 20 + $i * 72
+              if ($i % 2 -eq 0) { $graphics.FillRectangle($row, 0, $y, 1620, 64) }
+              $graphics.DrawString(("Xem tất cả - mục {0}: chi tiết, chuyển, tiếp tục" -f $i), $f, $light, 120, $y + 12)
+              $graphics.DrawString("15/10/2026", $f, $dim, 1300, $y + 12)
+            }
+            $graphics.FillRectangle($green, 900, 540, 120, 60)
+            $white = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(250, 250, 250))
+            $tab = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(222, 225, 230))
+            $ink = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(60, 64, 67))
+            $graphics.FillRectangle($white, 0, $BandTop, 1620, $BandH)
+            $graphics.FillRectangle($tab, 0, $BandTop, 1620, 56)
+            for ($t = 0; $t -lt 6; $t++) { $graphics.DrawString(("Tab trang {0}" -f ($t + 1)), $f, $ink, 30 + $t * 270, $BandTop + 12) }
+            for ($k = 0; $k -lt [Math]::Floor(($BandH - 70) / 40); $k++) {
+              $graphics.DrawString("Nội dung trang web màu trắng với chữ xám đậm để kiểm tra độ đọc", $f, $ink, 60, $BandTop + 70 + $k * 40)
+            }
+            $graphics.Dispose()
+            $bitmap.Save($Path, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+            $bitmap.Dispose()
+          }
+          New-Mixed "render-inputs/mixed_top.jpg" 0 240
+          New-Mixed "render-inputs/mixed_band.jpg" 460 260
           # A dark VS Code-like editor at 2x (~13 px code at 1x): syntax-coloured Java lines.
           $bitmap = [System.Drawing.Bitmap]::new(1620, 1140)
           $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
@@ -252,7 +286,7 @@ jobs:
             }
           }
           # Dark / photo / colourful backdrops through the live path at 100% and 125%.
-          foreach ($wp in @("dark_ide", "dark_ui", "wp_black", "wp_navy", "wp_colorful", "wp_nature", "wp_city", "ocean")) {
+          foreach ($wp in @("mixed_top", "mixed_band", "dark_ide", "dark_ui", "wp_black", "wp_navy", "wp_colorful", "wp_nature", "wp_city", "ocean")) {
             foreach ($sc in @("1", "1.25")) {
               $env:SMARTDOCK_CC_LIVE = $sc
               $tag = $sc.Replace(".", "")

@@ -495,7 +495,9 @@ impl Renderer {
             // Very subtle drop shadow under white ink on clear glass.
             // Soft halo: below plus both sides, so white ink stays readable over clear glass
             // with code or a photo showing through.
+            let boost = halo_boost(rect);
             for (dx, dy, a) in [(0.0, 0.8, 0x50u32), (-0.6, 0.2, 0x26), (0.6, 0.2, 0x26)] {
+                let a = ((a as f32 * boost).min(255.0)) as u32;
                 Self::set_color(brush, ((rgba & 0xFF) * a / 0xFF).max(1));
                 let sr = d2d_rect(RectF { x: rect.x + dx, y: rect.y + dy, ..rect });
                 // SAFETY: slices and rect live for the call.
@@ -1052,6 +1054,21 @@ thread_local! {
 
 thread_local! {
     static TEXT_SHADOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    static HALO_SAMPLER: std::cell::Cell<Option<fn(RectF) -> f32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Local backdrop brightness lookup (0..1) for the white-ink halo: brighter spots behind the
+/// text get a stronger halo. None = uniform halo.
+pub fn set_halo_sampler(f: Option<fn(RectF) -> f32>) {
+    HALO_SAMPLER.with(|c| c.set(f));
+}
+
+/// Halo strength multiplier for text/glyphs drawn in `rect` (1 over dark, up to ~2.6 over white).
+pub fn halo_boost(rect: RectF) -> f32 {
+    HALO_SAMPLER.with(std::cell::Cell::get).map_or(1.0, |f| 1.0 + 1.6 * f(rect).clamp(0.0, 1.0))
 }
 
 /// Enables the subtle drop shadow under light (white-ish) text and glyphs.

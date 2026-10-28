@@ -354,6 +354,23 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
             top * (1.0 - ty) + bot * ty
         })
     };
+    // Local backdrop brightness from the heavy frost (~16 DIP blur): a smooth field shared by the
+    // panel and every tile, so local darkening has no seams between pieces.
+    let heavy_lum = |x: f32, y: f32| -> f32 {
+        let fx = (x - 0.5).clamp(0.0, bg.w as f32 - 1.001);
+        let fy = (y - 0.5).clamp(0.0, bg.h as f32 - 1.001);
+        let (ix, iy) = (fx as usize, fy as usize);
+        let (tx, ty) = (fx - ix as f32, fy - iy as f32);
+        let ix1 = (ix + 1).min(bg.w as usize - 1);
+        let iy1 = (iy + 1).min(bg.h as usize - 1);
+        let lum = |xx: usize, yy: usize| {
+            let o = (yy * bg.w as usize + xx) * 4;
+            0.2126 * bg.rgba[o] as f32 + 0.7152 * bg.rgba[o + 1] as f32 + 0.0722 * bg.rgba[o + 2] as f32
+        };
+        let top = lum(ix, iy) * (1.0 - tx) + lum(ix1, iy) * tx;
+        let bot = lum(ix, iy1) * (1.0 - tx) + lum(ix1, iy1) * tx;
+        top * (1.0 - ty) + bot * ty
+    };
     let (lift, sat, target) = match layer {
         Layer::Tile => (0.10, 1.12, 118.0),
         Layer::Plate => (0.16, 1.10, 168.0),
@@ -498,8 +515,34 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                         *v *= 0.965;
                     }
                 }
-                for (v, g) in c.iter_mut().zip(veil) {
-                    *v += (g - *v) * veil_a;
+                if clear_dark {
+                    // Clear glass with LOCAL smoke: thin over dark content, thicker only where the
+                    // backdrop right behind is bright (e.g. a white browser strip above a dark app),
+                    // then a local cap on brightness so white ink stays readable there.
+                    let hb = heavy_lum(sx, sy);
+                    let lb = ((hb - 70.0) / 165.0).clamp(0.0, 1.0);
+                    let (g, a0, ka, cap) = match layer {
+                        Layer::Control => (60.0 - 22.0 * lb, 0.30, 0.40, 140.0),
+                        Layer::ControlLight => (112.0 - 46.0 * lb, 0.20, 0.40, 140.0),
+                        Layer::CcPanel => (54.0 - 18.0 * lb, 0.16, 0.40, 160.0),
+                        _ => (118.0 - 50.0 * lb, 0.06, 0.42, 170.0),
+                    };
+                    let a = a0 + ka * lb;
+                    let gg = [g, g, g + 6.0];
+                    for (v, g) in c.iter_mut().zip(gg) {
+                        *v += (g - *v) * a;
+                    }
+                    let est = hb + (g - hb) * a;
+                    if est > cap {
+                        let f = cap / est;
+                        for v in &mut c {
+                            *v *= f;
+                        }
+                    }
+                } else {
+                    for (v, g) in c.iter_mut().zip(veil) {
+                        *v += (g - *v) * veil_a;
+                    }
                 }
                 // Outward normal of the nearest edge (corners/caps use the radial direction).
                 let (mut nx, mut ny) = if qx > 0.0 && qy > 0.0 {
@@ -546,7 +589,8 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     }
     // Adaptive dim: only as much as needed to keep white content legible on bright wallpaper.
     let mean = if lum_n > 0.0 { lum_sum / lum_n } else { 0.0 };
-    let dim = if mean > target { target / mean } else { 1.0 };
+    // Clear CC glass darkens locally above; a whole-piece dim would leave seams between pieces.
+    let dim = if clear_dark { 1.0 } else if mean > target { target / mean } else { 1.0 };
     let mut out = vec![0u8; (w * h * 4) as usize];
     for o in 0..(w * h) as usize {
         for c in 0..3 {
@@ -685,6 +729,18 @@ thread_local! {
     /// lightly blurred detail frost (clear glass), not only the bright-page ink layers. Other
     /// popups sharing the backdrop keep the heavy frost.
     static CC_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Backdrop brightness (0 dark .. 1 white) behind `rect` (DIPs of the surface being painted),
+/// from the heavy frost. 0 when there is no backdrop.
+pub fn local_brightness(rect: RectF) -> f32 {
+    CTX.with(|c| {
+        c.borrow().as_ref().map_or(0.0, |ctx| {
+            let (px, py) = ((rect.x * ctx.sx) as i32, (rect.y * ctx.sy) as i32);
+            let (pw, ph) = (((rect.w * ctx.sx) as i32).max(2), ((rect.h * ctx.sy) as i32).max(2));
+            backdrop_brightness(&ctx.bg, px, py, pw, ph)
+        })
+    })
 }
 
 pub fn set_cc_clear(on: bool) {

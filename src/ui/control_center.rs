@@ -964,9 +964,10 @@ fn draw_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, rgba: u32)
     if super::renderer::text_shadow_for(rgba) {
         // Clear glass shows the page behind: a soft dark halo (below + both sides) keeps white
         // glyphs readable without a heavy tint.
-        let a = ((rgba & 0xFF) * 0x48 / 0xFF).max(1);
+        let boost = super::renderer::halo_boost(rect);
+        let a = ((((rgba & 0xFF) * 0x48 / 0xFF) as f32 * boost).min(255.0) as u32).max(1);
         super::ccicons::draw_in(r, glyph, RectF { y: rect.y + 0.8, ..rect }, size, a)?;
-        let a = ((rgba & 0xFF) * 0x22 / 0xFF).max(1);
+        let a = ((((rgba & 0xFF) * 0x22 / 0xFF) as f32 * boost).min(255.0) as u32).max(1);
         super::ccicons::draw_in(r, glyph, RectF { x: rect.x - 0.6, ..rect }, size, a)?;
         super::ccicons::draw_in(r, glyph, RectF { x: rect.x + 0.6, ..rect }, size, a)?;
     }
@@ -1077,7 +1078,9 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     super::glass::update_control_ink(rect);
     super::renderer::set_text_shadow(white_ink());
     super::glass::set_cc_clear(true);
+    super::renderer::set_halo_sampler(Some(super::glass::local_brightness));
     let result = draw_panel(r, rect, state, media);
+    super::renderer::set_halo_sampler(None);
     super::glass::set_cc_clear(false);
     super::renderer::set_text_shadow(false);
     result
