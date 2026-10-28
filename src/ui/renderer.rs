@@ -30,7 +30,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, DWRITE_FACTORY_TYPE_SHARED, DWRITE_TRIMMING,
     DWRITE_TRIMMING_GRANULARITY_CHARACTER,
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_BOLD,
-    DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
     DWRITE_WORD_WRAPPING_NO_WRAP,
@@ -86,6 +86,8 @@ fn dwrite_factory() -> Result<IDWriteFactory> {
 pub enum TextStyle {
     /// Segoe UI Variable Text, regular.
     Ui,
+    /// Segoe UI Variable Text, semibold (600): popup labels and secondary text.
+    SemiBold,
     /// Segoe UI Variable Text, semibold-bold, like `b` in the old CSS.
     Bold,
     /// Segoe MDL2 Assets glyphs (Windows system icons).
@@ -104,6 +106,7 @@ fn text_format(size: f32, align: Align, style: TextStyle) -> Result<IDWriteTextF
         // SAFETY: family name and locale are static UTF-16 literals.
         let (family, weight) = match style {
             TextStyle::Ui => (w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_NORMAL),
+            TextStyle::SemiBold => (w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_SEMI_BOLD),
             TextStyle::Bold => (w!("Segoe UI Variable Text"), DWRITE_FONT_WEIGHT_BOLD),
             TextStyle::Icon => (w!("Segoe MDL2 Assets"), DWRITE_FONT_WEIGHT_NORMAL),
         };
@@ -484,6 +487,7 @@ impl Renderer {
         align: Align,
         style: TextStyle,
     ) -> Result<()> {
+        let (style, rgba) = popup_text(style, rgba);
         let format = text_format(size, align, style)?;
         let (rt, brush) = self.parts()?;
         Self::set_color(brush, rgba);
@@ -505,6 +509,7 @@ impl Renderer {
 
     /// Width in DIPs of `text` laid out on one line with the given size and style.
     pub fn measure_text(&self, text: &str, size: f32, style: TextStyle) -> Result<f32> {
+        let (style, _) = popup_text(style, 0xFFFF_FFFF);
         let format = text_format(size, Align::Left, style)?;
         let wide: Vec<u16> = text.encode_utf16().collect();
         let dw = dwrite_factory()?;
@@ -1026,6 +1031,28 @@ thread_local! {
     /// Set while popup content is painted on the light (milky) glass: neutral white ink becomes
     /// near-black so every popup keeps its contrast without per-popup colour tables.
     static LIGHT_INK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    static POPUP_TEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enables the popup text weights (see `popup_text`) for subsequent text draws and measurements.
+/// Set only while popup panels paint their content, so the dock bar keeps its own type.
+pub fn set_popup_text(on: bool) {
+    POPUP_TEXT.with(|c| c.set(on));
+}
+
+/// Popup content reads on bright glass: regular text is set semibold (labels and secondary text
+/// alike; Segoe UI Variable has no medium instance, so 500 would fall back to regular), and
+/// translucent secondary text gains ~30% of its missing opacity. Bold and icon text pass through.
+fn popup_text(style: TextStyle, rgba: u32) -> (TextStyle, u32) {
+    if style != TextStyle::Ui || !POPUP_TEXT.with(std::cell::Cell::get) {
+        return (style, rgba);
+    }
+    let a = rgba & 0xFF;
+    let a = if a < 0xE0 { a + (0xFF - a) * 3 / 10 } else { a };
+    (TextStyle::SemiBold, (rgba & !0xFF) | a)
 }
 
 /// Enables the light-appearance ink remap (see `light_ink`) for subsequent solid-colour draws.

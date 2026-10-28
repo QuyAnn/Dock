@@ -113,38 +113,55 @@ pub fn output_id(n: usize) -> Option<String> {
 }
 
 const OUTPUT_ROW_H: f32 = 44.0;
+const OUTPUT_HEAD_H: f32 = 34.0;
+const OUTPUT_INSET: f32 = 10.0;
+
+/// The output picker's glass panel: one Control Center module sized to its rows and anchored to
+/// the bottom of the panel rect (just above the dock button, where the main modules end), so the
+/// sub-page opens in place instead of floating bare at the top of the popup window.
+fn outputs_card(rect: RectF) -> RectF {
+    let n = OUTPUTS.with(|o| o.borrow().as_ref().map_or(0, Vec::len)).max(1) as f32;
+    let h = (OUTPUT_INSET * 2.0 + OUTPUT_HEAD_H + 6.0 + n * OUTPUT_ROW_H + (n - 1.0) * 6.0).min(rect.h - 2.0 * PAD);
+    RectF { x: rect.x + PAD, y: rect.y + rect.h - PAD - h, w: rect.w - 2.0 * PAD, h }
+}
 
 fn outputs_back(rect: RectF) -> RectF {
-    RectF { x: rect.x + PAD, y: rect.y + PAD, w: rect.w - 2.0 * PAD, h: 30.0 }
+    let c = outputs_card(rect);
+    RectF { x: c.x + OUTPUT_INSET, y: c.y + OUTPUT_INSET, w: c.w - 2.0 * OUTPUT_INSET, h: OUTPUT_HEAD_H }
 }
 
 fn output_row(rect: RectF, i: usize) -> RectF {
-    RectF {
-        x: rect.x + PAD,
-        y: rect.y + PAD + 40.0 + i as f32 * (OUTPUT_ROW_H + GAP),
-        w: rect.w - 2.0 * PAD,
-        h: OUTPUT_ROW_H,
-    }
+    let back = outputs_back(rect);
+    RectF { x: back.x, y: back.y + back.h + 6.0 + i as f32 * (OUTPUT_ROW_H + 6.0), w: back.w, h: OUTPUT_ROW_H }
 }
 
 fn draw_outputs(r: &mut Renderer, rect: RectF, list: &[system::AudioOutput]) -> Result<()> {
+    // Same smoky glass as the main modules (blurred backdrop, bevel rim, shadow).
+    draw_module(r, outputs_card(rect), CARD_R)?;
     let back = outputs_back(rect);
-    draw_module(r, back, back.h / 2.0)?;
-    r.draw_text_styled("‹  Đầu ra âm thanh", RectF { x: back.x + 12.0, w: back.w - 24.0, ..back }, 12.0, text(), Align::Left, TextStyle::Bold)?;
+    let chev = RectF { x: back.x, y: back.y, w: 20.0, h: back.h };
+    draw_glyph(r, chev, Glyph::Back, 14.0, text())?;
+    r.draw_text_styled("Đầu ra âm thanh", RectF { x: back.x + 22.0, w: back.w - 22.0, ..back }, TITLE_PT, text(), Align::Left, TextStyle::Bold)?;
     if list.is_empty() {
-        return r.draw_text("Không tìm thấy thiết bị", output_row(rect, 0), 11.5, sub(), Align::Center);
+        return r.draw_text("Không tìm thấy thiết bị", output_row(rect, 0), SUB_PT, sub(), Align::Center);
     }
     for (i, d) in list.iter().enumerate() {
         let row = output_row(rect, i);
-        draw_module(r, row, 16.0)?;
-        let dot = RectF { x: row.x + 10.0, y: row.y + (row.h - 24.0) / 2.0, w: 24.0, h: 24.0 };
-        draw_glyph(r, dot, speaker(1.0, false), 16.0, if d.is_default { text() } else { sub() })?;
-        let label = RectF { x: row.x + 42.0, y: row.y, w: row.w - 42.0 - 34.0, h: row.h };
-        r.draw_text_styled(&d.name, label, 11.5, text(), Align::Left, if d.is_default { TextStyle::Bold } else { TextStyle::Ui })?;
+        // Rows: a faint lit well (the selected one brighter), like a CC list row.
+        r.fill_rounded_rect(row, 14.0, if d.is_default { 0xFFFF_FF2E } else { 0xFFFF_FF14 })?;
+        let dot = RectF { x: row.x + 8.0, y: row.y + (row.h - 28.0) / 2.0, w: 28.0, h: 28.0 };
         if d.is_default {
-            let c = RectF { x: row.x + row.w - 30.0, y: row.y + (row.h - 18.0) / 2.0, w: 18.0, h: 18.0 };
-            r.fill_rounded_rect(c, 9.0, ACCENT)?;
-            r.draw_text_styled("✓", c, 11.0, WHITE, Align::Center, TextStyle::Bold)?;
+            r.fill_rounded_rect(dot, 14.0, ACCENT)?;
+            draw_glyph(r, dot, speaker(1.0, false), 16.0, WHITE)?;
+        } else {
+            r.fill_rounded_rect(dot, 14.0, 0xFFFF_FF26)?;
+            draw_glyph(r, dot, speaker(1.0, false), 16.0, text())?;
+        }
+        let label = RectF { x: row.x + 44.0, y: row.y, w: row.w - 44.0 - 32.0, h: row.h };
+        r.draw_text_styled(&d.name, label, 12.5, text(), Align::Left, if d.is_default { TextStyle::Bold } else { TextStyle::Ui })?;
+        if d.is_default {
+            let c = RectF { x: row.x + row.w - 28.0, y: row.y + (row.h - 18.0) / 2.0, w: 18.0, h: 18.0 };
+            r.draw_text_styled("✓", c, 13.0, ACCENT, Align::Center, TextStyle::Bold)?;
         }
     }
     Ok(())
@@ -169,7 +186,12 @@ pub fn apply(action: ControlAction) -> Result<()> {
             system::set_bluetooth(!on)
         }
         ControlAction::ToggleDark => system::set_dark_mode(!system::dark_mode()),
-        ControlAction::OpenNetworkSettings => system::open_settings("ms-settings:network-wifi"),
+        // Wired link: the Ethernet page; otherwise the network status overview.
+        ControlAction::OpenNetworkSettings => system::open_settings(if system::ethernet_connected() {
+            "ms-settings:network-ethernet"
+        } else {
+            "ms-settings:network-status"
+        }),
         ControlAction::OpenSoundSettings => system::open_settings("ms-settings:sound"),
         ControlAction::OpenWifiList => system::open_settings("ms-availablenetworks:"),
         ControlAction::OpenBluetoothSettings => system::open_settings("ms-settings:bluetooth"),
@@ -629,7 +651,8 @@ pub fn slider_value(slider: Slider, x: f32, rect: RectF) -> f32 {
 pub fn hit_test(x: f32, y: f32, rect: RectF, state: &ControlState) -> Option<ControlAction> {
     if let Some(hit) = OUTPUTS.with(|o| {
         o.borrow().as_ref().map(|l| {
-            if contains(outputs_back(rect), x, y) {
+            // The header, or anywhere outside the sub-page card, goes back to the panel.
+            if contains(outputs_back(rect), x, y) || !contains(outputs_card(rect), x, y) {
                 return Some(ControlAction::CloseOutputs);
             }
             (0..l.len()).find(|&i| contains(output_row(rect, i), x, y)).map(ControlAction::SetOutput)

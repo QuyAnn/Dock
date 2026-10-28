@@ -51,6 +51,8 @@ pub enum Icon {
     Play,
     Next,
     Chevron,
+    /// Left-pointing chevron (sub-page back button).
+    Back,
     Music,
 }
 
@@ -137,6 +139,7 @@ fn layers(icon: Icon) -> (Vec<(Part, f32)>, f32, f32) {
                 Icon::Play => PLAY,
                 Icon::Next => NEXT,
                 Icon::Chevron => CHEVRON,
+                Icon::Back => BACK,
                 _ => MUSIC,
             };
             (vec![(p, 1.0)], 0.0, 0.0)
@@ -202,4 +205,5 @@ pub const NEXT: &[(&str, K)] = &[("M3.6 6L11.6 12L3.6 18ZM12.6 6L20.6 12L12.6 18
 pub const PLAY: &[(&str, K)] = &[("M7.4 4.8L19 12L7.4 19.2Z", K::Round)];
 pub const PAUSE: &[(&str, K)] = &[("M7.2 4.6H8.6A1.4 1.4 0 0 1 10 6V18A1.4 1.4 0 0 1 8.6 19.4H7.2A1.4 1.4 0 0 1 5.8 18V6A1.4 1.4 0 0 1 7.2 4.6ZM15.4 4.6H16.8A1.4 1.4 0 0 1 18.2 6V18A1.4 1.4 0 0 1 16.8 19.4H15.4A1.4 1.4 0 0 1 14 18V6A1.4 1.4 0 0 1 15.4 4.6Z", K::Fill)];
 pub const CHEVRON: &[(&str, K)] = &[("M9 5.4L15.6 12L9 18.6", K::Stroke)];
+pub const BACK: &[(&str, K)] = &[("M15 5.4L8.4 12L15 18.6", K::Stroke)];
 pub const MUSIC: &[(&str, K)] = &[("M9.2 17.6V6.4L19.4 4.2V15.6", K::Stroke), ("M3.9 17.6A2.7 2.7 0 1 0 9.3 17.6A2.7 2.7 0 1 0 3.9 17.6ZM14.1 15.6A2.7 2.7 0 1 0 19.5 15.6A2.7 2.7 0 1 0 14.1 15.6Z", K::Fill)];

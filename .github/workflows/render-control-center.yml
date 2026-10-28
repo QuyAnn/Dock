@@ -19,6 +19,8 @@ on:
       - "src/ui/thumbnails.rs"
       - "render-inputs/**"
       - "src/main.rs"
+      - "src/ui/sficons.rs"
+      - "src/win/**"
       - ".github/workflows/render-control-center.yml"
   workflow_dispatch:
 
@@ -56,6 +58,22 @@ jobs:
           }
           New-Gradient "render-inputs/ocean.jpg" "#1598A5" "#063D57"
           New-Gradient "render-inputs/light.jpg" "#E9F6FF" "#8BC7E8"
+          # A bright light-theme editor: white page, grey gutter, dark code lines (worst case for
+          # dark glass legibility).
+          $bitmap = [System.Drawing.Bitmap]::new(1280, 720)
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.Clear([System.Drawing.Color]::White)
+          $graphics.FillRectangle([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(243, 243, 243)), 0, 0, 220, 720)
+          $font = [System.Drawing.Font]::new("Consolas", 11)
+          $ink = @([System.Drawing.Color]::FromArgb(36, 41, 47), [System.Drawing.Color]::FromArgb(0, 92, 197), [System.Drawing.Color]::FromArgb(215, 58, 73), [System.Drawing.Color]::FromArgb(111, 66, 193))
+          for ($i = 0; $i -lt 38; $i++) {
+            $brush = [System.Drawing.SolidBrush]::new($ink[$i % 4])
+            $graphics.DrawString(("    let value_{0} = compute(item, {1}) + offset; // note" -f $i, ($i * 7)), $font, $brush, 240, 8 + $i * 18.5)
+            $brush.Dispose()
+          }
+          $graphics.Dispose()
+          $bitmap.Save("render-inputs/white_ide.jpg", [System.Drawing.Imaging.ImageFormat]::Jpeg)
+          $bitmap.Dispose()
           New-Gradient "render-inputs/dark.jpg" "#193250" "#050A13"
       - name: Render production Control Center
         shell: pwsh
@@ -107,6 +125,20 @@ jobs:
             $r = Invoke-Render "render-output\control_center_$name.png" "render-inputs\$name.jpg" $renders[$name]
             if ($r) { $failures += $r }
           }
+          foreach ($mode in @("dark", "light")) {
+            $r = Invoke-Render "render-output\control_center_white_ide_$mode.png" "render-inputs\white_ide.jpg" $mode
+            if ($r) { $failures += $r }
+            foreach ($p in @("ai", "calendar", "weather")) {
+              $r = Invoke-Render "render-output\popup_${p}_white_ide_$mode.png" "render-inputs\white_ide.jpg" $mode $p
+              if ($r) { $failures += $r }
+            }
+          }
+          $env:SMARTDOCK_CC_OUTPUTS = "1"
+          foreach ($name in @("dark_ui", "user_desktop")) {
+            $r = Invoke-Render "render-output\cc_outputs_$name.png" "render-inputs\$name.jpg" "dark"
+            if ($r) { $failures += $r }
+          }
+          Remove-Item Env:SMARTDOCK_CC_OUTPUTS
           $popups = @("calendar", "weather", "cpu", "ram", "media", "settings", "todo", "ai", "git", "currency", "notes",
             "stopwatch", "worldclock", "screentime", "forecast", "appmenu", "dockmenu", "gallery")
           foreach ($p in $popups) {

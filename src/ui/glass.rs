@@ -245,6 +245,28 @@ pub fn release_backdrop(bg: &Arc<LiquidBitmap>) {
     });
 }
 
+/// Mean luminance of the (blurred) backdrop under a piece, mapped to 0..1 between a typical dark
+/// window (~70) and a white page (~235). Sampled on a coarse grid; the backdrop is already blurred.
+fn backdrop_brightness(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32) -> f32 {
+    if bg.w == 0 || bg.h == 0 {
+        return 0.0;
+    }
+    let step = ((pw.max(ph) / 24).max(2)) as usize;
+    let (mut sum, mut n) = (0f32, 0f32);
+    for y in (py.max(0) as usize..((py + ph).max(0) as usize).min(bg.h as usize)).step_by(step) {
+        for x in (px.max(0) as usize..((px + pw).max(0) as usize).min(bg.w as usize)).step_by(step) {
+            let o = (y * bg.w as usize + x) * 4;
+            let c = &bg.rgba[o..o + 3];
+            sum += 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
+            n += 1.0;
+        }
+    }
+    if n == 0.0 {
+        return 0.0;
+    }
+    ((sum / n - 70.0) / 165.0).clamp(0.0, 1.0)
+}
+
 /// CPU render of one glass piece (straight RGBA, `pw` x `ph`).
 #[allow(clippy::too_many_arguments)]
 fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f32, dpr: f32, layer: Layer) -> Piece {
@@ -281,12 +303,27 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     let edge_glow = if control { 0.0 } else { 0.0 };
     // Control material (macOS 27): smoky dark (or milky light) veil over the heavily blurred
     // backdrop, then a thick-glass bevel lit from the top-left.
+    let dark_ctl = layer == Layer::Control;
+    // Backdrop brightness under this piece (0 = dark window, 1 = white document). Dark glass must
+    // stay smoky over bright content: the veil thickens and darkens and the speculars calm down,
+    // so a module over a white IDE reads like the same module over a dark window.
+    let bright = if control { backdrop_brightness(bg, px, py, pw, ph) } else { 0.0 };
     let (veil, veil_a) = match layer {
-        Layer::Control => ([72.0f32, 72.0, 78.0], 0.63f32),
-        Layer::ControlLight => ([246.0f32, 246.0, 250.0], 0.30f32),
+        Layer::Control => {
+            let g = 72.0 - 24.0 * bright;
+            ([g, g, g + 6.0], 0.63 + 0.22 * bright)
+        }
+        // Light glass stays milky; over very bright content it adds a touch of grey body so the
+        // module edge and the dark ink still separate from a white page.
+        Layer::ControlLight => {
+            let g = 246.0 - 16.0 * bright;
+            ([g, g, g + 4.0], 0.30 + 0.12 * bright)
+        }
         _ => ([0.0f32; 3], 0.0f32),
     };
-    let dark_ctl = layer == Layer::Control;
+    let spec_k = if dark_ctl { 1.0 - 0.45 * bright } else { 1.0 };
+    // Dark glass never ends up lighter than this mean, whatever is behind it.
+    let target = if dark_ctl { target - 62.0 * bright } else { target };
     let mut rgb = vec![0f32; (w * h * 3) as usize];
     let mut alpha = vec![0u8; (w * h) as usize];
     let (mut lum_sum, mut lum_n) = (0f32, 0f32);
@@ -362,7 +399,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 let side = (1.0 - top - bottom).clamp(0.0, 1.0) * (1.0 - d / 6.0).max(0.0) * 0.20;
                 // Dark outer contour right at the silhouette, under the specular.
                 let contour = (1.0 - d / 0.9).max(0.0) * (1.0 - top * 0.8) * if dark_ctl { 0.45 } else { 0.18 };
-                let add = (rim + glow).min(0.85);
+                let add = ((rim + glow) * spec_k).min(0.85);
                 let mul = 1.0 - side - contour;
                 for v in &mut c {
                     *v = (*v * mul) + (255.0 - *v * mul) * add;
@@ -555,12 +592,13 @@ fn draw_control_rims(r: &mut Renderer, rect: RectF, radius: f32, k: f32) -> Resu
     r.stroke_rounded_rect_linear(edge, (radius - 0.5).max(0.0), (x + w, y + h), 0xFFFF_FF00 | a(90.0), (x + w - reach * 0.3, y + h * 0.3), 0xFFFF_FF00, 0.75)
 }
 
-/// Very soft, low-opacity drop shadow (wide and faint, slightly below the module).
+/// Tight contact shadow hugging the module (no wide halo: a soft grey spread reads as a dirty
+/// smudge when the module floats over a white window).
 fn draw_control_shadow(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
-    for i in 1..=6 {
-        let g = i as f32 * 1.4;
-        let sh = RectF { x: rect.x - g * 0.5, y: rect.y + 1.5 + g * 0.35, w: rect.w + g, h: rect.h + g * 0.5 };
-        r.fill_rounded_rect(sh, radius + g * 0.5, 0x0000_0006)?;
+    for i in 1..=2 {
+        let g = i as f32 * 0.6;
+        let sh = RectF { x: rect.x - g * 0.5, y: rect.y + 0.6 + g * 0.4, w: rect.w + g, h: rect.h + g * 0.4 };
+        r.fill_rounded_rect(sh, radius + g * 0.5, 0x0000_0007)?;
     }
     Ok(())
 }

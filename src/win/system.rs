@@ -78,6 +78,9 @@ pub fn set_dark_mode(dark: bool) -> Result<()> {
 }
 
 pub fn open_settings(page: &str) -> Result<()> {
+    // Control actions run on short-lived worker threads; ShellExecute needs COM there to
+    // delegate `ms-settings:` URIs to the protocol handler reliably.
+    let _com = super::com::Apartment::sta();
     let uri = windows::core::HSTRING::from(page);
     let result = unsafe {
         ShellExecuteW(None, w!("open"), &uri, None, None, SW_SHOWNORMAL)

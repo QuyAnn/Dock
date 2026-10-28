@@ -79,6 +79,14 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
         h: control_center::HEIGHT - 1.0,
     };
 
+    // SMARTDOCK_CC_OUTPUTS=1 renders the sound-output sub-page instead of the main modules.
+    if std::env::var_os("SMARTDOCK_CC_OUTPUTS").is_some() {
+        control_center::show_outputs(vec![
+            crate::win::system::AudioOutput { id: "a".into(), name: "Speakers (Realtek(R) Audio)".into(), is_default: true },
+            crate::win::system::AudioOutput { id: "b".into(), name: "Headphones (AirPods Pro)".into(), is_default: false },
+            crate::win::system::AudioOutput { id: "c".into(), name: "LG HDR 4K (NVIDIA High Definition Audio)".into(), is_default: false },
+        ]);
+    }
     trace("starting Direct2D/WIC render");
     let result = Renderer::render_png(out_path, px_w, px_h, 96 * SCALE, |renderer| {
         renderer.draw_bitmap(
@@ -265,6 +273,7 @@ pub fn render_popup(
         super::glass::set_backdrop(Some(frost.clone()), w, h);
         let surface = super::glass::draw_popup_surface(r, panel, radius);
         super::renderer::set_light_ink(!dark);
+        super::renderer::set_popup_text(true);
         let painted = surface.and_then(|_| match kind {
             Some(kind) => pc::draw_popup(r, kind, rect, &data),
             None => match name {
@@ -274,6 +283,7 @@ pub fn render_popup(
                 id => super::more_widgets::paint_popup(r, id, rect, &data, &settings),
             },
         });
+        super::renderer::set_popup_text(false);
         super::renderer::set_light_ink(false);
         super::glass::set_backdrop(None, w, h);
         painted

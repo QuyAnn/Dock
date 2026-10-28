@@ -537,9 +537,12 @@ fn paint() {
                     super::glass::draw_popup_surface(&mut pw.renderer, rect, radius)?;
                 }
                 super::renderer::set_light_ink(!pw.floating_modules && !super::glass::control_dark());
+                // Heavier popup type (the Control Center sets its own weights).
+                super::renderer::set_popup_text(!pw.floating_modules);
                 if let Some(f) = PAINTER.with(Cell::get) {
                     f(&mut pw.renderer, rect);
                 }
+                super::renderer::set_popup_text(false);
                 super::renderer::set_light_ink(false);
                 super::glass::set_backdrop(None, w, h);
                 pw.renderer.end()
