@@ -33,10 +33,17 @@ const DOT: f32 = 2.5;
 const DOT_GAP: f32 = 0.5;
 const DOT_RGBA: u32 = 0xFFFF_FFD9; // small white running dot
 /// Active-app indicator: a short system-blue pill under the icon of the app in front.
-const ACTIVE_LEN: f32 = 12.0;
-const ACTIVE_THICK: f32 = 3.0;
+const ACTIVE_LEN: f32 = 17.0;
+const ACTIVE_THICK: f32 = 4.0;
 /// Gap between the icon's screen-edge side and the pill.
-const ACTIVE_GAP: f32 = 0.75;
+/// (The icon sits 11 DIP from the screen edge on every edge: 3.5 + 4 + 1 outline leaves 2.5.)
+const ACTIVE_GAP: f32 = 3.5;
+/// Light outline around the pill (separates it from blue backdrops / blue tiles).
+const ACTIVE_OUTLINE: f32 = 1.0;
+const ACTIVE_OUTLINE_RGBA: u32 = 0xFFFF_FFE6;
+/// Soft dark shadow ring outside the outline (separates it from white backdrops).
+const ACTIVE_SHADOW: f32 = 1.0;
+const ACTIVE_SHADOW_RGBA: u32 = 0x0000_0040;
 const ACTIVE_RGBA: u32 = 0x0A84_FFFF;
 /// Grow-in time of the pill when the active app changes.
 const ACTIVE_ANIM_SECS: f32 = 0.18;
@@ -101,6 +108,40 @@ fn active_bar(edge: crate::win::edge::AbEdge, s: RectF, len: f32) -> RectF {
             let cy = s.y + SLOT / 2.0;
             RectF { x: s.x + ICON_TOP + ICON + ACTIVE_GAP, y: cy - len / 2.0, w: ACTIVE_THICK, h: len }
         }
+    }
+}
+
+/// The pill: soft dark shadow ring, light outline, then solid system blue, all fully rounded.
+fn draw_active_pill(r: &mut Renderer, bar: RectF) -> Result<()> {
+    let grow = |rc: RectF, d: f32| RectF { x: rc.x - d, y: rc.y - d, w: rc.w + 2.0 * d, h: rc.h + 2.0 * d };
+    let radius = |rc: RectF| rc.w.min(rc.h) / 2.0;
+    let shadow = grow(bar, ACTIVE_OUTLINE + ACTIVE_SHADOW);
+    r.fill_rounded_rect(shadow, radius(shadow), ACTIVE_SHADOW_RGBA)?;
+    let soft = grow(bar, ACTIVE_OUTLINE + ACTIVE_SHADOW * 0.5);
+    r.fill_rounded_rect(soft, radius(soft), ACTIVE_SHADOW_RGBA)?;
+    let outline = grow(bar, ACTIVE_OUTLINE);
+    r.fill_rounded_rect(outline, radius(outline), ACTIVE_OUTLINE_RGBA)?;
+    r.fill_rounded_rect(bar, radius(bar), ACTIVE_RGBA)
+}
+
+thread_local! {
+    /// Last logged (dock state, foreground root, slot) per dock, so the log only shows changes.
+    static ACTIVE_LOGGED: std::cell::RefCell<HashMap<usize, (isize, usize)>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Logs when a dock's active slot changes (verifies the foreground -> tile mapping on the PC).
+fn log_active(state: &AppsState, i: usize, w: &WindowEntry) {
+    let key = state as *const AppsState as usize;
+    let root = FOREGROUND.with(|f| f.borrow().0);
+    let changed = ACTIVE_LOGGED.with(|m| m.borrow_mut().insert(key, (root, i)) != Some((root, i)));
+    if changed {
+        crate::log(&format!(
+            "active app: fg=0x{root:X} -> slot {i}/{} hwnd=0x{:X} exe={} edge={}",
+            state.windows.len(),
+            w.hwnd,
+            w.exe,
+            crate::win::edge::current().name()
+        ));
     }
 }
 
@@ -259,7 +300,8 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
             // The app in front: a short blue pill instead of the white dot (eased grow-in).
             let k = 1.0 - (1.0 - grow).powi(3);
             let bar = active_bar(edge, s, DOT + (ACTIVE_LEN - DOT) * k);
-            r.fill_rounded_rect(bar, ACTIVE_THICK / 2.0, ACTIVE_RGBA)?;
+            draw_active_pill(r, bar)?;
+            log_active(state, i, w);
             continue;
         }
         // Small white running dot between the icon and the screen edge.
@@ -781,28 +823,37 @@ mod tests {
 
     #[test]
     fn dock_layout_active_pill_sits_between_icon_and_screen_edge() {
+        use crate::ui::dock::{CENTER_RISE, DOCK_H};
         use crate::win::edge::AbEdge;
-        // Bottom: centred under the icon, a hair below it, inside the cluster band.
-        let s = RectF { x: 100.0, y: 3.0, w: SLOT, h: CLUSTER_H };
+        // Slots as the dock lays them out: the cluster band sits CENTER_RISE away from the
+        // screen edge inside the DOCK_H strip (strip-local coordinates, screen edge at 0 / DOCK_H).
+        let near = (DOCK_H - CLUSTER_H) / 2.0 - CENTER_RISE; // band offset on the far side
+        let far = (DOCK_H - CLUSTER_H) / 2.0 + CENTER_RISE; // band offset on the screen side
+        let halo = ACTIVE_OUTLINE + ACTIVE_SHADOW;
+        // Bottom: screen edge at DOCK_H, below the icon.
+        let s = RectF { x: 100.0, y: near, w: SLOT, h: CLUSTER_H };
         let (ico, _) = icon_geometry(AbEdge::Bottom, s, None);
         let bar = active_bar(AbEdge::Bottom, s, ACTIVE_LEN);
         assert_eq!((bar.w, bar.h), (ACTIVE_LEN, ACTIVE_THICK));
         assert!((bar.x + bar.w / 2.0 - (ico.x + ico.w / 2.0)).abs() < 1e-4);
-        assert!(bar.y >= ico.y + ico.h && bar.y + bar.h <= s.y + s.h);
-        // Top: above the icon.
+        assert!(bar.y - (ico.y + ico.h) >= 3.0, "separated from the icon");
+        assert!(bar.y + bar.h + halo <= DOCK_H - 1.0, "inside the strip: {bar:?}");
+        // Top: screen edge at 0, above the icon, not clipped by the screen edge.
+        let s = RectF { x: 100.0, y: far, w: SLOT, h: CLUSTER_H };
         let (ico, _) = icon_geometry(AbEdge::Top, s, None);
         let bar = active_bar(AbEdge::Top, s, ACTIVE_LEN);
-        assert!(bar.y + bar.h <= ico.y && bar.y >= s.y);
-        // Sides: vertical pill on the outer (screen) side, centred on the icon.
-        let v = RectF { x: 7.0, y: 300.0, w: CLUSTER_H, h: SLOT };
+        assert!(ico.y - (bar.y + bar.h) >= 3.0 && bar.y - halo >= 1.0, "top pill clipped: {bar:?}");
+        // Left: screen edge at x 0; right: screen edge at x DOCK_H. Vertical pill, centred.
+        let v = RectF { x: far, y: 300.0, w: CLUSTER_H, h: SLOT };
         let (ico, _) = icon_geometry(AbEdge::Left, v, None);
         let bar = active_bar(AbEdge::Left, v, ACTIVE_LEN);
         assert_eq!((bar.w, bar.h), (ACTIVE_THICK, ACTIVE_LEN));
-        assert!(bar.x + bar.w <= ico.x && bar.x >= v.x);
+        assert!(ico.x - (bar.x + bar.w) >= 3.0 && bar.x - halo >= 1.0);
         assert!((bar.y + bar.h / 2.0 - (ico.y + ico.h / 2.0)).abs() < 1e-4);
+        let v = RectF { x: near, ..v };
         let (ico, _) = icon_geometry(AbEdge::Right, v, None);
         let bar = active_bar(AbEdge::Right, v, ACTIVE_LEN);
-        assert!(bar.x >= ico.x + ico.w && bar.x + bar.w <= v.x + v.w);
+        assert!(bar.x - (ico.x + ico.w) >= 3.0 && bar.x + bar.w + halo <= DOCK_H - 1.0);
     }
 
     #[test]

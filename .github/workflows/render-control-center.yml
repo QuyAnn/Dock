@@ -80,6 +80,8 @@ jobs:
           $bitmap.Save("render-inputs/white_ide.jpg", [System.Drawing.Imaging.ImageFormat]::Jpeg)
           $bitmap.Dispose()
           New-Gradient "render-inputs/dark.jpg" "#193250" "#050A13"
+          # Saturated Windows-blue desktop (a user's real backdrop behind a top dock).
+          New-Gradient "render-inputs/blue_desk.jpg" "#3C88F2" "#1E5CC6"
           # Mixed backdrops: dark app UI with a white browser/tab strip on top (~20%), and a variant
           # with a white band across the middle. Drawn at 2x.
           function New-Mixed([string]$Path, [int]$BandTop, [int]$BandH) {
@@ -353,8 +355,8 @@ jobs:
           # Active-app pill (SMARTDOCK_DOCK_ACTIVE = foreground fake app) on bottom and right docks.
           $env:SMARTDOCK_DOCK_ACTIVE = "1"
           $env:SMARTDOCK_DOCK_POPUP = "weather"
-          foreach ($set in @(@("dark_ide", "light"), @("wp_city", "dark"))) {
-            foreach ($edge in @("bottom", "right")) {
+          foreach ($set in @(@("blue_desk", "light"), @("wp_white", "light"), @("dark_ide", "dark"), @("wp_city", "dark"))) {
+            foreach ($edge in @("bottom", "top", "right")) {
               $env:SMARTDOCK_DOCK_EDGE = $edge
               $outPath = [System.IO.Path]::GetFullPath("render-output\dock_active_${edge}_$($set[0]).png")
               $wallpaperPath = (Resolve-Path "render-inputs\$($set[0]).jpg").Path
@@ -398,7 +400,7 @@ jobs:
           if (@(Get-ChildItem "render-output\dock_edge_*.png").Count -lt 8) { throw "Missing dock edge renders" }
           $expected += Get-ChildItem "render-output\dock_edge_*.png" | ForEach-Object { $_.FullName }
           if (@(Get-ChildItem "render-output\popup_live_*.png").Count -lt 16) { throw "Missing live popup renders" }
-          if (@(Get-ChildItem "render-output\dock_active_*.png").Count -lt 4) { throw "Missing dock active renders" }
+          if (@(Get-ChildItem "render-output\dock_active_*.png").Count -lt 12) { throw "Missing dock active renders" }
           $expected += Get-ChildItem "render-output\dock_active_*.png" | ForEach-Object { $_.FullName }
           if (@(Get-ChildItem "render-output\cc_edit*.png").Count -lt 8 -or @(Get-ChildItem "render-output\cc_custom*.png").Count -lt 8) { throw "Missing Edit Controls renders" }
           foreach ($path in $expected) {
