@@ -923,6 +923,7 @@ fn run() -> windows::core::Result<()> {
         }
     });
     appbar::ensure_secondary_trays_visible();
+    release_stale_taskbar_areas();
 
     // The tray listener starts only after every AppBar is registered with Explorer; the
     // work-area guard (TIMER_GUARD) turns it off again if the reservation does not hold.
@@ -3308,6 +3309,27 @@ fn reattach_to_explorer(primary: HWND) {
     log(&format!("explorer: re-attached (AppBars re-registered, tray listener {})", if tray_enabled { "restarted" } else { "off" }));
 }
 
+thread_local! {
+    static LAST_STALE_TASKBAR: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// `appbar::release_stale_taskbar_area` for the primary dock and every secondary dock.
+fn release_stale_taskbar_areas() {
+    let docks: Vec<(HWND, bool, u32)> = APP.with(|a| {
+        a.try_borrow()
+            .ok()
+            .and_then(|b| {
+                b.as_ref().map(|app| {
+                    std::iter::once((app.hwnd, true, app.dpi)).chain(app.secondaries.iter().map(|s| (s.hwnd, false, s.dpi))).collect()
+                })
+            })
+            .unwrap_or_default()
+    });
+    for (hwnd, primary, dpi_value) in docks {
+        appbar::release_stale_taskbar_area(hwnd, primary, dpi::dip_to_px(DOCK_HEIGHT, dpi_value));
+    }
+}
+
 /// Keeps maximized windows above every dock. A missing reservation is first repaired the
 /// normal way (re-register the AppBars); only if that does not hold is the work area set
 /// directly, at most every 5 s so we never fight Explorer in a tight loop (each set makes
@@ -3324,6 +3346,12 @@ fn guard_work_area(primary: HWND) {
     if released || settling {
         WORK_AREA_MISSES.with(|m| m.borrow_mut().clear());
         return;
+    }
+    // A hidden taskbar on another edge than the dock keeps its reservation: give it back
+    // (cheap check; writes only when the stale inset is there, at most every 10 s).
+    if LAST_STALE_TASKBAR.with(|c| c.get()).is_none_or(|t| t.elapsed().as_secs() >= 10) {
+        LAST_STALE_TASKBAR.with(|c| c.set(Some(std::time::Instant::now())));
+        release_stale_taskbar_areas();
     }
     let docks: Vec<HWND> = APP.with(|a| {
         a.try_borrow()
@@ -3517,6 +3545,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         }
                     });
                     appbar::enforce_taskbar_hidden();
+                release_stale_taskbar_areas();
                     guard_work_area(hwnd);
                 }
                 TIMER_VISUALIZER => repaint(),
@@ -3809,5 +3838,61 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod dock_edge_window_tests {
+    use super::*;
+
+    const PRIMARY: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+    const SECONDARY: RECT = RECT { left: -1920, top: 0, right: 0, bottom: 1080 };
+
+    /// The real window path: AppBar strip → (Explorer grant) → placed strip → window rect and
+    /// renderer size → layout length, as `run`/`attach_primary`/`build_secondary_docks` do it.
+    fn place(edge: AbEdge, mon: RECT, granted: Option<RECT>) -> ((i32, i32, i32, i32), f32) {
+        let dock_px = dpi::dip_to_px(DOCK_HEIGHT, 96);
+        let corner = dpi::dip_to_px(16.0, 96);
+        let (_, full) = appbar::edge_rect(mon, edge, dock_px);
+        let strip = appbar::placed_strip(edge, mon, dock_px, granted.unwrap_or(full));
+        (dock_window_rect(edge, strip, dock_px, corner), dock_length_dip(edge, strip, 96))
+    }
+
+    #[test]
+    fn dock_edge_window_geometry_on_both_monitors() {
+        let dock_px = dpi::dip_to_px(DOCK_HEIGHT, 96);
+        assert_eq!(dock_px, 52);
+        for mon in [PRIMARY, SECONDARY] {
+            // Bottom: exactly the old geometry (strip + 16-px corner extension below the monitor).
+            assert_eq!(place(AbEdge::Bottom, mon, None), ((mon.left, 1028, 1920, 52 + 16), 1920.0));
+            assert_eq!(place(AbEdge::Top, mon, None), ((mon.left, 0, 1920, 52), 1920.0));
+            assert_eq!(place(AbEdge::Left, mon, None), ((mon.left, 0, 52, 1080), 1080.0));
+            assert_eq!(place(AbEdge::Right, mon, None), ((mon.right - 52, 0, 52, 1080), 1080.0));
+        }
+        // What Explorer actually granted on the user's PC (hidden taskbar still reserving 48 px).
+        assert_eq!(place(AbEdge::Right, PRIMARY, Some(RECT { left: 1868, top: 0, right: 1872, bottom: 1080 })), ((1868, 0, 52, 1080), 1080.0));
+        assert_eq!(place(AbEdge::Left, PRIMARY, Some(RECT { left: 48, top: 0, right: 52, bottom: 1080 })), ((0, 0, 52, 1080), 1080.0));
+        assert_eq!(place(AbEdge::Bottom, PRIMARY, Some(RECT { left: 48, top: 1028, right: 1920, bottom: 1080 })), ((0, 1028, 1920, 68), 1920.0));
+        assert_eq!(place(AbEdge::Right, SECONDARY, Some(RECT { left: -52, top: 0, right: -48, bottom: 1080 })), ((-52, 0, 52, 1080), 1080.0));
+    }
+
+    #[test]
+    fn dock_edge_window_fits_the_layout() {
+        // The vertical layout must fit the window it is drawn into: every tile inside 52 x length.
+        let (l, c, r) = (
+            vec![Tile { id: "git", width: 120.0, height: 0.0 }],
+            vec![Tile { id: "start", width: 34.0, height: 42.0 }, Tile { id: "apps", width: ui::apps::cluster_width(8), height: 42.0 }],
+            vec![Tile { id: "cc", width: 78.0, height: 0.0 }, Tile { id: "clock", width: 64.0, height: 0.0 }],
+        );
+        for edge in [AbEdge::Left, AbEdge::Right, AbEdge::Top] {
+            for mon in [PRIMARY, SECONDARY] {
+                let ((_, _, w, h), length) = place(edge, mon, None);
+                let rects = dock::layout_edge(edge, &l, &c, &r, length);
+                for rc in rects.iter().filter(|rc| rc.w > 0.0) {
+                    assert!(rc.x >= 0.0 && rc.x + rc.w <= w as f32 + 0.01, "{edge:?} {rc:?} in {w}x{h}");
+                    assert!(rc.y >= 0.0 && rc.y + rc.h <= h as f32 + 0.01, "{edge:?} {rc:?} in {w}x{h}");
+                }
+            }
+        }
     }
 }

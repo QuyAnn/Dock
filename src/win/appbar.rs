@@ -132,7 +132,33 @@ pub fn register_appbar_on(hwnd: HWND, edge: AbEdge, height_px: i32, mon: RECT) -
         data.rc = rc;
         SHAppBarMessage(ABM_SETPOS, &mut data);
     }
-    Ok(data.rc)
+    Ok(placed_strip(edge, mon, height_px, data.rc))
+}
+
+/// The strip the dock window is placed on after ABM_SETPOS returned `granted`. Explorer trims
+/// `granted` around the hidden taskbar's stale reservation (Win11 26300: a right taskbar gives
+/// (1868,0)-(1872,1080), a 4-px window; a left one shifts a bottom dock to x=48). The taskbar
+/// is hidden while SmartDock runs, so the dock always takes its full strip on `mon`; the trim is
+/// only logged. When Explorer grants exactly the strip (the normal bottom case) nothing changes.
+pub fn placed_strip(edge: AbEdge, mon: RECT, thickness_px: i32, granted: RECT) -> RECT {
+    let (_, full) = edge_rect(mon, edge, thickness_px);
+    if granted != full {
+        crate::log(&format!(
+            "appbar: Explorer granted ({},{}..{},{}) for the {} strip; using the full strip ({},{}..{},{})",
+            granted.left, granted.top, granted.right, granted.bottom, edge_name(edge),
+            full.left, full.top, full.right, full.bottom
+        ));
+    }
+    full
+}
+
+fn edge_name(edge: AbEdge) -> &'static str {
+    match edge {
+        AbEdge::Top => "top",
+        AbEdge::Bottom => "bottom",
+        AbEdge::Left => "left",
+        AbEdge::Right => "right",
+    }
 }
 
 /// Re-applies the primary monitor edge after a topology/resolution change.
@@ -148,7 +174,7 @@ pub fn reposition_appbar_on(hwnd: HWND, edge: AbEdge, height_px: i32, mon: RECT)
         data.rc = rc;
         SHAppBarMessage(ABM_SETPOS, &mut data);
     }
-    Ok(data.rc)
+    Ok(placed_strip(edge, mon, height_px, data.rc))
 }
 
 /// Releases the reserved strip. Safe to call when not registered.
@@ -481,6 +507,70 @@ fn dock_work_area(dock: HWND) -> Option<(RECT, RECT, Option<RECT>)> {
     }
 }
 
+/// Work area without the hidden taskbar's leftover reservation: when Explorer's taskbar sits on
+/// `taskbar` (another edge than the dock's) and is hidden by us, its old inset (at most
+/// `max_inset` px) on that side is given back to the monitor. `None` when nothing changes.
+/// A bottom taskbar under a bottom dock never changes anything (the original behaviour).
+pub fn stale_taskbar_fix(dock_edge: AbEdge, taskbar: AbEdge, mon: RECT, work: RECT, max_inset: i32) -> Option<RECT> {
+    if taskbar == dock_edge {
+        return None;
+    }
+    let inset = |v: i32| v > 0 && v <= max_inset;
+    let mut want = work;
+    match taskbar {
+        AbEdge::Left if inset(work.left - mon.left) => want.left = mon.left,
+        AbEdge::Right if inset(mon.right - work.right) => want.right = mon.right,
+        AbEdge::Top if inset(work.top - mon.top) => want.top = mon.top,
+        AbEdge::Bottom if inset(mon.bottom - work.bottom) => want.bottom = mon.bottom,
+        _ => return None,
+    }
+    Some(want)
+}
+
+/// Whether Explorer's taskbar window is hidden by us on the primary (`primary`) or secondary
+/// monitors, so its reservation there is stale.
+pub fn taskbar_hidden_on(primary: bool) -> bool {
+    if primary {
+        APPLIED.load(Ordering::SeqCst) && HIDE_WINDOW.load(Ordering::SeqCst)
+    } else {
+        secondaries_should_hide()
+    }
+}
+
+/// Removes the hidden taskbar's stale work-area inset on `dock`'s monitor (taskbar on another
+/// edge than the dock), then makes sure the work area stops at the dock. Returns true when it
+/// changed the work area.
+pub fn release_stale_taskbar_area(dock: HWND, primary: bool, dock_px: i32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPIF_SENDCHANGE, SPI_SETWORKAREA};
+    if !taskbar_hidden_on(primary) || DOCK_RELEASED.load(Ordering::SeqCst) {
+        return false;
+    }
+    let dock_edge = crate::win::edge::current();
+    let taskbar = crate::win::edge::taskbar_edge();
+    let Some((m, work, _)) = dock_work_area(dock) else { return false };
+    let Some(mut want) = stale_taskbar_fix(dock_edge, taskbar, m, work, dock_px * 3) else { return false };
+    // Keep the dock's own side reserved in the same write.
+    if let Some(fixed) = dock_rect(dock).and_then(|wr| work_area_fix(dock_edge, m, want, wr)) {
+        want = fixed;
+    }
+    // SAFETY: want is a valid RECT that outlives the SPI call.
+    let ok = unsafe { SystemParametersInfoW(SPI_SETWORKAREA, 0, Some(&mut want as *mut RECT as *mut _), SPIF_SENDCHANGE) }.is_ok();
+    WORK_AREA_FORCED.store(true, Ordering::SeqCst);
+    crate::log(&format!(
+        "workarea: hidden {} taskbar still reserved ({},{}..{},{}) on monitor ({},{}..{},{}); set ({},{}..{},{}) ok={ok}",
+        edge_name(taskbar), work.left, work.top, work.right, work.bottom, m.left, m.top, m.right, m.bottom,
+        want.left, want.top, want.right, want.bottom
+    ));
+    true
+}
+
+fn dock_rect(dock: HWND) -> Option<RECT> {
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let mut wr = RECT::default();
+    // SAFETY: plain query on our own window.
+    unsafe { GetWindowRect(dock, &mut wr) }.ok().map(|_| wr)
+}
+
 /// Set once we wrote a work area ourselves (SPI_SETWORKAREA); undone on exit.
 static WORK_AREA_FORCED: AtomicBool = AtomicBool::new(false);
 static WORK_AREA_LOGS: AtomicU32 = AtomicU32::new(0);
@@ -535,6 +625,40 @@ mod edge_tests {
         let sec = RECT { left: -1280, top: 100, right: 0, bottom: 1124 };
         assert_eq!(edge_rect(sec, AbEdge::Right, 52).1, RECT { left: -52, top: 100, right: 0, bottom: 1124 });
         assert_eq!(edge_rect(sec, AbEdge::Left, 52).1, RECT { left: -1280, top: 100, right: -1228, bottom: 1124 });
+    }
+
+    #[test]
+    fn dock_edge_placed_strip_ignores_explorer_trims() {
+        let sec = RECT { left: -1920, top: 0, right: 0, bottom: 1080 };
+        // Real Win11 26300 grants with the taskbar hidden on another edge.
+        assert_eq!(placed_strip(AbEdge::Right, MON, 52, RECT { left: 1868, top: 0, right: 1872, bottom: 1080 }), RECT { left: 1868, top: 0, right: 1920, bottom: 1080 });
+        assert_eq!(placed_strip(AbEdge::Left, MON, 52, RECT { left: 48, top: 0, right: 52, bottom: 1080 }), RECT { left: 0, top: 0, right: 52, bottom: 1080 });
+        assert_eq!(placed_strip(AbEdge::Bottom, MON, 52, RECT { left: 48, top: 1028, right: 1920, bottom: 1080 }), RECT { left: 0, top: 1028, right: 1920, bottom: 1080 });
+        // Bottom granted exactly: unchanged.
+        let full = edge_rect(MON, AbEdge::Bottom, 52).1;
+        assert_eq!(placed_strip(AbEdge::Bottom, MON, 52, full), full);
+        for edge in [AbEdge::Top, AbEdge::Bottom, AbEdge::Left, AbEdge::Right] {
+            for mon in [MON, sec] {
+                let full = edge_rect(mon, edge, 52).1;
+                assert_eq!(placed_strip(edge, mon, 52, RECT { right: full.left + 4, ..full }), full);
+            }
+        }
+    }
+
+    #[test]
+    fn dock_edge_stale_taskbar_inset_is_released() {
+        // Taskbar moved to the left and hidden; bottom dock: give the 48 px back.
+        let work = RECT { left: 48, top: 0, right: 1920, bottom: 1028 };
+        assert_eq!(stale_taskbar_fix(AbEdge::Bottom, AbEdge::Left, MON, work, 156), Some(RECT { left: 0, ..work }));
+        // Right taskbar, left dock.
+        let work = RECT { left: 52, top: 0, right: 1872, bottom: 1080 };
+        assert_eq!(stale_taskbar_fix(AbEdge::Left, AbEdge::Right, MON, work, 156), Some(RECT { right: 1920, ..work }));
+        // Same edge (the original bottom/bottom setup): never touched.
+        assert_eq!(stale_taskbar_fix(AbEdge::Bottom, AbEdge::Bottom, MON, RECT { bottom: 1028, ..MON }, 156), None);
+        assert_eq!(stale_taskbar_fix(AbEdge::Right, AbEdge::Right, MON, RECT { right: 1868, ..MON }, 156), None);
+        // No inset, or an inset too large to be the taskbar (another app bar): left alone.
+        assert_eq!(stale_taskbar_fix(AbEdge::Bottom, AbEdge::Left, MON, RECT { bottom: 1028, ..MON }, 156), None);
+        assert_eq!(stale_taskbar_fix(AbEdge::Bottom, AbEdge::Left, MON, RECT { left: 400, bottom: 1028, ..MON }, 156), None);
     }
 
     #[test]
