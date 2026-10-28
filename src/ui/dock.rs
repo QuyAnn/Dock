@@ -296,7 +296,18 @@ fn layout_vertical(edge: AbEdge, left: &[Tile], center: &[Tile], right: &[Tile],
 
     let center_cells: Vec<_> = center.iter().map(center_cell).collect();
     let center_len = zone_len(&center_cells);
-    let center_y = ((length - center_len) / 2.0).max(ROW_PAD);
+    // Room the Control Center, tray chevron and clock need at the bottom. When the centred
+    // cluster would crowd them out, the cluster slides up (left widgets give way first).
+    let essential = |t: &Tile| matches!(t.id, "cc" | "chevron" | "clock");
+    let essentials: Vec<f32> = right.iter().filter(|t| essential(t)).map(|t| side_cell(t).1).collect();
+    let essential_len = zone_len(&essentials.iter().map(|&l| (0.0, l)).collect::<Vec<_>>());
+    let mut center_y = ((length - center_len) / 2.0).max(ROW_PAD);
+    if !center.is_empty() && essential_len > 0.0 {
+        let max_end = length - ROW_PAD - essential_len - CENTER_GAP;
+        if center_y + center_len > max_end {
+            center_y = (max_end - center_len).max(ROW_PAD);
+        }
+    }
     let center_end = center_y + center_len;
     let (top_limit, bottom_limit) = if center.is_empty() {
         (length / 2.0 - CENTER_GAP / 2.0, length / 2.0 + CENTER_GAP / 2.0)
@@ -323,7 +334,6 @@ fn layout_vertical(edge: AbEdge, left: &[Tile], center: &[Tile], right: &[Tile],
     // Right zone: packed to the bottom. When it does not all fit, the Control Center, tray
     // chevron and clock keep their place first, then the tiles nearest the end.
     let budget = (length - ROW_PAD) - bottom_limit;
-    let essential = |t: &Tile| matches!(t.id, "cc" | "chevron" | "clock");
     let mut keep = vec![false; right.len()];
     let mut used = 0.0;
     let order = (0..right.len()).rev().filter(|&i| essential(&right[i])).chain((0..right.len()).rev().filter(|&i| !essential(&right[i])));
@@ -958,11 +968,16 @@ mod tests {
                 for pair in shown.windows(2) {
                     assert!(pair[1].y >= pair[0].y + pair[0].h - 0.01, "{edge:?} len={len} {pair:?}");
                 }
-                // Centre cluster centred along the dock when it fits.
+                // Centre cluster centred along the dock when it fits; on a short dock it may
+                // only slide up to make room for the Control Center and clock.
                 let first = rects[l.len()];
                 let last = rects[l.len() + c.len() - 1];
                 let mid = (first.y + last.y + last.h) / 2.0;
-                assert!((mid - len / 2.0).abs() < 0.01, "{edge:?} len={len} mid={mid}");
+                if len >= 864.0 {
+                    assert!((mid - len / 2.0).abs() < 0.01, "{edge:?} len={len} mid={mid}");
+                } else {
+                    assert!(mid <= len / 2.0 + 0.01 && first.y >= ROW_PAD - 0.01, "{edge:?} len={len} mid={mid}");
+                }
                 // Clock (last right tile) is kept at the bottom.
                 let clock = rects[rects.len() - 1];
                 assert!(clock.h > 0.0 && (clock.y + clock.h - (len - ROW_PAD)).abs() < 0.01);
