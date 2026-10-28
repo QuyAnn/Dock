@@ -601,8 +601,18 @@ pub(crate) fn paint_clear_glass(
     glass::update_control_ink(rect);
     glass::set_cc_clear(true);
     renderer::set_halo_sampler(Some(glass::local_brightness));
-    let res = glass::draw_control_panel(r, rect, radius);
     let ink = glass::control_ink_dark();
+    // Over a near-white page the clear panel would let the page's own text compete with the
+    // popup's (the Control Center has its module cards for that): a light white veil, as macOS
+    // does on bright pages. Darker backdrops keep the pure clear glass and its adaptive smoke.
+    let res = glass::draw_control_panel(r, rect, radius).and_then(|_| {
+        if ink {
+            let rr = radius.min(rect.w / 2.0).min(rect.h / 2.0);
+            r.fill_rounded_rect(rect, rr, 0xFFFF_FF5C)
+        } else {
+            Ok(())
+        }
+    });
     renderer::set_light_ink(ink);
     renderer::set_text_shadow(!ink);
     // Heavier popup type (the Control Center sets its own weights).
