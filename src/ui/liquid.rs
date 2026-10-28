@@ -33,8 +33,9 @@ pub struct LiquidBitmap {
     pub w: u32,
     pub h: u32,
     pub rgba: Vec<u8>,
-    /// Unblurred wallpaper crop of the same size, fully opaque. Painted as the bar itself so the
-    /// dock looks transparent between the tiles. Empty for popup backdrops.
+    /// Dock: unblurred wallpaper crop of the same size, fully opaque, painted as the bar itself so
+    /// the dock looks transparent between the tiles. Control Center over a bright page: a lightly
+    /// blurred frost for the pale glass (see `add_bright_detail`). Otherwise empty.
     pub plain: Vec<u8>,
 }
 
@@ -69,6 +70,34 @@ pub const FROST_LENS: LensOptions =
 /// behind each module stay readable, and almost no saturation boost (no colour cast).
 pub const CONTROL_LENS: LensOptions =
     LensOptions { radius: 8.0, band: 1.0, strength: 0.0, blur: 16.0, saturate: 1.25, aberration: 0.0 };
+
+/// Light frost kept beside `CONTROL_LENS` when the Control Center sits on a bright page: the pale
+/// glass samples it so page content (text lines, window edges) stays visible, softly blurred.
+pub const BRIGHT_DETAIL_LENS: LensOptions =
+    LensOptions { radius: 8.0, band: 1.0, strength: 0.0, blur: 2.5, saturate: 1.15, aberration: 0.0 };
+
+/// Adds the bright-page detail frost (`BRIGHT_DETAIL_LENS`) to a Control Center backdrop as its
+/// `plain` layer, but only when the frost is bright on average (otherwise nothing is kept).
+pub fn add_bright_detail(frost: &mut LiquidBitmap, grab: &ScreenGrab, rect: RectF, dpr: f32) {
+    let n = (frost.w * frost.h) as usize;
+    if n == 0 {
+        return;
+    }
+    let step = (n / 4096).max(1);
+    let (mut sum, mut cnt) = (0f32, 0f32);
+    for i in (0..n).step_by(step) {
+        let c = &frost.rgba[i * 4..i * 4 + 3];
+        sum += 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
+        cnt += 1.0;
+    }
+    // Kept for every backdrop brightness: the dark/normal Control Center glass is clear too
+    // (`glass::set_cc_clear`); the mean is still computed for callers' logging/tests.
+    let _mean = sum / cnt;
+    let detail = render_frost_with(grab, rect, dpr, &BRIGHT_DETAIL_LENS);
+    if detail.w == frost.w && detail.h == frost.h {
+        frost.plain = detail.rgba;
+    }
+}
 
 /// Frosted backdrop from the wallpaper alone (used until a live screen grab is possible).
 pub fn render_popup(wallpaper: &WallpaperPixels, rect: RectF, screen: (i32, i32), dpr: f32) -> LiquidBitmap {
@@ -125,11 +154,12 @@ fn render_with(
     let margin = ((o.strength + o.blur * 3.0 + 4.0) * dpr).ceil() as i32;
     let x0 = bar.x.floor() as i32 - margin;
     let y0 = bar.y.floor() as i32 - margin;
-    let gw = (bw as i32 + 2 * margin + GRID - 1) / GRID;
-    let gh = (bh as i32 + 2 * margin + GRID - 1) / GRID;
+    let grid_px = grid_for(blur_px, flat_bottom);
+    let gw = (bw as i32 + 2 * margin + grid_px - 1) / grid_px;
+    let gh = (bh as i32 + 2 * margin + grid_px - 1) / grid_px;
 
     // 1) Wallpaper on the grid, 2x2 supersamples per cell, straight to float RGB.
-    let g = GRID as f32;
+    let g = grid_px as f32;
     let mut grid = vec![0f32; (gw * gh * 3) as usize];
     for gy in 0..gh {
         for gx in 0..gw {
@@ -313,6 +343,19 @@ impl Placement {
 }
 
 /// Box radius for three passes that approximate a gaussian of `sigma` (variance 3*(w^2-1)/12).
+/// Blur grid step for a blur of `blur_px` physical px. Wide blurs keep the coarse `GRID`; light
+/// blurs (the bright-page detail frost) use a finer grid so the blur stays the same size in DIPs at
+/// any display scale. With a fixed 4 px grid the smallest possible blur (box radius 1, 3 passes)
+/// is ~5.7 px: ~2.8 DIP at 200% but ~5.7 DIP at 100%, which smeared page text on real screens.
+/// The dock (`flat_bottom`) always keeps `GRID`.
+fn grid_for(blur_px: f32, flat_bottom: bool) -> i32 {
+    if flat_bottom || blur_px >= 4.0 * GRID as f32 {
+        GRID
+    } else {
+        ((blur_px / 3.0).round() as i32).clamp(1, GRID)
+    }
+}
+
 fn box_radius(sigma: f32) -> i32 {
     let r = ((4.0 * sigma * sigma + 1.0).sqrt() - 1.0) / 2.0;
     r.round().max(1.0) as i32

@@ -263,9 +263,15 @@ fn show(pending: Pending) {
     let pad = dpi::dip_to_px(PAD, dpi);
     let gap = dpi::dip_to_px(GAP, dpi);
 
-    let cx = (pending.anchor.left + pending.anchor.right) / 2;
-    let x = cx - width / 2;
-    let y = pending.anchor.top - height - dpi::dip_to_px(LIFT, dpi);
+    // Above a bottom dock (as before), below a top dock, beside a left/right one.
+    let edge = crate::win::edge::current();
+    let (x, y) = if edge == crate::win::edge::AbEdge::Bottom {
+        let cx = (pending.anchor.left + pending.anchor.right) / 2;
+        (cx - width / 2, pending.anchor.top - height - dpi::dip_to_px(LIFT, dpi))
+    } else {
+        let free = RECT { left: i32::MIN / 4, top: i32::MIN / 4, right: i32::MAX / 4, bottom: i32::MAX / 4 };
+        crate::win::edge::place_beside(edge, pending.anchor, (width, height), dpi::dip_to_px(LIFT, dpi), free)
+    };
 
     let mut thumbs = Vec::new();
     HOST.with(|h| {
@@ -378,7 +384,14 @@ fn poll_leave(dock: HWND) {
         let a = host.anchor;
         // Bridge the gap between the icon and the peek so moving up never flickers it away.
         let in_host = pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
-        let in_bridge = pt.x >= a.left && pt.x < a.right && pt.y >= rc.bottom && pt.y < a.top;
+        let in_span_x = pt.x >= a.left && pt.x < a.right;
+        let in_span_y = pt.y >= a.top && pt.y < a.bottom;
+        let in_bridge = match crate::win::edge::current() {
+            crate::win::edge::AbEdge::Bottom => in_span_x && pt.y >= rc.bottom && pt.y < a.top,
+            crate::win::edge::AbEdge::Top => in_span_x && pt.y >= a.bottom && pt.y < rc.top,
+            crate::win::edge::AbEdge::Left => in_span_y && pt.x >= a.right && pt.x < rc.left,
+            crate::win::edge::AbEdge::Right => in_span_y && pt.x >= rc.right && pt.x < a.left,
+        };
         let in_anchor = pt.x >= a.left && pt.x < a.right && pt.y >= a.top && pt.y < a.bottom;
         if in_host || in_bridge || in_anchor {
             host.outside_ms = 0;
@@ -519,22 +532,27 @@ fn paint(hwnd: HWND, _hdc: HDC) {
         let panel = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: hgt - 1.0 };
         let _ = r.begin().and_then(|_| {
             super::glass::set_backdrop(backdrop, w, hgt);
-            let surface = super::glass::draw_popup_surface(r, panel, POPUP_CORNER_RADIUS + 4.0);
+            // The Control Center clear glass, like every other popup.
+            let mut drawn: windows::core::Result<()> = Ok(());
+            let surface = super::popup::paint_clear_glass(r, panel, POPUP_CORNER_RADIUS + 4.0, |r, _| {
+                drawn = (|| {
+                    for (title, rc) in &titles {
+                        // DirectWrite: full Unicode (Vietnamese) titles, ellipsized to the thumbnail width.
+                        r.draw_text(title, *rc, 11.0, 0xF4F4_F7FF, Align::Left)?;
+                    }
+                    for b in &buttons {
+                        // Soft translucent disc with a hairline white cross.
+                        r.fill_rounded_rect(*b, CLOSE_SIZE / 2.0, 0xFFFF_FF2E)?;
+                        let (cx, cy, k) = (b.x + b.w / 2.0, b.y + b.h / 2.0, 3.3);
+                        r.stroke_line(cx - k, cy - k, cx + k, cy + k, 0xFFFF_FFE6, 1.4)?;
+                        r.stroke_line(cx - k, cy + k, cx + k, cy - k, 0xFFFF_FFE6, 1.4)?;
+                    }
+                    Ok(())
+                })();
+            });
             super::glass::set_backdrop(None, w, hgt);
             surface?;
-            super::renderer::set_light_ink(!super::glass::control_dark());
-            for (title, rc) in &titles {
-                // DirectWrite: full Unicode (Vietnamese) titles, ellipsized to the thumbnail width.
-                r.draw_text(title, *rc, 11.0, 0xF4F4_F7FF, Align::Left)?;
-            }
-            for b in &buttons {
-                // Soft translucent disc with a hairline white cross.
-                r.fill_rounded_rect(*b, CLOSE_SIZE / 2.0, 0xFFFF_FF2E)?;
-                let (cx, cy, k) = (b.x + b.w / 2.0, b.y + b.h / 2.0, 3.3);
-                r.stroke_line(cx - k, cy - k, cx + k, cy + k, 0xFFFF_FFE6, 1.4)?;
-                r.stroke_line(cx - k, cy + k, cx + k, cy - k, 0xFFFF_FFE6, 1.4)?;
-            }
-            super::renderer::set_light_ink(false);
+            drawn?;
             r.end()
         });
     });

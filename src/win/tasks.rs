@@ -759,6 +759,29 @@ fn close_target(hwnd: isize) -> isize {
     hwnd
 }
 
+/// The app window behind a foreground HWND (its root owner, so a dialog maps to its app window)
+/// and that window's process image path. (0, "") for none.
+pub fn app_window_of(hwnd: isize) -> (isize, String) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GA_ROOTOWNER};
+    if hwnd == 0 {
+        return (0, String::new());
+    }
+    let h = HWND(hwnd as _);
+    // SAFETY: plain queries on a possibly stale handle.
+    let root = unsafe {
+        if !IsWindow(h).as_bool() {
+            return (0, String::new());
+        }
+        let root = GetAncestor(h, GA_ROOTOWNER);
+        if root.is_invalid() { hwnd } else { root.0 as isize }
+    };
+    let mut pid = 0u32;
+    // SAFETY: plain query.
+    unsafe { GetWindowThreadProcessId(HWND(root as _), Some(&mut pid)) };
+    let exe = if pid == 0 { String::new() } else { process_identity(pid).0 };
+    (root, exe)
+}
+
 /// UI Automation WindowPattern.Close; works across integrity levels only where Windows allows.
 fn uia_close(hwnd: HWND) -> bool {
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED};

@@ -32,6 +32,123 @@ const DOT: f32 = 2.5;
 /// Space between the icon's bottom edge and the running dot.
 const DOT_GAP: f32 = 0.5;
 const DOT_RGBA: u32 = 0xFFFF_FFD9; // small white running dot
+/// Active-app indicator: a short system-blue pill under the icon of the app in front.
+const ACTIVE_LEN: f32 = 17.0;
+const ACTIVE_THICK: f32 = 4.0;
+/// Gap between the icon's screen-edge side and the pill.
+/// (The icon sits 11 DIP from the screen edge on every edge: 3.5 + 4 + 1 outline leaves 2.5.)
+const ACTIVE_GAP: f32 = 3.5;
+/// Light outline around the pill (separates it from blue backdrops / blue tiles).
+const ACTIVE_OUTLINE: f32 = 1.0;
+const ACTIVE_OUTLINE_RGBA: u32 = 0xFFFF_FFE6;
+/// Soft dark shadow ring outside the outline (separates it from white backdrops).
+const ACTIVE_SHADOW: f32 = 1.0;
+const ACTIVE_SHADOW_RGBA: u32 = 0x0000_0040;
+const ACTIVE_RGBA: u32 = 0x0A84_FFFF;
+/// Grow-in time of the pill when the active app changes.
+const ACTIVE_ANIM_SECS: f32 = 0.18;
+
+thread_local! {
+    /// Foreground app window (root owner) and its exe path, set from the foreground hook.
+    static FOREGROUND: std::cell::RefCell<(isize, String)> = const { std::cell::RefCell::new((0, String::new())) };
+    /// When the active slot last changed (for the short grow-in).
+    static ACTIVE_SINCE: Cell<Option<(isize, Instant)>> = const { Cell::new(None) };
+}
+
+/// Records the window now in front (from the foreground hook; `root` is its root owner, `exe`
+/// its process image path). The dock repaints after this.
+pub fn set_foreground(root: isize, exe: String) {
+    FOREGROUND.with(|f| *f.borrow_mut() = (root, exe));
+}
+
+/// `set_foreground` with the grow-in already finished (offscreen renders).
+pub fn set_foreground_settled(root: isize, exe: String) {
+    set_foreground(root, exe);
+    let past = Instant::now().checked_sub(std::time::Duration::from_secs(1)).unwrap_or_else(Instant::now);
+    ACTIVE_SINCE.with(|c| c.set(Some((root, past))));
+}
+
+/// Index of the dock slot for the app in front: the slot of that exact window, else (a window
+/// the dock does not list, e.g. a tool window) the first running slot of the same exe.
+/// Pinned launchers (`hwnd == 0`) never match.
+pub fn active_index(windows: &[WindowEntry], root: isize, exe: &str) -> Option<usize> {
+    if root == 0 {
+        return None;
+    }
+    if let Some(i) = windows.iter().position(|w| w.hwnd != 0 && w.hwnd == root) {
+        return Some(i);
+    }
+    let name = |p: &str| Path::new(p).file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let fg = name(exe);
+    // The UWP frame host and Explorer own many unrelated windows: only exact matches count.
+    if fg.is_empty() || matches!(fg.as_str(), "applicationframehost.exe" | "explorer.exe") {
+        return None;
+    }
+    windows.iter().position(|w| w.hwnd != 0 && w.exe.eq_ignore_ascii_case(exe))
+}
+
+/// The active pill beside slot `s`'s icon, between it and the screen edge (under it on a bottom
+/// dock, above on top, on the outer side of a side dock), at full length `len`.
+fn active_bar(edge: crate::win::edge::AbEdge, s: RectF, len: f32) -> RectF {
+    use crate::win::edge::AbEdge;
+    match edge {
+        AbEdge::Bottom => {
+            let cx = s.x + SLOT / 2.0;
+            RectF { x: cx - len / 2.0, y: s.y + ICON_TOP + ICON + ACTIVE_GAP, w: len, h: ACTIVE_THICK }
+        }
+        AbEdge::Top => {
+            let cx = s.x + SLOT / 2.0;
+            RectF { x: cx - len / 2.0, y: s.y + s.h - ICON_TOP - ICON - ACTIVE_GAP - ACTIVE_THICK, w: len, h: ACTIVE_THICK }
+        }
+        AbEdge::Left => {
+            let cy = s.y + SLOT / 2.0;
+            RectF { x: s.x + s.w - ICON_TOP - ICON - ACTIVE_GAP - ACTIVE_THICK, y: cy - len / 2.0, w: ACTIVE_THICK, h: len }
+        }
+        AbEdge::Right => {
+            let cy = s.y + SLOT / 2.0;
+            RectF { x: s.x + ICON_TOP + ICON + ACTIVE_GAP, y: cy - len / 2.0, w: ACTIVE_THICK, h: len }
+        }
+    }
+}
+
+/// The pill: soft dark shadow ring, light outline, then solid system blue, all fully rounded.
+fn draw_active_pill(r: &mut Renderer, bar: RectF) -> Result<()> {
+    let grow = |rc: RectF, d: f32| RectF { x: rc.x - d, y: rc.y - d, w: rc.w + 2.0 * d, h: rc.h + 2.0 * d };
+    let radius = |rc: RectF| rc.w.min(rc.h) / 2.0;
+    let shadow = grow(bar, ACTIVE_OUTLINE + ACTIVE_SHADOW);
+    r.fill_rounded_rect(shadow, radius(shadow), ACTIVE_SHADOW_RGBA)?;
+    let soft = grow(bar, ACTIVE_OUTLINE + ACTIVE_SHADOW * 0.5);
+    r.fill_rounded_rect(soft, radius(soft), ACTIVE_SHADOW_RGBA)?;
+    let outline = grow(bar, ACTIVE_OUTLINE);
+    r.fill_rounded_rect(outline, radius(outline), ACTIVE_OUTLINE_RGBA)?;
+    r.fill_rounded_rect(bar, radius(bar), ACTIVE_RGBA)
+}
+
+thread_local! {
+    /// Last logged (dock state, foreground root, slot) per dock, so the log only shows changes.
+    static ACTIVE_LOGGED: std::cell::RefCell<HashMap<usize, (isize, usize)>> = std::cell::RefCell::new(HashMap::new());
+}
+
+/// Logs when a dock's active slot changes (verifies the foreground -> tile mapping on the PC).
+fn log_active(state: &AppsState, i: usize, w: &WindowEntry) {
+    let key = state as *const AppsState as usize;
+    let root = FOREGROUND.with(|f| f.borrow().0);
+    let changed = ACTIVE_LOGGED.with(|m| m.borrow_mut().insert(key, (root, i)) != Some((root, i)));
+    if changed {
+        crate::log(&format!(
+            "active app: fg=0x{root:X} -> slot {i}/{} hwnd=0x{:X} exe={} edge={}",
+            state.windows.len(),
+            w.hwnd,
+            w.exe,
+            crate::win::edge::current().name()
+        ));
+    }
+}
+
+/// True while the active pill is still growing in (the caller keeps repainting).
+pub fn active_animating() -> bool {
+    ACTIVE_SINCE.with(|c| c.get()).is_some_and(|(_, t)| t.elapsed().as_secs_f32() < ACTIVE_ANIM_SECS)
+}
 /// Shadow under each icon (in composed-icon pixels: ICON_N px = ICON DIPs).
 const SHADOW_SIGMA_PX: f32 = 2.6;
 const SHADOW_OPACITY: f32 = 0.38;
@@ -152,13 +269,22 @@ fn pinned_launchers(pins: &[(String, String)], open: &[WindowEntry]) -> Vec<Wind
 pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()> {
     let pointer = POINTER.with(Cell::get);
     let t = now_secs();
-    for (w, s) in state.windows.iter().zip(slots(rect, state.windows.len())) {
-        let cx = s.x + SLOT / 2.0;
-        let k = magnify(cx, pointer);
-        let size = ICON * k;
-        // Scales around the bottom centre; the base position never moves.
-        let base_bottom = s.y + ICON_TOP + ICON;
-        let ico = RectF { x: cx - size / 2.0, y: base_bottom - size, w: size, h: size };
+    let edge = crate::win::edge::current();
+    // Keyed by the foreground window itself (not by slot), so docks on other monitors, which
+    // may not list it, never restart each other's grow-in.
+    let (active, fg_root) = FOREGROUND.with(|f| {
+        let f = f.borrow();
+        (active_index(&state.windows, f.0, &f.1), f.0)
+    });
+    let grow = ACTIVE_SINCE.with(|c| match c.get() {
+        Some((h, t)) if h == fg_root => (t.elapsed().as_secs_f32() / ACTIVE_ANIM_SECS).min(1.0),
+        _ => {
+            c.set(Some((fg_root, Instant::now())));
+            0.0
+        }
+    });
+    for (i, (w, s)) in state.windows.iter().zip(slots_on(edge.vertical(), rect, state.windows.len())).enumerate() {
+        let (ico, dot) = icon_geometry(edge, s, pointer);
         let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
         match state.icons.get(key) {
             Some(icon) => draw_icon(r, icon, ico)?,
@@ -170,20 +296,71 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
         if let Some(badge) = badge_of(w) {
             draw_badge(r, ico, badge, t)?;
         }
-        // Small white running dot under the icon.
-        let dot = RectF { x: cx - DOT / 2.0, y: base_bottom + DOT_GAP, w: DOT, h: DOT };
+        if Some(i) == active {
+            // The app in front: a short blue pill instead of the white dot (eased grow-in).
+            let k = 1.0 - (1.0 - grow).powi(3);
+            let bar = active_bar(edge, s, DOT + (ACTIVE_LEN - DOT) * k);
+            draw_active_pill(r, bar)?;
+            log_active(state, i, w);
+            continue;
+        }
+        // Small white running dot between the icon and the screen edge.
         r.fill_rounded_rect(dot, DOT / 2.0, DOT_RGBA)?;
     }
     Ok(())
 }
 
+/// Icon rect (magnified for `pointer`, the pointer's position along the dock) and running-dot
+/// rect for slot `s`. The icon's screen-edge side never moves; it grows away from the edge.
+/// Bottom is the original geometry.
+fn icon_geometry(edge: crate::win::edge::AbEdge, s: RectF, pointer: Option<f32>) -> (RectF, RectF) {
+    use crate::win::edge::AbEdge;
+    match edge {
+        AbEdge::Bottom | AbEdge::Top => {
+            let cx = s.x + SLOT / 2.0;
+            let size = ICON * magnify(cx, pointer);
+            if edge == AbEdge::Bottom {
+                // Scales around the bottom centre; the base position never moves.
+                let base_bottom = s.y + ICON_TOP + ICON;
+                let ico = RectF { x: cx - size / 2.0, y: base_bottom - size, w: size, h: size };
+                (ico, RectF { x: cx - DOT / 2.0, y: base_bottom + DOT_GAP, w: DOT, h: DOT })
+            } else {
+                let base_top = s.y + s.h - ICON_TOP - ICON;
+                let ico = RectF { x: cx - size / 2.0, y: base_top, w: size, h: size };
+                (ico, RectF { x: cx - DOT / 2.0, y: base_top - DOT_GAP - DOT, w: DOT, h: DOT })
+            }
+        }
+        AbEdge::Left | AbEdge::Right => {
+            let cy = s.y + SLOT / 2.0;
+            let size = ICON * magnify(cy, pointer);
+            if edge == AbEdge::Left {
+                let base_left = s.x + s.w - ICON_TOP - ICON;
+                let ico = RectF { x: base_left, y: cy - size / 2.0, w: size, h: size };
+                (ico, RectF { x: base_left - DOT_GAP - DOT, y: cy - DOT / 2.0, w: DOT, h: DOT })
+            } else {
+                let base_right = s.x + ICON_TOP + ICON;
+                let ico = RectF { x: base_right - size, y: cy - size / 2.0, w: size, h: size };
+                (ico, RectF { x: base_right + DOT_GAP, y: cy - DOT / 2.0, w: DOT, h: DOT })
+            }
+        }
+    }
+}
+
 /// Plate rect of the Start / Search button: same size and bottom line as an app icon, growing
 /// like one when hovered.
 fn button_plate(rc: RectF, hovered: bool) -> RectF {
+    use crate::win::edge::AbEdge;
     let size = ICON * if hovered { 1.0 + MAG_MAX } else { 1.0 };
-    let cx = rc.x + rc.w / 2.0;
-    let bottom = rc.y + ICON_TOP + ICON;
-    RectF { x: cx - size / 2.0, y: bottom - size, w: size, h: size }
+    let (cx, cy) = (rc.x + rc.w / 2.0, rc.y + rc.h / 2.0);
+    match crate::win::edge::current() {
+        AbEdge::Bottom => {
+            let bottom = rc.y + ICON_TOP + ICON;
+            RectF { x: cx - size / 2.0, y: bottom - size, w: size, h: size }
+        }
+        AbEdge::Top => RectF { x: cx - size / 2.0, y: rc.y + rc.h - ICON_TOP - ICON, w: size, h: size },
+        AbEdge::Left => RectF { x: rc.x + rc.w - ICON_TOP - ICON, y: cy - size / 2.0, w: size, h: size },
+        AbEdge::Right => RectF { x: rc.x + ICON_TOP + ICON - size, y: cy - size / 2.0, w: size, h: size },
+    }
 }
 
 const BUTTON_RADIUS: f32 = ICON * ICON_GLASS_RADIUS;
@@ -234,17 +411,24 @@ pub fn draw_search_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()
 /// are split between neighbours), and any height counts, so a click at the very bottom edge of the
 /// screen (where the pointer tends to rest) or between two icons is never swallowed. Callers gate on
 /// the dock's own bounds.
-pub fn hit_app_index(x: f32, _y: f32, rect: RectF, state: &AppsState) -> Option<usize> {
+pub fn hit_app_index(x: f32, y: f32, rect: RectF, state: &AppsState) -> Option<usize> {
+    let half_gap = GAP / 2.0;
+    if crate::win::edge::current().vertical() {
+        // Same rule along a vertical dock: y picks the slot, any x counts.
+        if y < rect.y || y >= rect.y + rect.h {
+            return None;
+        }
+        return slots_on(true, rect, state.windows.len()).iter().position(|s| y >= s.y - half_gap && y < s.y + s.h + half_gap);
+    }
     if x < rect.x || x >= rect.x + rect.w {
         return None;
     }
-    let half_gap = GAP / 2.0;
     slots(rect, state.windows.len()).iter().position(|s| x >= s.x - half_gap && x < s.x + s.w + half_gap)
 }
 
 /// Slot rect for window index `i`, if it fits.
 pub fn slot_rect(rect: RectF, state: &AppsState, i: usize) -> Option<RectF> {
-    slots(rect, state.windows.len()).get(i).copied()
+    slots_on(crate::win::edge::current().vertical(), rect, state.windows.len()).get(i).copied()
 }
 
 /// Display name for an app icon (exe stem, else window title).
@@ -299,6 +483,21 @@ fn slots(rect: RectF, n: usize) -> Vec<RectF> {
     let x0 = rect.x + (rect.w - group_w).max(0.0) / 2.0;
     (0..count)
         .map(|i| RectF { x: x0 + i as f32 * PITCH, y: rect.y, w: SLOT, h: rect.h })
+        .collect()
+}
+
+/// `slots` along either axis: a vertical dock stacks the slots top to bottom, centred in
+/// `rect`, each spanning the full width.
+fn slots_on(vertical: bool, rect: RectF, n: usize) -> Vec<RectF> {
+    if !vertical {
+        return slots(rect, n);
+    }
+    let fit = ((rect.h + GAP) / PITCH).floor().max(0.0) as usize;
+    let count = n.min(fit);
+    let group_h = count as f32 * SLOT + count.saturating_sub(1) as f32 * GAP;
+    let y0 = rect.y + (rect.h - group_h).max(0.0) / 2.0;
+    (0..count)
+        .map(|i| RectF { x: rect.x, y: y0 + i as f32 * PITCH, w: rect.w, h: SLOT })
         .collect()
 }
 
@@ -595,6 +794,85 @@ mod tests {
         assert_eq!(launchers.len(), 1, "running pin is not duplicated");
         assert_eq!(launchers[0].hwnd, 0);
         assert_eq!(launchers[0].exe, "C:\\Apps\\Notes.exe");
+    }
+
+    #[test]
+    fn dock_layout_edge_icons_grow_away_from_screen_edge() {
+        use crate::win::edge::AbEdge;
+        // Bottom keeps the original geometry exactly.
+        let s = RectF { x: 100.0, y: 3.0, w: SLOT, h: CLUSTER_H };
+        let (ico, dot) = icon_geometry(AbEdge::Bottom, s, None);
+        assert_eq!(ico, RectF { x: 100.0, y: 3.0 + ICON_TOP, w: ICON, h: ICON });
+        assert_eq!(dot.y, 3.0 + ICON_TOP + ICON + DOT_GAP);
+        // Top: dot above the icon, magnified icon keeps its top line.
+        let s = RectF { x: 100.0, y: 7.0, w: SLOT, h: CLUSTER_H };
+        let (ico, dot) = icon_geometry(AbEdge::Top, s, Some(117.0));
+        assert_eq!(ico.y, 7.0 + ICON_TOP);
+        assert!(ico.w > ICON && dot.y + dot.h <= ico.y);
+        // Left/right: slots stack vertically; the dot sits on the screen side.
+        let band = RectF { x: 7.0, y: 300.0, w: CLUSTER_H, h: cluster_width(3) };
+        let v = slots_on(true, band, 3);
+        assert_eq!(v.len(), 3);
+        assert!((v[1].y - v[0].y - PITCH).abs() < 1e-4 && v[0].y == 300.0);
+        let (ico, dot) = icon_geometry(AbEdge::Left, v[0], Some(v[0].y + SLOT / 2.0));
+        assert!(dot.x + dot.w <= ico.x && (ico.x - (7.0 + ICON_TOP)).abs() < 1e-4);
+        let band = RectF { x: 3.0, ..band };
+        let (ico, dot) = icon_geometry(AbEdge::Right, slots_on(true, band, 3)[2], None);
+        assert!(dot.x >= ico.x + ico.w && (ico.x + ico.w - (3.0 + ICON_TOP + ICON)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn dock_layout_active_pill_sits_between_icon_and_screen_edge() {
+        use crate::ui::dock::{CENTER_RISE, DOCK_H};
+        use crate::win::edge::AbEdge;
+        // Slots as the dock lays them out: the cluster band sits CENTER_RISE away from the
+        // screen edge inside the DOCK_H strip (strip-local coordinates, screen edge at 0 / DOCK_H).
+        let near = (DOCK_H - CLUSTER_H) / 2.0 - CENTER_RISE; // band offset on the far side
+        let far = (DOCK_H - CLUSTER_H) / 2.0 + CENTER_RISE; // band offset on the screen side
+        let halo = ACTIVE_OUTLINE + ACTIVE_SHADOW;
+        // Bottom: screen edge at DOCK_H, below the icon.
+        let s = RectF { x: 100.0, y: near, w: SLOT, h: CLUSTER_H };
+        let (ico, _) = icon_geometry(AbEdge::Bottom, s, None);
+        let bar = active_bar(AbEdge::Bottom, s, ACTIVE_LEN);
+        assert_eq!((bar.w, bar.h), (ACTIVE_LEN, ACTIVE_THICK));
+        assert!((bar.x + bar.w / 2.0 - (ico.x + ico.w / 2.0)).abs() < 1e-4);
+        assert!(bar.y - (ico.y + ico.h) >= 3.0, "separated from the icon");
+        assert!(bar.y + bar.h + halo <= DOCK_H - 1.0, "inside the strip: {bar:?}");
+        // Top: screen edge at 0, above the icon, not clipped by the screen edge.
+        let s = RectF { x: 100.0, y: far, w: SLOT, h: CLUSTER_H };
+        let (ico, _) = icon_geometry(AbEdge::Top, s, None);
+        let bar = active_bar(AbEdge::Top, s, ACTIVE_LEN);
+        assert!(ico.y - (bar.y + bar.h) >= 3.0 && bar.y - halo >= 1.0, "top pill clipped: {bar:?}");
+        // Left: screen edge at x 0; right: screen edge at x DOCK_H. Vertical pill, centred.
+        let v = RectF { x: far, y: 300.0, w: CLUSTER_H, h: SLOT };
+        let (ico, _) = icon_geometry(AbEdge::Left, v, None);
+        let bar = active_bar(AbEdge::Left, v, ACTIVE_LEN);
+        assert_eq!((bar.w, bar.h), (ACTIVE_THICK, ACTIVE_LEN));
+        assert!(ico.x - (bar.x + bar.w) >= 3.0 && bar.x - halo >= 1.0);
+        assert!((bar.y + bar.h / 2.0 - (ico.y + ico.h / 2.0)).abs() < 1e-4);
+        let v = RectF { x: near, ..v };
+        let (ico, _) = icon_geometry(AbEdge::Right, v, None);
+        let bar = active_bar(AbEdge::Right, v, ACTIVE_LEN);
+        assert!(bar.x - (ico.x + ico.w) >= 3.0 && bar.x + bar.w + halo <= DOCK_H - 1.0);
+    }
+
+    #[test]
+    fn dock_layout_active_index_maps_foreground_to_one_slot() {
+        let mut launcher = entry(0, "C:\\Apps\\Notes.exe");
+        launcher.hwnd = 0;
+        let wins = vec![
+            entry(7, "C:\\Apps\\Code.exe"),
+            entry(9, "C:\\Apps\\Code.exe"),
+            entry(11, "C:\\Windows\\System32\\ApplicationFrameHost.exe"),
+            launcher,
+        ];
+        assert_eq!(active_index(&wins, 9, "C:\\Apps\\Code.exe"), Some(1), "exact window wins");
+        assert_eq!(active_index(&wins, 11, "C:\\Windows\\System32\\ApplicationFrameHost.exe"), Some(2));
+        assert_eq!(active_index(&wins, 42, "c:\\apps\\code.exe"), Some(0), "unlisted window of a running exe");
+        assert_eq!(active_index(&wins, 43, "C:\\Windows\\System32\\ApplicationFrameHost.exe"), None);
+        assert_eq!(active_index(&wins, 44, "C:\\Windows\\explorer.exe"), None, "desktop/Explorer");
+        assert_eq!(active_index(&wins, 45, "C:\\Apps\\Notes.exe"), None, "launchers never light up");
+        assert_eq!(active_index(&wins, 0, ""), None);
     }
 }
 

@@ -1,5 +1,5 @@
 //! Balanced COM initialization for temporary worker threads and local WIC calls.
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED};
 
 pub struct Apartment {
     initialized: bool,
@@ -13,6 +13,15 @@ impl Apartment {
             // Both S_OK and S_FALSE require a matching CoUninitialize. A thread
             // already using another apartment model must not be uninitialized here.
             initialized: unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok(),
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    /// Single-threaded apartment, as ShellExecute expects. A thread already in another
+    /// apartment keeps it (the call fails and nothing is uninitialized).
+    pub fn sta() -> Self {
+        Self {
+            initialized: unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) }.is_ok(),
             _thread: std::marker::PhantomData,
         }
     }

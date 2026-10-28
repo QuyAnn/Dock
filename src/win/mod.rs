@@ -2,6 +2,7 @@
 pub mod kbd;
 pub mod com;
 pub mod appbar;   // AppBar registration, dock placement, taskbar hide/restore + crash recovery
+pub mod edge;     // dock edge: follows the taskbar position (StuckRects3) or settings `dockEdge`
 pub mod dpi;      // per-monitor-v2 awareness and DIP/physical-pixel conversions
 pub mod monitors; // EnumDisplayMonitors + primary/secondary selection (unit-tested)
 pub mod tasks;    // window list, shell hook, activate window, attention flags

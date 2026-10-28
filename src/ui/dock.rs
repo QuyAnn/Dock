@@ -9,6 +9,7 @@ use std::time::Instant;
 use super::liquid::{glass_fill_color, LiquidBitmap, GLASS_SHEEN_TOP};
 use super::renderer::{Align, Renderer, TextStyle};
 use super::svgpath;
+use crate::win::edge::AbEdge;
 
 /// Bar height in DIPs. 52 leaves a 5-DIP clear margin above and below the 42-DIP centre
 /// cluster (shelf + 38 px icons + running dots), so the shelf's top rim is never clipped.
@@ -30,8 +31,6 @@ const NO_BACKDROP_TOP: u32 = 0x6E68_62FF;
 const NO_BACKDROP_BOTTOM: u32 = 0x5A55_50FF;
 const CLOCK_TOP: u32 = 0xFF5A_3CFF;
 const CLOCK_BOTTOM: u32 = 0xE832_1EFF;
-const HM_EMPTY: u32 = 0xFFFF_FF26; // .hm.l0 (a bit lighter: the bar is clear glass)
-const HM_LEVELS: [u32; 4] = [0x1F8F_4EFF, 0x2FB8_63FF, 0x4AD6_7FFF, 0x8BF0_AAFF];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RectF {
@@ -166,7 +165,8 @@ impl TileView {
 
 /// Fixed left-tile widths (Dock-Rc: .ai-tile 100px, .music-tile 142px, scaled up a little so
 /// "$52.59/$20.00" and Vietnamese titles fit). Every usage tile shares one width.
-pub const GIT_W: f32 = 152.0;
+/// Git: one stat line ("6 today  37 week  🔥 23 streak") over a 3-row strip of recent days.
+pub const GIT_W: f32 = 188.0;
 pub const USAGE_W: f32 = 112.0;
 pub const MEDIA_W: f32 = 200.0;
 
@@ -256,6 +256,108 @@ fn side_widths(tiles: &[Tile], max_w: f32) -> Vec<f32> {
     widths
 }
 
+/// Length of a widget along a vertical (left/right) dock; its thickness is the usual 42 DIP.
+/// Wide widgets collapse to a compact square there (see `draw_tile_vertical`).
+pub fn vertical_len(id: &str) -> f32 {
+    match id {
+        "cc" => 62.0,
+        "chevron" => 30.0,
+        "clock" => 46.0,
+        _ => TILE_H,
+    }
+}
+
+/// `layout` for a dock on any screen edge. Bottom is exactly `layout`; top is the same row
+/// mirrored (tiles rise away from the screen edge, i.e. downwards); left/right stack the zones
+/// top to bottom along `length` (the dock window's height in DIPs).
+pub fn layout_edge(edge: AbEdge, left: &[Tile], center: &[Tile], right: &[Tile], length: f32) -> Vec<RectF> {
+    match edge {
+        AbEdge::Bottom => layout(left, center, right, length),
+        AbEdge::Top => layout(left, center, right, length)
+            .into_iter()
+            .map(|r| RectF { y: DOCK_H - r.y - r.h, ..r })
+            .collect(),
+        AbEdge::Left | AbEdge::Right => layout_vertical(edge, left, center, right, length),
+    }
+}
+
+/// Vertical dock: the centre cluster (Start, Search, apps, Trash) is centred on `length / 2`,
+/// the "left" zone starts at the top and the "right" zone packs to the bottom. Widgets keep a
+/// 42-DIP square (taller for Control Center / clock); side tiles that do not fit are hidden
+/// (zero-size rect) rather than squeezed. Cells sit `CENTER_RISE` away from the screen edge.
+fn layout_vertical(edge: AbEdge, left: &[Tile], center: &[Tile], right: &[Tile], length: f32) -> Vec<RectF> {
+    let away = if edge == AbEdge::Left { CENTER_RISE } else { -CENTER_RISE };
+    // (thickness across the dock, length along it)
+    let center_cell = |t: &Tile| (if t.height > 0.0 { t.height } else { TILE_H }, t.width);
+    let side_cell = |t: &Tile| (TILE_H, vertical_len(t.id));
+    let rect = |(thick, len): (f32, f32), y: f32| RectF { x: (DOCK_H - thick) / 2.0 + away, y, w: thick, h: len };
+    let zone_len = |cells: &[(f32, f32)]| cells.iter().map(|c| c.1).sum::<f32>() + ZONE_GAP * cells.len().saturating_sub(1) as f32;
+
+    let center_cells: Vec<_> = center.iter().map(center_cell).collect();
+    let center_len = zone_len(&center_cells);
+    // Room the Control Center, tray chevron and clock need at the bottom. When the centred
+    // cluster would crowd them out, the cluster slides up (left widgets give way first).
+    let essential = |t: &Tile| matches!(t.id, "cc" | "chevron" | "clock");
+    let essentials: Vec<f32> = right.iter().filter(|t| essential(t)).map(|t| side_cell(t).1).collect();
+    let essential_len = zone_len(&essentials.iter().map(|&l| (0.0, l)).collect::<Vec<_>>());
+    let mut center_y = ((length - center_len) / 2.0).max(ROW_PAD);
+    if !center.is_empty() && essential_len > 0.0 {
+        let max_end = length - ROW_PAD - essential_len - CENTER_GAP;
+        if center_y + center_len > max_end {
+            center_y = (max_end - center_len).max(ROW_PAD);
+        }
+    }
+    let center_end = center_y + center_len;
+    let (top_limit, bottom_limit) = if center.is_empty() {
+        (length / 2.0 - CENTER_GAP / 2.0, length / 2.0 + CENTER_GAP / 2.0)
+    } else {
+        (center_y - CENTER_GAP, center_end + CENTER_GAP)
+    };
+
+    let mut out = Vec::with_capacity(left.len() + center.len() + right.len());
+    let mut y = ROW_PAD;
+    for t in left {
+        let cell = side_cell(t);
+        if y + cell.1 <= top_limit {
+            out.push(rect(cell, y));
+            y += cell.1 + ZONE_GAP;
+        } else {
+            out.push(RectF { x: rect(cell, y).x, y, w: 0.0, h: 0.0 });
+        }
+    }
+    let mut y = center_y;
+    for cell in center_cells {
+        out.push(rect(cell, y));
+        y += cell.1 + ZONE_GAP;
+    }
+    // Right zone: packed to the bottom. When it does not all fit, the Control Center, tray
+    // chevron and clock keep their place first, then the tiles nearest the end.
+    let budget = (length - ROW_PAD) - bottom_limit;
+    let mut keep = vec![false; right.len()];
+    let mut used = 0.0;
+    let order = (0..right.len()).rev().filter(|&i| essential(&right[i])).chain((0..right.len()).rev().filter(|&i| !essential(&right[i])));
+    for i in order {
+        let need = side_cell(&right[i]).1 + if used > 0.0 { ZONE_GAP } else { 0.0 };
+        if used + need <= budget {
+            keep[i] = true;
+            used += need;
+        }
+    }
+    let mut placed = vec![RectF::default(); right.len()];
+    let mut end = length - ROW_PAD;
+    for (i, t) in right.iter().enumerate().rev() {
+        let cell = side_cell(t);
+        if keep[i] {
+            placed[i] = rect(cell, end - cell.1);
+            end -= cell.1 + ZONE_GAP;
+        } else {
+            placed[i] = RectF { x: rect(cell, end).x, y: end, w: 0.0, h: 0.0 };
+        }
+    }
+    out.extend(placed);
+    out
+}
+
 /// Index of the rect containing (x, y), if any.
 pub fn hit_test(x: f32, y: f32, rects: &[RectF]) -> Option<usize> {
     rects
@@ -274,8 +376,9 @@ pub fn draw_dock(
     backdrop: Option<&LiquidBitmap>,
     opacity_pct: u8,
 ) -> Result<()> {
-    let (w, _) = r.size();
-    let bar = RectF { x: 0.0, y: 0.0, w, h: DOCK_H };
+    let (w, h) = r.size();
+    let edge = crate::win::edge::current();
+    let bar = if edge.vertical() { RectF { x: 0.0, y: 0.0, w: DOCK_H, h } } else { RectF { x: 0.0, y: 0.0, w, h: DOCK_H } };
     // The wallpaper blur is the backdrop. The readable smoky tint must sit above it, not below
     // an opaque bitmap where it would disappear.
     match backdrop {
@@ -287,7 +390,16 @@ pub fn draw_dock(
         Some(b) => r.draw_bitmap(b.w, b.h, &b.rgba, bar)?,
         // No wallpaper crop yet: the HWND target has no real alpha, so a transparent clear
         // shows as black. Paint a neutral mid-tone glass base instead of a near-black bar.
-        None => r.fill_top_rounded_rect_gradient(bar, BAR_RADIUS, NO_BACKDROP_TOP, NO_BACKDROP_BOTTOM)?,
+        None if edge == AbEdge::Bottom => r.fill_top_rounded_rect_gradient(bar, BAR_RADIUS, NO_BACKDROP_TOP, NO_BACKDROP_BOTTOM)?,
+        // Other edges: round only the inner corners by pushing the outer ones past the window.
+        None => {
+            let ext = match edge {
+                AbEdge::Top => RectF { y: -BAR_RADIUS, h: DOCK_H + BAR_RADIUS, ..bar },
+                AbEdge::Left => RectF { x: -BAR_RADIUS, w: DOCK_H + BAR_RADIUS, ..bar },
+                _ => RectF { w: DOCK_H + BAR_RADIUS, ..bar },
+            };
+            r.fill_rounded_rect_gradient(ext, BAR_RADIUS, NO_BACKDROP_TOP, NO_BACKDROP_BOTTOM)?
+        }
     }
     let _ = (glass_fill_color(opacity_pct), GLASS_SHEEN_TOP, BAR_BORDER, w);
 
@@ -296,7 +408,14 @@ pub fn draw_dock(
     }
     for (i, (t, rc)) in tiles.iter().zip(rects).enumerate() {
         let hovered = hover == Some(i);
-        draw_tile(r, t, *rc, hovered)?;
+        if edge.vertical() {
+            // Tiles that did not fit the vertical dock are laid out with zero size.
+            if rc.w > 0.0 && rc.h > 0.0 {
+                draw_tile_vertical(r, t, *rc, hovered)?;
+            }
+        } else {
+            draw_tile(r, t, *rc, hovered)?;
+        }
     }
     Ok(())
 }
@@ -323,6 +442,83 @@ pub fn draw_tile(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Re
             Style::Separator => draw_separator(r, rc)?,
         }
     Ok(())
+}
+
+/// One tile of a vertical (left/right) dock: square widgets draw as usual, wide ones collapse
+/// to a compact card (small title over a bold value), the status button stacks its icons.
+fn draw_tile_vertical(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    match t.style {
+        Style::Ring | Style::Label | Style::Bare | Style::Start | Style::Search | Style::Trash => draw_tile(r, t, rc, hovered),
+        Style::Git => draw_git_compact(r, t, rc, hovered),
+        Style::Widget if t.extra == "analog" => draw_tile(r, t, rc, hovered),
+        Style::Separator => r.fill_rect(RectF { x: rc.x, y: rc.y + (rc.h - 1.0) / 2.0, w: rc.w, h: 1.0 }, 0xFFFF_FF4D),
+        Style::Button if t.chevron.is_some() => draw_button(r, t, rc, hovered),
+        Style::Button => {
+            card_frame(r, rc, hovered)?;
+            let cx = rc.x + rc.w / 2.0;
+            if let Some(st) = t.status {
+                // Wi-Fi, speaker and Control Center icons stacked top to bottom.
+                let wifi = RectF { x: cx - 7.5, y: rc.y + 6.0, w: 15.0, h: 15.0 };
+                let spk = RectF { x: cx - 8.5, y: wifi.y + 18.0, w: 17.0, h: 15.0 };
+                let ccr = RectF { x: cx - 7.5, y: spk.y + 18.0, w: 15.0, h: 15.0 };
+                super::sficons::draw_wifi(r, wifi, st.wifi, 0xFFFF_FFFF)?;
+                super::sficons::draw_speaker(r, spk, st.volume, st.muted, 0xFFFF_FFF0)?;
+                return super::sficons::draw_control_center(r, ccr, 0xFFFF_FFF0);
+            }
+            let n = t.value.chars().count().max(1) as f32;
+            let pitch = ((rc.h - 8.0) / n).min(18.0);
+            let mut y = rc.y + (rc.h - pitch * n) / 2.0;
+            for glyph in t.value.chars() {
+                r.draw_text_styled(&glyph.to_string(), RectF { x: rc.x, y, w: rc.w, h: pitch }, 12.0, 0xFFFF_FFE8, Align::Center, TextStyle::Icon)?;
+                y += pitch;
+            }
+            Ok(())
+        }
+        Style::Clock | Style::ClockWide => {
+            card_frame(r, rc, hovered)?;
+            let time = RectF { x: rc.x + 3.0, y: rc.y + 5.0, w: rc.w - 6.0, h: 17.0 };
+            r.fill_rounded_rect_gradient(time, 5.0, CLOCK_TOP, CLOCK_BOTTOM)?;
+            r.draw_text_styled(&t.value, time, 10.5, 0xFFFF_FFFF, Align::Center, TextStyle::Bold)?;
+            let below = RectF { x: rc.x + 2.0, y: time.y + time.h + 2.0, w: rc.w - 4.0, h: (rc.y + rc.h - time.y - time.h - 4.0).max(0.0) };
+            r.draw_text(&t.title, below, 8.0, MUTED, Align::Center)
+        }
+        Style::Media => {
+            card_frame(r, rc, hovered)?;
+            let playing = t.progress.is_some();
+            let peak = t.audio_peak.sqrt();
+            for i in 0..7 {
+                let shape = 0.45 + 0.55 * ((i as f32 - 3.0).abs() / 3.0 * std::f32::consts::PI).cos().abs();
+                let h = if playing { 4.0 + (6.0 + 14.0 * peak) * shape } else { 4.0 };
+                r.fill_rounded_rect(
+                    RectF { x: rc.x + (rc.w - 26.0) / 2.0 + i as f32 * 4.0, y: rc.y + (rc.h - h) / 2.0, w: 2.0, h },
+                    1.0,
+                    if playing { 0xC7A6_FFFF } else { 0xC7A6_FF8C },
+                )?;
+            }
+            Ok(())
+        }
+        _ => {
+            card_frame(r, rc, hovered)?;
+            let inner = RectF { x: rc.x + 2.0, w: rc.w - 4.0, ..rc };
+            if t.bg != 0 {
+                // Provider square (AI usage) above the value.
+                let sq = RectF { x: rc.x + (rc.w - 18.0) / 2.0, y: rc.y + 4.0, w: 18.0, h: 18.0 };
+                r.fill_rounded_rect(sq, 5.0, t.bg)?;
+                if let Some((d, stroke)) = t.glyph {
+                    svgpath::draw_path(r, d, RectF { x: sq.x + 3.0, y: sq.y + 3.0, w: 12.0, h: 12.0 }, 24.0, 0xFFFF_FFFF, stroke)?;
+                } else if let Some(icon) = &t.icon {
+                    r.draw_bitmap(icon.w, icon.h, &icon.rgba, RectF { x: sq.x + 3.0, y: sq.y + 3.0, w: 12.0, h: 12.0 })?;
+                }
+                let value = if t.value.is_empty() { t.rows.first().map(|row| row.value.clone()).unwrap_or_default() } else { t.value.clone() };
+                return r.draw_text_styled(&value, RectF { y: sq.y + 19.0, h: 12.0, ..inner }, 8.5, TEXT, Align::Center, TextStyle::Bold);
+            }
+            if t.value.is_empty() {
+                return r.draw_text_styled(&t.title, inner, 8.5, TEXT, Align::Center, TextStyle::Bold);
+            }
+            r.draw_text(&t.title, RectF { y: rc.y + rc.h / 2.0 - 12.0, h: 10.0, ..inner }, 6.5, MUTED, Align::Center)?;
+            r.draw_text_styled(&t.value, RectF { y: rc.y + rc.h / 2.0 - 2.0, h: 13.0, ..inner }, 9.5, TEXT, Align::Center, TextStyle::Bold)
+        }
+    }
 }
 
 /// Card background shared by every boxed tile: a Liquid Glass piece sampled from the bar's
@@ -500,33 +696,125 @@ fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
     )
 }
 
-fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
-    card_frame(r, rc, hovered)?;
-    let off = (rc.h - 38.0) / 2.0;
-    // Right: the whole week (7 rows, Monday on top) for the last weeks, newest column at the edge.
-    // Left: today's commits (bold), then the week and streak totals.
-    let rows = 7usize;
-    let cols = (t.cells.len() / rows).max(1);
-    let gap = 1.0;
-    let cell = ((rc.h - 6.0 - (rows - 1) as f32 * gap) / rows as f32).clamp(2.5, 4.5);
-    let grid_w = cols as f32 * cell + (cols - 1) as f32 * gap;
-    let grid_h = rows as f32 * cell + (rows - 1) as f32 * gap;
-    let left = rc.x + rc.w - 7.0 - grid_w;
-    let top = rc.y + (rc.h - grid_h) / 2.0;
-    for (i, level) in t.cells.iter().enumerate() {
-        let (col, row) = (i / rows, i % rows);
-        let color = match level {
-            0 => HM_EMPTY,
-            l => HM_LEVELS[(*l as usize - 1).min(3)],
-        };
-        let rect = RectF { x: left + col as f32 * (cell + gap), y: top + row as f32 * (cell + gap), w: cell, h: cell };
-        r.fill_rounded_rect(rect, 1.0, color)?;
-    }
-    let text_w = (left - 6.0 - (rc.x + 8.0)).max(0.0);
-    r.draw_text_styled(&t.title, RectF { x: rc.x + 8.0, y: rc.y + off + 6.0, w: text_w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(&t.value, RectF { x: rc.x + 8.0, y: rc.y + off + 21.0, w: text_w, h: 11.0 }, 8.0, MUTED, Align::Left)
+/// Git tile cell colours (0xRRGGBBAA): empty days a translucent grey (lighter than dark glass,
+/// darker than light glass), then GitHub-style greens.
+const GIT_EMPTY: u32 = 0x5A5A_60A6;
+const GIT_LEVELS: [u32; 4] = [0x1F6F_3AFF, 0x2EA0_43FF, 0x39D3_53FF, 0x6CEB_83FF];
+const GIT_ROWS: usize = 3;
+const GIT_CELL: f32 = 6.0;
+const GIT_GAP: f32 = 1.5;
+/// Side padding of the stat line and the grid inside the wide (horizontal) tile.
+const GIT_PAD: f32 = 9.0;
+
+/// Where the recent-days grid sits in a git tile: (left, top, columns). Columns fill the width
+/// left by `GIT_PAD` on both sides; the grid is centred horizontally and sits under the stat
+/// line, clear of the 12 DIP rounded corners.
+pub fn git_grid(rc: RectF, compact: bool) -> (f32, f32, usize) {
+    let pad = if compact { 6.0 } else { GIT_PAD };
+    let pitch = GIT_CELL + GIT_GAP;
+    let cols = (((rc.w - 2.0 * pad + GIT_GAP) / pitch).floor() as usize).max(1);
+    let grid_w = cols as f32 * pitch - GIT_GAP;
+    let grid_h = GIT_ROWS as f32 * pitch - GIT_GAP;
+    let top = rc.y + rc.h - 4.0 - grid_h;
+    (rc.x + (rc.w - grid_w) / 2.0, top, cols)
 }
 
+/// Colour for one day's heat level.
+fn git_cell_color(level: u8) -> u32 {
+    match level {
+        0 => GIT_EMPTY,
+        l => GIT_LEVELS[(l as usize - 1).min(3)],
+    }
+}
+
+/// The most recent `GIT_ROWS * cols` days, column-major (top to bottom, then left to right),
+/// so time runs left to right and today is the bottom-right cell.
+fn draw_git_grid(r: &mut Renderer, cells: &[u8], left: f32, top: f32, cols: usize) -> Result<()> {
+    let n = GIT_ROWS * cols;
+    let pitch = GIT_CELL + GIT_GAP;
+    for i in 0..n {
+        // Index from the end: the last cell drawn is the newest day.
+        let back = n - 1 - i;
+        let level = cells.len().checked_sub(1 + back).map_or(0, |k| cells[k]);
+        let (col, row) = (i / GIT_ROWS, i % GIT_ROWS);
+        let cell = RectF { x: left + col as f32 * pitch, y: top + row as f32 * pitch, w: GIT_CELL, h: GIT_CELL };
+        r.fill_rounded_rect(cell, 1.5, git_cell_color(level))?;
+    }
+    Ok(())
+}
+
+/// Wide git tile: "6 today   37 week   🔥 23 streak" over a 3-row strip of recent days.
+fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    let (left, top, cols) = git_grid(rc, false);
+    draw_git_grid(r, &t.cells, left, top, cols)?;
+    // Stat line: bold numbers, medium labels; three groups spread over the grid's width.
+    // When the dock squeezes the tile, labels shrink, then the streak label goes, then all
+    // labels go (numbers and the flame always stay).
+    let span_w = cols as f32 * (GIT_CELL + GIT_GAP) - GIT_GAP;
+    let num = 12.0;
+    let flame_w = 13.0;
+    let nums = [t.title.as_str(), t.value.as_str(), t.sub.as_str()];
+    let mut nw = [0.0f32; 3];
+    for (i, n) in nums.iter().enumerate() {
+        nw[i] = r.measure_text(n, num, TextStyle::Bold)?;
+    }
+    let mut chosen = (10.0f32, [" today", " week", ""], [0.0f32; 3], f32::MAX);
+    for (lab, labels) in [
+        (10.0f32, [" today", " week", " streak"]),
+        (9.0, [" today", " week", " streak"]),
+        (9.0, [" today", " week", ""]),
+        (9.0, ["", "", ""]),
+    ] {
+        let mut lw = [0.0f32; 3];
+        for (i, l) in labels.iter().enumerate() {
+            lw[i] = if l.is_empty() { 0.0 } else { r.measure_text(l, lab, TextStyle::SemiBold)? };
+        }
+        let total = flame_w + nw.iter().sum::<f32>() + lw.iter().sum::<f32>();
+        chosen = (lab, labels, lw, total);
+        if total + 2.0 * 6.0 <= span_w {
+            break;
+        }
+    }
+    let (lab, labels, lw, total) = chosen;
+    let gap = ((span_w - total) / 2.0).max(3.0);
+    let line = RectF { x: 0.0, y: rc.y + 3.5, w: 0.0, h: (top - rc.y - 3.5 - 1.0).max(12.0) };
+    let mut x = left;
+    for i in 0..3 {
+        if i == 2 {
+            r.draw_text("\u{1F525}", RectF { x: x - 1.0, w: flame_w + 2.0, ..line }, 9.5, 0xFFFF_FFFF, Align::Left)?;
+            x += flame_w;
+        }
+        r.draw_text_styled(nums[i], RectF { x, w: nw[i] + 1.0, ..line }, num, TEXT, Align::Left, TextStyle::Bold)?;
+        if !labels[i].is_empty() {
+            r.draw_text_styled(labels[i], RectF { x: x + nw[i], w: lw[i] + 1.0, ..line }, lab, GIT_LABEL, Align::Left, TextStyle::SemiBold)?;
+        }
+        x += nw[i] + lw[i] + gap;
+    }
+    Ok(())
+}
+
+/// Labels next to the bold numbers: white at ~70% so they read as secondary but stay bold-ish.
+const GIT_LABEL: u32 = 0xFFFF_FFB8;
+
+/// Square git tile on a left/right dock (42x42): today's count on top, last days below.
+fn draw_git_compact(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    let (left, top, cols) = git_grid(rc, true);
+    draw_git_grid(r, &t.cells, left, top, cols)?;
+    let line = RectF { x: rc.x, y: rc.y + 3.5, w: rc.w, h: (top - rc.y - 4.5).max(11.0) };
+    // "6 today" centred when it fits the 42 DIP square, else just the bold number.
+    let (num, lab) = (11.0, 8.0);
+    let nw = r.measure_text(&t.title, num, TextStyle::Bold)?;
+    let lw = r.measure_text(" today", lab, TextStyle::SemiBold)?;
+    if nw + lw <= rc.w - 6.0 {
+        let x = rc.x + (rc.w - nw - lw) / 2.0;
+        r.draw_text_styled(&t.title, RectF { x, w: nw + 1.0, ..line }, num, TEXT, Align::Left, TextStyle::Bold)?;
+        r.draw_text_styled(" today", RectF { x: x + nw, w: lw + 1.0, ..line }, lab, GIT_LABEL, Align::Left, TextStyle::SemiBold)
+    } else {
+        r.draw_text_styled(&t.title, line, num, TEXT, Align::Center, TextStyle::Bold)
+    }
+}
 
 fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
@@ -634,19 +922,24 @@ pub fn shelf_for(first: RectF, last: RectF) -> RectF {
     RectF { x: first.x - pad, y: first.y, w: last.x + last.w - first.x + 2.0 * pad, h: first.h }
 }
 
-const SHELF_PAD: f32 = 7.0;
-const SHELF_RADIUS: f32 = 12.0;
+/// `shelf_for` on any edge: along a vertical dock the padding runs top/bottom instead.
+pub fn shelf_for_edge(edge: AbEdge, first: RectF, last: RectF) -> RectF {
+    if edge.vertical() {
+        let pad = SHELF_PAD;
+        RectF { x: first.x, y: first.y - pad, w: first.w, h: last.y + last.h - first.y + 2.0 * pad }
+    } else {
+        shelf_for(first, last)
+    }
+}
 
-/// One continuous, very light liquid-glass capsule behind the icon group (macOS Tahoe dock).
+const SHELF_PAD: f32 = 7.0;
+/// The centre cluster's capsule uses the same glass, radius and rims as every other dock
+/// section (widgets, tray, clock), so all sections read as one height: the old very light
+/// shelf had near-invisible rims and looked shorter than its 42 DIP (only the icons showed).
 fn draw_shelf(r: &mut Renderer, rc: RectF) -> Result<()> {
     let scale = r.dpi() as f32 / 96.0;
     let rc = snap_to_pixels(rc, scale);
-    r.fill_rounded_rect(rc, SHELF_RADIUS, 0xFFFF_FF12)?;
-    // 1 px rims are stroked half a device pixel inside the edge so each rim lands on
-    // exactly one pixel row/column (crisp, and nothing bleeds into the bar margin).
-    let half = 0.5 / scale;
-    let rim = RectF { x: rc.x + half, y: rc.y + half, w: rc.w - 2.0 * half, h: rc.h - 2.0 * half };
-    super::glass::draw_highlights(r, rim, SHELF_RADIUS - half, 0.75)
+    super::glass::draw_glass(r, rc, super::glass::GLASS_RADIUS, super::glass::Layer::Tile, false)
 }
 
 /// Rounds a DIP rect's edges to whole device pixels at `scale` (DPI / 96).
@@ -728,6 +1021,124 @@ mod tests {
                 assert_eq!(rc.w, tile.width, "{} apps={apps}", tile.id);
             }
         }
+    }
+
+    #[test]
+    fn dock_layout_edge_bottom_is_unchanged_and_top_is_mirrored() {
+        for &(w, apps) in &[(1920.0, 5), (1280.0, 12)] {
+            let (l, c, r) = home_zones(apps);
+            let bottom = layout(&l, &c, &r, w);
+            assert_eq!(layout_edge(AbEdge::Bottom, &l, &c, &r, w), bottom);
+            let top = layout_edge(AbEdge::Top, &l, &c, &r, w);
+            for (b, t) in bottom.iter().zip(&top) {
+                assert_eq!((b.x, b.w, b.h), (t.x, t.w, t.h));
+                assert!((t.y - (DOCK_H - b.y - b.h)).abs() < 1e-4);
+                // Rises away from the top screen edge: more clearance above than below.
+                assert!(t.y >= DOCK_H - t.y - t.h - 0.01, "{t:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dock_layout_vertical_stacks_zones_without_overlap() {
+        for edge in [AbEdge::Left, AbEdge::Right] {
+            for &(len, apps) in &[(1032.0, 5), (864.0, 9), (700.0, 12)] {
+                let (l, c, r) = home_zones(apps);
+                let rects = layout_edge(edge, &l, &c, &r, len);
+                assert_eq!(rects.len(), l.len() + c.len() + r.len());
+                let shown: Vec<RectF> = rects.iter().copied().filter(|r| r.w > 0.0 && r.h > 0.0).collect();
+                for r in &shown {
+                    assert!(r.x >= 0.0 && r.x + r.w <= DOCK_H, "{edge:?} {r:?}");
+                    assert!(r.y >= 0.0 && r.y + r.h <= len + 0.01, "{edge:?} len={len} {r:?}");
+                }
+                // Visible tiles run strictly top to bottom.
+                for pair in shown.windows(2) {
+                    assert!(pair[1].y >= pair[0].y + pair[0].h - 0.01, "{edge:?} len={len} {pair:?}");
+                }
+                // Centre cluster centred along the dock when it fits; on a short dock it may
+                // only slide up to make room for the Control Center and clock.
+                let first = rects[l.len()];
+                let last = rects[l.len() + c.len() - 1];
+                let mid = (first.y + last.y + last.h) / 2.0;
+                if len >= 864.0 {
+                    assert!((mid - len / 2.0).abs() < 0.01, "{edge:?} len={len} mid={mid}");
+                } else {
+                    assert!(mid <= len / 2.0 + 0.01 && first.y >= ROW_PAD - 0.01, "{edge:?} len={len} mid={mid}");
+                }
+                // Clock (last right tile) is kept at the bottom.
+                let clock = rects[rects.len() - 1];
+                assert!(clock.h > 0.0 && (clock.y + clock.h - (len - ROW_PAD)).abs() < 0.01);
+                // The Control Center / tray chevron keep their place before optional widgets.
+                for id in ["cc", "chevron"] {
+                    if let Some(i) = r.iter().position(|t| t.id == id) {
+                        assert!(rects[l.len() + c.len() + i].h > 0.0, "{edge:?} len={len} {id} dropped");
+                    }
+                }
+            }
+        }
+        // Tiles rise away from the screen edge.
+        let (l, c, r) = home_zones(5);
+        let left = layout_edge(AbEdge::Left, &l, &c, &r, 1000.0);
+        let right = layout_edge(AbEdge::Right, &l, &c, &r, 1000.0);
+        assert!(left[l.len()].x > right[l.len()].x);
+    }
+
+    #[test]
+    fn dock_layout_all_sections_share_one_height_on_every_edge() {
+        // Widgets, the centre capsule (Start .. apps) and tray/status/clock tiles all have the
+        // same thickness and the same position across the dock, on every edge.
+        for edge in [AbEdge::Bottom, AbEdge::Top, AbEdge::Left, AbEdge::Right] {
+            let (l, c, r) = home_zones(6);
+            let len = if edge.vertical() { 1032.0 } else { 1920.0 };
+            let rects = layout_edge(edge, &l, &c, &r, len);
+            let ids: Vec<&str> = l.iter().chain(&c).chain(&r).map(|t| t.id).collect();
+            let across = |rc: &RectF| if edge.vertical() { (rc.x, rc.w) } else { (rc.y, rc.h) };
+            let shelf = shelf_for_edge(edge, rects[l.len()], rects[l.len() + c.len() - 1]);
+            let want = across(&shelf);
+            assert!((want.1 - TILE_H).abs() < 1e-4, "{edge:?} shelf {shelf:?}");
+            for (id, rc) in ids.iter().zip(&rects) {
+                if id.starts_with("sep") || rc.w <= 0.0 || rc.h <= 0.0 {
+                    continue;
+                }
+                let got = across(rc);
+                assert!((got.0 - want.0).abs() < 1e-4 && (got.1 - want.1).abs() < 1e-4, "{edge:?} {id} {rc:?} vs shelf {shelf:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dock_layout_git_grid_fits_inside_the_tile() {
+        for (rc, compact) in [
+            (RectF { x: 10.0, y: 5.0, w: GIT_W, h: TILE_H }, false),
+            (RectF { x: 5.0, y: 300.0, w: TILE_H, h: TILE_H }, true),
+        ] {
+            let (left, top, cols) = git_grid(rc, compact);
+            let pitch = GIT_CELL + GIT_GAP;
+            let (w, h) = (cols as f32 * pitch - GIT_GAP, GIT_ROWS as f32 * pitch - GIT_GAP);
+            // Same 42 DIP height as every section; the grid stays clear of the tile edges and
+            // leaves at least 12 DIP above it for the stat line.
+            assert_eq!(rc.h, TILE_H);
+            assert!(left >= rc.x + 6.0 && left + w <= rc.x + rc.w - 6.0, "{rc:?} {left} {w}");
+            assert!(top >= rc.y + 15.0 && top + h <= rc.y + rc.h - 3.0, "{rc:?} {top} {h}");
+            // Bottom corner cells stay inside the 12 DIP rounded corners.
+            let (cx, cy) = (rc.x + 12.0, rc.y + rc.h - 12.0);
+            let (dx, dy) = (cx - left, top + h - cy);
+            assert!(dx <= 0.0 || dy <= 0.0 || (dx * dx + dy * dy).sqrt() <= 12.0 - 1.0, "{rc:?}");
+            if compact {
+                assert!(cols >= 4);
+            } else {
+                assert!(cols >= 20, "wide tile shows at least ~2 months: {cols}");
+            }
+        }
+    }
+
+    #[test]
+    fn dock_layout_vertical_shelf_wraps_cluster() {
+        let first = RectF { x: 5.0, y: 400.0, w: 42.0, h: 34.0 };
+        let last = RectF { x: 5.0, y: 600.0, w: 42.0, h: 100.0 };
+        let shelf = shelf_for_edge(AbEdge::Left, first, last);
+        assert_eq!(shelf, RectF { x: 5.0, y: 393.0, w: 42.0, h: 314.0 });
+        assert_eq!(shelf_for_edge(AbEdge::Bottom, first, last), shelf_for(first, last));
     }
 }
 
