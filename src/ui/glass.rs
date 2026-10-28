@@ -261,16 +261,10 @@ pub fn release_backdrop(bg: &Arc<LiquidBitmap>) {
     });
 }
 
-/// Flat frosted material (no bevel, lens or shading): light popups, and the Control Center over
-/// bright backdrops (white or light grey pages).
+/// Flat frosted material (no bevel, lens or shading) for light popups.
 fn render_light_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f32, layer: Layer) -> Piece {
-    // Bright-backdrop materials are flat frosted greys: the panel a light grey, modules clearly
-    // darker than it, so both separate from a white page without any soft shading.
-    let (veil, veil_a): ([f32; 3], f32) = match layer {
-        Layer::CcPanelInk => ([233.0, 233.0, 236.0], 0.88),
-        Layer::ControlInk => ([218.0, 218.0, 223.0], 0.92),
-        _ => ([236.0; 3], 0.58),
-    };
+    debug_assert_eq!(layer, Layer::PopupLight);
+    let (veil, veil_a) = ([236.0f32; 3], 0.58f32);
     let (w, h) = (pw.max(1) as u32, ph.max(1) as u32);
     let (hx, hy) = (pw as f32 / 2.0, ph as f32 / 2.0);
     let r = radius.min(hx).min(hy);
@@ -327,7 +321,7 @@ fn backdrop_brightness(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32) ->
 /// CPU render of one glass piece (straight RGBA, `pw` x `ph`).
 #[allow(clippy::too_many_arguments)]
 fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f32, dpr: f32, layer: Layer) -> Piece {
-    if matches!(layer, Layer::PopupLight | Layer::ControlInk | Layer::CcPanelInk) {
+    if layer == Layer::PopupLight {
         return render_light_piece(bg, px, py, pw, ph, radius, layer);
     }
     let (w, h) = (pw as u32, ph as u32);
@@ -359,11 +353,15 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         Layer::ControlLight => (0.0, 1.06, 138.0),
         Layer::CcPanel => (0.0, 1.06, 175.0),
         Layer::CcPanelLight => (0.0, 1.04, 255.0),
-        Layer::ControlInk | Layer::CcPanelInk | Layer::PopupLight => (0.0, 1.04, 255.0),
+        // Bright-page glass: no dimming, a touch more colour so blurred content stays alive.
+        Layer::ControlInk | Layer::CcPanelInk => (0.0, 1.12, 255.0),
+        Layer::PopupLight => (0.0, 1.04, 255.0),
     };
     let control = !matches!(layer, Layer::Tile | Layer::Plate);
     // Control modules are thicker "lenses": a wider refraction band and a gentle edge brightening.
-    let (band, k) = if layer == Layer::ControlLight {
+    // Pale glass over bright pages: clearly translucent, with the strong lens of the clear glass.
+    let pale = matches!(layer, Layer::ControlInk | Layer::CcPanelInk);
+    let (band, k) = if layer == Layer::ControlLight || pale {
         // Light clear glass: a stronger lens so the backdrop visibly bends at the rim (macOS 27).
         (12.0 * dpr, 13.0 * dpr)
     } else if control {
@@ -374,7 +372,13 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     // Crisper optics for the clear light glass: a tight 1 px specular, a firm dark contour and a
     // fainter bottom glow (the soft glow reads puffy over a light backdrop).
     let clear = layer == Layer::ControlLight;
-    let (rim_w, rim_k, glow_k) = if clear { (0.65, 1.25, 0.07) } else { (1.1, 1.0, 0.16) };
+    let (rim_w, rim_k, glow_k) = if pale {
+        (0.6, 1.3, 0.0)
+    } else if clear {
+        (0.65, 1.25, 0.07)
+    } else {
+        (1.1, 1.0, 0.16)
+    };
     let edge_glow = if control { 0.0 } else { 0.0 };
     // Control material (macOS 27): smoky dark (or milky light) veil over the heavily blurred
     // backdrop, then a thick-glass bevel lit from the top-left.
@@ -401,8 +405,10 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         }
         // Barely-there panel: a slight grey, the tiles dominate.
         Layer::CcPanelLight => ([124.0, 122.0, 121.0], 0.06),
-        Layer::ControlInk => ([206.0, 206.0, 211.0], 0.36),
-        Layer::CcPanelInk => ([238.0, 238.0, 241.0], 0.22),
+        // Bright-page glass: thin grey tints, so the blurred page shows through. Modules carry
+        // more grey than the panel so they separate from it.
+        Layer::ControlInk => ([196.0, 196.0, 203.0], 0.42),
+        Layer::CcPanelInk => ([236.0, 236.0, 240.0], 0.50),
         _ => ([0.0f32; 3], 0.0f32),
     };
     let spec_k = (if dark_ctl { 1.0 - 0.45 * bright } else { 1.0 }) * if panel { 0.6 } else { 1.0 };
@@ -481,11 +487,17 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 let glow = if ny > 0.0 { ny.powf(2.0) * (1.0 - d / 7.0).max(0.0).powf(1.5) * glow_k } else { 0.0 };
                 // Thick-glass sides: darker toward the middle of the left/right edges.
                 // Pale (dark-ink) glass over white pages keeps the shading light, or it turns puffy.
-                let pale = matches!(layer, Layer::ControlInk | Layer::CcPanelInk);
-                let side = (1.0 - top - bottom).clamp(0.0, 1.0) * (1.0 - d / 6.0).max(0.0) * if pale { 0.07 } else { 0.20 };
+                let side = if pale { 0.0 } else { (1.0 - top - bottom).clamp(0.0, 1.0) * (1.0 - d / 6.0).max(0.0) * 0.20 };
                 // Dark outer contour right at the silhouette, under the specular.
-                let contour = (1.0 - d / 0.9).max(0.0) * (1.0 - top * 0.8) * if dark_ctl { 0.45 } else if pale { 0.08 } else if clear { 0.32 } else { 0.18 };
-                let add = ((rim + glow) * spec_k).min(0.85);
+                let contour = (1.0 - d / 0.9).max(0.0) * (1.0 - top * 0.8) * if dark_ctl { 0.45 } else if pale { 0.10 } else if clear { 0.32 } else { 0.18 };
+                // Pale glass: a soft white sheen fading out over the top ~30% (thickness, no blobs).
+                let sheen = if pale {
+                    let ty = (j as f32 + 0.5) / ph as f32 / 0.3;
+                    (1.0 - ty).max(0.0).powf(1.6) * if panel { 0.16 } else { 0.30 }
+                } else {
+                    0.0
+                };
+                let add = ((rim + glow) * spec_k + sheen).min(0.85);
                 let mul = 1.0 - side - contour;
                 for v in &mut c {
                     *v = (*v * mul) + (255.0 - *v * mul) * add;
@@ -738,10 +750,10 @@ fn draw_light_rims(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
 /// Bright-backdrop panel shadow: soft but visible all around, a little heavier below, so the
 /// panel lifts off a white page.
 fn draw_soft_panel_shadow(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
-    for i in 1..=6 {
+    for i in 1..=5 {
         let g = i as f32 * 1.1;
         let sh = RectF { x: rect.x - g * 0.5, y: rect.y + 0.4 + g * 0.3, w: rect.w + g, h: rect.h + g * 0.5 };
-        r.fill_rounded_rect(sh, radius + g * 0.5, 0x0000_0007)?;
+        r.fill_rounded_rect(sh, radius + g * 0.5, 0x0000_0005)?;
     }
     Ok(())
 }
@@ -751,9 +763,11 @@ fn draw_soft_panel_shadow(r: &mut Renderer, rect: RectF, radius: f32) -> Result<
 fn draw_ink_rims(r: &mut Renderer, rect: RectF, radius: f32, contour: u32) -> Result<()> {
     let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
     let edge = RectF { x: x + 0.5, y: y + 0.5, w: (w - 1.0).max(0.0), h: (h - 1.0).max(0.0) };
-    r.stroke_rounded_rect(edge, (radius - 0.5).max(0.0), contour, 1.0)?;
+    // Contour a touch heavier at the bottom (thickness), lighter at the lit top.
+    r.stroke_rounded_rect_linear(edge, (radius - 0.5).max(0.0), (x, y), contour & !0xFF | (contour & 0xFF) * 3 / 5, (x, y + h), contour, 1.0)?;
+    // Crisp specular just inside the silhouette, bright on top, gone by mid-height.
     let inner = RectF { x: x + 1.5, y: y + 1.5, w: (w - 3.0).max(0.0), h: (h - 3.0).max(0.0) };
-    r.stroke_rounded_rect_linear(inner, (radius - 1.5).max(0.0), (x, y), 0xFFFF_FFB4, (x, y + h * 0.5), 0xFFFF_FF00, 1.0)
+    r.stroke_rounded_rect_linear(inner, (radius - 1.5).max(0.0), (x, y), 0xFFFF_FFF0, (x, y + h * 0.5), 0xFFFF_FF00, 1.0)
 }
 
 /// Crisp 1.25 px specular rim (brightest top-left, faint at the bottom), a thin inner highlight
