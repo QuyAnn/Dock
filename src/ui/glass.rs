@@ -52,6 +52,10 @@ pub enum Layer {
     Control,
     /// Control Center modules in the light appearance: same clear glass, slightly brighter veil.
     ControlLight,
+    /// The large Control Center panel behind the modules (dark appearance): thinner smoky veil.
+    CcPanel,
+    /// The Control Center panel in the light appearance: a subtle milky veil.
+    CcPanelLight,
 }
 
 /// Uniform corner radius for tiles and plates (continuous-looking at 34 DIP height).
@@ -123,6 +127,8 @@ pub fn draw_glass(r: &mut Renderer, rect: RectF, radius: f32, layer: Layer, hove
                 Layer::Plate => 0xB4AA_A04D,
                 Layer::Control => 0xFFFF_FF2A,
                 Layer::ControlLight => 0xFFFF_FF40,
+                Layer::CcPanel => 0x2C2C_3070,
+                Layer::CcPanelLight => 0xF2F2_F680,
                 Layer::Tile => 0x8C84_7C59,
             },
         )?,
@@ -296,14 +302,17 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         // Control Center: a ~8% white veil, no extra saturation; dim only very bright backdrops.
         Layer::Control => (0.0, 1.08, 150.0),
         Layer::ControlLight => (0.0, 1.05, 255.0),
+        Layer::CcPanel => (0.0, 1.06, 175.0),
+        Layer::CcPanelLight => (0.0, 1.04, 255.0),
     };
-    let control = matches!(layer, Layer::Control | Layer::ControlLight);
+    let control = matches!(layer, Layer::Control | Layer::ControlLight | Layer::CcPanel | Layer::CcPanelLight);
     // Control modules are thicker "lenses": a wider refraction band and a gentle edge brightening.
     let (band, k) = if control { (11.0 * dpr, 9.0 * dpr) } else { (band, k) };
     let edge_glow = if control { 0.0 } else { 0.0 };
     // Control material (macOS 27): smoky dark (or milky light) veil over the heavily blurred
     // backdrop, then a thick-glass bevel lit from the top-left.
-    let dark_ctl = layer == Layer::Control;
+    let dark_ctl = matches!(layer, Layer::Control | Layer::CcPanel);
+    let panel = matches!(layer, Layer::CcPanel | Layer::CcPanelLight);
     // Backdrop brightness under this piece (0 = dark window, 1 = white document). Dark glass must
     // stay smoky over bright content: the veil thickens and darkens and the speculars calm down,
     // so a module over a white IDE reads like the same module over a dark window.
@@ -319,11 +328,21 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
             let g = 246.0 - 16.0 * bright;
             ([g, g, g + 4.0], 0.30 + 0.12 * bright)
         }
+        // The panel is a lighter smoke than the modules (~30%), thickening on bright content so the
+        // modules on top still read as darker, distinct pieces.
+        Layer::CcPanel => {
+            let g = 58.0 - 18.0 * bright;
+            ([g, g, g + 6.0], 0.30 + 0.32 * bright)
+        }
+        Layer::CcPanelLight => {
+            let g = 244.0 - 10.0 * bright;
+            ([g, g, g + 4.0], 0.20 + 0.10 * bright)
+        }
         _ => ([0.0f32; 3], 0.0f32),
     };
-    let spec_k = if dark_ctl { 1.0 - 0.45 * bright } else { 1.0 };
+    let spec_k = (if dark_ctl { 1.0 - 0.45 * bright } else { 1.0 }) * if panel { 0.6 } else { 1.0 };
     // Dark glass never ends up lighter than this mean, whatever is behind it.
-    let target = if dark_ctl { target - 62.0 * bright } else { target };
+    let target = if dark_ctl { target - if panel { 70.0 } else { 62.0 } * bright } else { target };
     let mut rgb = vec![0f32; (w * h * 3) as usize];
     let mut alpha = vec![0u8; (w * h) as usize];
     let (mut lum_sum, mut lum_n) = (0f32, 0f32);
@@ -551,6 +570,23 @@ pub fn control_dark() -> bool {
 /// very soft shadow make it read as a thick lens. Separate from dock tiles and popup cards.
 pub fn draw_control_card(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
     draw_glass_surface(r, rect, radius, true)
+}
+
+/// The large Control Center panel behind all modules: the same material family with a thinner
+/// veil, softer rims and a tight shadow, so the modules on top stay distinct.
+pub fn draw_control_panel(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
+    if rect.w < 1.0 || rect.h < 1.0 {
+        return Ok(());
+    }
+    let radius = radius.min(rect.w / 2.0).min(rect.h / 2.0);
+    let dark = control_dark();
+    draw_control_shadow(r, rect, radius)?;
+    let layer = if dark { Layer::CcPanel } else { Layer::CcPanelLight };
+    match piece_for(rect, radius, layer) {
+        Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
+        None => r.fill_rounded_rect(rect, radius, if dark { 0x2C2C_30A0 } else { 0xF2F2_F6B0 })?,
+    }
+    draw_control_rims(r, rect, radius, if dark { 0.7 } else { 0.85 })
 }
 
 /// Shared surface for every popup panel (widget/data popups, menus, calendar, gallery, tray):

@@ -121,8 +121,9 @@ const OUTPUT_INSET: f32 = 10.0;
 /// sub-page opens in place instead of floating bare at the top of the popup window.
 fn outputs_card(rect: RectF) -> RectF {
     let n = OUTPUTS.with(|o| o.borrow().as_ref().map_or(0, Vec::len)).max(1) as f32;
-    let h = (OUTPUT_INSET * 2.0 + OUTPUT_HEAD_H + 6.0 + n * OUTPUT_ROW_H + (n - 1.0) * 6.0).min(rect.h - 2.0 * PAD);
-    RectF { x: rect.x + PAD, y: rect.y + rect.h - PAD - h, w: rect.w - 2.0 * PAD, h }
+    let h = (OUTPUT_INSET * 2.0 + OUTPUT_HEAD_H + 6.0 + n * OUTPUT_ROW_H + (n - 1.0) * 6.0).min(rect.h - 2.0 * EDGE);
+    // Same footprint edges as the main panel background (it replaces it; no double glass).
+    RectF { x: rect.x + EDGE, y: rect.y + rect.h - EDGE - h, w: rect.w - 2.0 * EDGE, h }
 }
 
 fn outputs_back(rect: RectF) -> RectF {
@@ -137,7 +138,7 @@ fn output_row(rect: RectF, i: usize) -> RectF {
 
 fn draw_outputs(r: &mut Renderer, rect: RectF, list: &[system::AudioOutput]) -> Result<()> {
     // Same smoky glass as the main modules (blurred backdrop, bevel rim, shadow).
-    draw_module(r, outputs_card(rect), CARD_R)?;
+    draw_module(r, outputs_card(rect), PANEL_R)?;
     let back = outputs_back(rect);
     let chev = RectF { x: back.x, y: back.y, w: 20.0, h: back.h };
     draw_glyph(r, chev, Glyph::Back, 14.0, text())?;
@@ -214,9 +215,17 @@ pub fn apply(action: ControlAction) -> Result<()> {
 
 /// Nominal popup dimensions. The one-DIP client inset leaves a 60-DIP grid unit (11-DIP gaps) at
 /// 100% scale, the macOS 27 proportions: tall capsules, big badges and type.
-pub const WIDTH: f32 = 290.0;
-pub const HEIGHT: f32 = 471.0;
-const PAD: f32 = 8.0;
+/// Popup window size: the panel plus `EDGE` of room for its shadow on every side.
+pub const WIDTH: f32 = 308.0;
+pub const HEIGHT: f32 = 489.0;
+/// Window edge to the panel background (room for its tight shadow).
+const EDGE: f32 = 4.0;
+/// Panel background edge to the modules, like macOS's Control Center padding.
+const PANEL_PAD: f32 = 13.0;
+/// Window edge to the modules.
+const PAD: f32 = EDGE + PANEL_PAD;
+/// Corner radius of the panel background.
+const PANEL_R: f32 = 30.0;
 const GAP: f32 = 11.0;
 const SLIDER_CARD_H: f32 = 60.0;
 const SETTINGS_H: f32 = 28.0;
@@ -492,6 +501,10 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     if let Some(done) = OUTPUTS.with(|o| o.borrow().as_ref().map(|l| draw_outputs(r, rect, l))) {
         return done;
     }
+    // One large blurred glass panel behind every module (macOS Control Center); the modules
+    // keep their thicker glass on top.
+    let panel = RectF { x: rect.x + EDGE, y: rect.y + EDGE, w: rect.w - 2.0 * EDGE, h: rect.h - 2.0 * EDGE };
+    super::glass::draw_control_panel(r, panel, PANEL_R)?;
     let l = layout(rect);
 
     // Wi-Fi tile: always the Wi-Fi radio, subtitled with the network name like macOS.
