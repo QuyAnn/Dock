@@ -841,18 +841,13 @@ pub fn shelf_for_edge(edge: AbEdge, first: RectF, last: RectF) -> RectF {
 }
 
 const SHELF_PAD: f32 = 7.0;
-const SHELF_RADIUS: f32 = 12.0;
-
-/// One continuous, very light liquid-glass capsule behind the icon group (macOS Tahoe dock).
+/// The centre cluster's capsule uses the same glass, radius and rims as every other dock
+/// section (widgets, tray, clock), so all sections read as one height: the old very light
+/// shelf had near-invisible rims and looked shorter than its 42 DIP (only the icons showed).
 fn draw_shelf(r: &mut Renderer, rc: RectF) -> Result<()> {
     let scale = r.dpi() as f32 / 96.0;
     let rc = snap_to_pixels(rc, scale);
-    r.fill_rounded_rect(rc, SHELF_RADIUS, 0xFFFF_FF12)?;
-    // 1 px rims are stroked half a device pixel inside the edge so each rim lands on
-    // exactly one pixel row/column (crisp, and nothing bleeds into the bar margin).
-    let half = 0.5 / scale;
-    let rim = RectF { x: rc.x + half, y: rc.y + half, w: rc.w - 2.0 * half, h: rc.h - 2.0 * half };
-    super::glass::draw_highlights(r, rim, SHELF_RADIUS - half, 0.75)
+    super::glass::draw_glass(r, rc, super::glass::GLASS_RADIUS, super::glass::Layer::Tile, false)
 }
 
 /// Rounds a DIP rect's edges to whole device pixels at `scale` (DPI / 96).
@@ -994,6 +989,29 @@ mod tests {
         let left = layout_edge(AbEdge::Left, &l, &c, &r, 1000.0);
         let right = layout_edge(AbEdge::Right, &l, &c, &r, 1000.0);
         assert!(left[l.len()].x > right[l.len()].x);
+    }
+
+    #[test]
+    fn dock_layout_all_sections_share_one_height_on_every_edge() {
+        // Widgets, the centre capsule (Start .. apps) and tray/status/clock tiles all have the
+        // same thickness and the same position across the dock, on every edge.
+        for edge in [AbEdge::Bottom, AbEdge::Top, AbEdge::Left, AbEdge::Right] {
+            let (l, c, r) = home_zones(6);
+            let len = if edge.vertical() { 1032.0 } else { 1920.0 };
+            let rects = layout_edge(edge, &l, &c, &r, len);
+            let ids: Vec<&str> = l.iter().chain(&c).chain(&r).map(|t| t.id).collect();
+            let across = |rc: &RectF| if edge.vertical() { (rc.x, rc.w) } else { (rc.y, rc.h) };
+            let shelf = shelf_for_edge(edge, rects[l.len()], rects[l.len() + c.len() - 1]);
+            let want = across(&shelf);
+            assert!((want.1 - TILE_H).abs() < 1e-4, "{edge:?} shelf {shelf:?}");
+            for (id, rc) in ids.iter().zip(&rects) {
+                if id.starts_with("sep") || rc.w <= 0.0 || rc.h <= 0.0 {
+                    continue;
+                }
+                let got = across(rc);
+                assert!((got.0 - want.0).abs() < 1e-4 && (got.1 - want.1).abs() < 1e-4, "{edge:?} {id} {rc:?} vs shelf {shelf:?}");
+            }
+        }
     }
 
     #[test]
