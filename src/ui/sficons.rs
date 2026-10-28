@@ -49,6 +49,15 @@ pub fn bars_for(quality: u8) -> u8 {
 }
 
 /// Volume to speaker waves: 0 when silent, then 1/2/3 by thirds.
+/// Volume at or below this counts as silent: the slider there mutes (as on macOS), and the
+/// speaker shows the muted glyph even when the endpoint itself is not muted.
+pub const MUTE_AT: f32 = 0.005;
+
+/// Whether the speaker should read as muted: muted endpoint, or volume at zero.
+pub fn shows_muted(volume: f32, muted: bool) -> bool {
+    muted || volume <= MUTE_AT
+}
+
 pub fn waves_for(volume: f32) -> u8 {
     let v = volume.clamp(0.0, 1.0);
     if v <= 0.005 {
@@ -151,6 +160,7 @@ pub fn draw_speaker(r: &mut Renderer, rect: RectF, volume: f32, muted: bool, rgb
     use super::ccicons::{self, Icon};
     // Cone plus three waves span ~19.2 of 24 grid units wide and 14.1 tall.
     let size = (rect.w * 24.0 / 19.2).min(rect.h * 24.0 / 14.1);
+    let muted = shows_muted(volume, muted);
     let icon = Icon::Speaker { waves: if muted { 0 } else { waves_for(volume) }, muted };
     ccicons::draw(r, icon, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0, size, rgba)
 }
@@ -158,6 +168,15 @@ pub fn draw_speaker(r: &mut Renderer, rect: RectF, volume: f32, muted: bool, rgb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_volume_reads_as_muted() {
+        assert!(shows_muted(0.0, false));
+        assert!(shows_muted(0.004, false));
+        assert!(!shows_muted(0.01, false));
+        assert!(shows_muted(0.5, true));
+        assert!(!shows_muted(0.34, false));
+    }
 
     #[test]
     fn dock_layout_status_icon_levels() {

@@ -196,7 +196,20 @@ pub fn apply(action: ControlAction) -> Result<()> {
             let (_, muted) = system::get_volume();
             system::set_mute(!muted)
         }
-        ControlAction::SetVolume(v) => system::set_volume(v),
+        // macOS-like: the slider at 0 mutes; any level above unmutes. Unmute before raising and
+        // zero before muting, so the endpoint callback never reports a loud-but-muted or
+        // audible-at-zero intermediate state.
+        ControlAction::SetVolume(v) => {
+            if v <= sficons::MUTE_AT {
+                system::set_volume(0.0)?;
+                system::set_mute(true)
+            } else {
+                if system::get_volume().1 {
+                    system::set_mute(false)?;
+                }
+                system::set_volume(v)
+            }
+        }
         ControlAction::SetBrightness(p) => system::set_brightness(p),
         ControlAction::ToggleWifi => {
             let on = system::wifi_enabled().ok_or_else(|| Error::from(E_NOTIMPL))?;
@@ -1240,13 +1253,14 @@ fn draw_module_at(r: &mut Renderer, m: Module, rc: RectF, state: &ControlState, 
         Module::Volume => {
             // The small icon at left toggles mute.
             let vol = state.volume.clamp(0.0, 1.0);
-            let vol_text = if state.muted { "Đã tắt tiếng".to_string() } else { format!("{}%", (vol * 100.0).round() as u32) };
+            let silent = sficons::shows_muted(vol, state.muted);
+            let vol_text = if silent { "Đã tắt tiếng".to_string() } else { format!("{}%", (vol * 100.0).round() as u32) };
             draw_cap(r, rc, "Âm thanh", &vol_text)?;
             // "Âm thanh ›": the chevron sits right after the measured title.
             let head = head_of(rc);
             let title_w = r.measure_text("Âm thanh", TITLE_PT, TextStyle::SemiBold).unwrap_or(62.0);
             draw_glyph(r, RectF { x: head.x + title_w + 3.0, y: head.y, w: 12.0, h: head.h }, Glyph::Chevron, 12.0, sub())?;
-            draw_capsule(r, slider_of(rc), vol, true, speaker(0.0, state.muted), speaker(1.0, false))
+            draw_capsule(r, slider_of(rc), vol, true, speaker(0.0, silent), speaker(1.0, false))
         }
         // Microphone: lit (blue) with a slashed glyph while muted.
         Module::Mic => {

@@ -1616,15 +1616,11 @@ fn set_volume_live(v: f32) {
             if let Some(app) = slot.as_ref() {
                 let mut c = app.shared.control.lock().unwrap();
                 c.volume = v;
-                if v > 0.0 {
-                    c.muted = false;
-                }
+                c.muted = v <= ui::sficons::MUTE_AT;
             }
         }
     });
-    if v > 0.0 {
-        let _ = win::system::set_mute(false);
-    }
+    // live_apply mutes at 0 and unmutes above it.
     live_apply(control_center::ControlAction::SetVolume(v));
     repaint();
 }
@@ -2731,7 +2727,10 @@ fn on_popup_drag(phase: popup::DragPhase, x: f32, _y: f32) -> bool {
     CONTROL_VIEW.with(|c| {
         if let Some(st) = c.borrow_mut().as_mut() {
             match action {
-                control_center::ControlAction::SetVolume(v) => st.volume = v,
+                control_center::ControlAction::SetVolume(v) => {
+                    st.volume = v;
+                    st.muted = v <= ui::sficons::MUTE_AT;
+                }
                 control_center::ControlAction::SetBrightness(p) => st.brightness = Some(p),
                 _ => {}
             }
@@ -2785,7 +2784,7 @@ fn on_popup_wheel(x: f32, y: f32, notches: f32) {
             match action {
                 control_center::ControlAction::SetVolume(v) => {
                     st.volume = v;
-                    st.muted = false;
+                    st.muted = v <= ui::sficons::MUTE_AT;
                 }
                 control_center::ControlAction::SetBrightness(p) => st.brightness = Some(p),
                 _ => {}
