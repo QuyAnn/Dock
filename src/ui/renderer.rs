@@ -493,12 +493,16 @@ impl Renderer {
         let wide: Vec<u16> = text.encode_utf16().collect();
         if text_shadow_for(rgba) {
             // Very subtle drop shadow under white ink on clear glass.
-            Self::set_color(brush, ((rgba & 0xFF) * 0x38 / 0xFF).max(1));
-            let sr = d2d_rect(RectF { y: rect.y + 0.6, ..rect });
-            // SAFETY: slices and rect live for the call.
-            unsafe {
-                rt.DrawText(&wide, &format, &sr, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL)
-            };
+            // Soft halo: below plus both sides, so white ink stays readable over clear glass
+            // with code or a photo showing through.
+            for (dx, dy, a) in [(0.0, 0.8, 0x50u32), (-0.6, 0.2, 0x26), (0.6, 0.2, 0x26)] {
+                Self::set_color(brush, ((rgba & 0xFF) * a / 0xFF).max(1));
+                let sr = d2d_rect(RectF { x: rect.x + dx, y: rect.y + dy, ..rect });
+                // SAFETY: slices and rect live for the call.
+                unsafe {
+                    rt.DrawText(&wide, &format, &sr, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP, DWRITE_MEASURING_MODE_NATURAL)
+                };
+            }
         }
         Self::set_color(brush, rgba);
         let r = d2d_rect(rect);

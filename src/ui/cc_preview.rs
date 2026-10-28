@@ -65,7 +65,9 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
     let mut frost = liquid::render_frost_with(&grab, full, SCALE as f32, &liquid::CONTROL_LENS);
     // Live popups measure only the area behind the panel; do the same here.
     let behind = RectF { x: (CANVAS_W as f32 - PANEL_RIGHT - control_center::WIDTH) * SCALE as f32, y: PANEL_TOP * SCALE as f32, w: control_center::WIDTH * SCALE as f32, h: panel_h * SCALE as f32 };
-    if bright_behind(&frost, behind) {
+    // Detail frost for every backdrop, like `liquid::add_bright_detail` on the live popup.
+    let _ = bright_behind(&frost, behind);
+    {
         let detail = liquid::render_frost_with(&grab, full, SCALE as f32, &liquid::BRIGHT_DETAIL_LENS);
         if detail.w == frost.w && detail.h == frost.h {
             frost.plain = detail.rgba;

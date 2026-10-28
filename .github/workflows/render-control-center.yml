@@ -77,6 +77,29 @@ jobs:
           $bitmap.Save("render-inputs/white_ide.jpg", [System.Drawing.Imaging.ImageFormat]::Jpeg)
           $bitmap.Dispose()
           New-Gradient "render-inputs/dark.jpg" "#193250" "#050A13"
+          # A dark VS Code-like editor at 2x (~13 px code at 1x): syntax-coloured Java lines.
+          $bitmap = [System.Drawing.Bitmap]::new(1620, 1140)
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+          $graphics.Clear([System.Drawing.Color]::FromArgb(30, 30, 30))
+          $graphics.FillRectangle([System.Drawing.SolidBrush]::new([System.Drawing.Color]::FromArgb(37, 37, 38)), 0, 0, 120, 1140)
+          $code = [System.Drawing.Font]::new("Consolas", 26, [System.Drawing.GraphicsUnit]::Pixel)
+          $cols = @([System.Drawing.Color]::FromArgb(86, 156, 214), [System.Drawing.Color]::FromArgb(220, 220, 170), [System.Drawing.Color]::FromArgb(206, 145, 120),
+                    [System.Drawing.Color]::FromArgb(156, 220, 254), [System.Drawing.Color]::FromArgb(78, 201, 176), [System.Drawing.Color]::FromArgb(212, 212, 212), [System.Drawing.Color]::FromArgb(106, 153, 85))
+          $parts = @("private ", "void ", "validate", "(item.getNum(), ", "ResponseCode", ".H2H_FILE_UPLOAD_17, ", "// check")
+          for ($i = 0; $i -lt 30; $i++) {
+            $x = 160 + ($i % 5) * 40
+            for ($k = 0; $k -lt 7; $k++) {
+              $t = $parts[($k + $i) % 7]
+              $b = [System.Drawing.SolidBrush]::new($cols[($k + $i) % 7])
+              $graphics.DrawString($t, $code, $b, $x, 14 + $i * 37)
+              $x += $graphics.MeasureString($t, $code).Width - 6
+              $b.Dispose()
+            }
+          }
+          $graphics.Dispose()
+          $bitmap.Save("render-inputs/dark_ide.jpg", [System.Drawing.Imaging.ImageFormat]::Jpeg)
+          $bitmap.Dispose()
           # A light web page like a real browser at 100%: white page, grey nav, cards with real
           # body text, a teal image block and a blue button (drawn at 2x so text is ~14 px at 1x).
           $bitmap = [System.Drawing.Bitmap]::new(1620, 1140)
@@ -219,6 +242,18 @@ jobs:
           # backdrop and blur as the real popup on a 100% / 125% / 150% screen.
           foreach ($wp in @("web_page", "user_mint", "white_ide", "wp_white", "user_desktop")) {
             foreach ($sc in @("1", "1.25", "1.5")) {
+              $env:SMARTDOCK_CC_LIVE = $sc
+              $tag = $sc.Replace(".", "")
+              foreach ($mode in @("light", "dark")) {
+                $r = Invoke-Render "render-output\cc_live_${wp}_${mode}_$tag.png" "render-inputs\$wp.jpg" $mode
+                if ($r) { $failures += $r }
+              }
+              Remove-Item Env:SMARTDOCK_CC_LIVE
+            }
+          }
+          # Dark / photo / colourful backdrops through the live path at 100% and 125%.
+          foreach ($wp in @("dark_ide", "dark_ui", "wp_black", "wp_navy", "wp_colorful", "wp_nature", "wp_city", "ocean")) {
+            foreach ($sc in @("1", "1.25")) {
               $env:SMARTDOCK_CC_LIVE = $sc
               $tag = $sc.Replace(".", "")
               foreach ($mode in @("light", "dark")) {

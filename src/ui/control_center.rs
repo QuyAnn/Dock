@@ -962,8 +962,13 @@ type Glyph = super::ccicons::Icon;
 /// subtle drop shadow as the text (macOS lifts white glyphs off the glass).
 fn draw_glyph(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, rgba: u32) -> Result<()> {
     if super::renderer::text_shadow_for(rgba) {
-        let a = ((rgba & 0xFF) * 0x30 / 0xFF).max(1);
-        super::ccicons::draw_in(r, glyph, RectF { y: rect.y + 0.6, ..rect }, size, a)?;
+        // Clear glass shows the page behind: a soft dark halo (below + both sides) keeps white
+        // glyphs readable without a heavy tint.
+        let a = ((rgba & 0xFF) * 0x48 / 0xFF).max(1);
+        super::ccicons::draw_in(r, glyph, RectF { y: rect.y + 0.8, ..rect }, size, a)?;
+        let a = ((rgba & 0xFF) * 0x22 / 0xFF).max(1);
+        super::ccicons::draw_in(r, glyph, RectF { x: rect.x - 0.6, ..rect }, size, a)?;
+        super::ccicons::draw_in(r, glyph, RectF { x: rect.x + 0.6, ..rect }, size, a)?;
     }
     super::ccicons::draw_in(r, glyph, rect, size, rgba)
 }
@@ -1071,7 +1076,9 @@ pub fn draw(r: &mut Renderer, rect: RectF, state: &ControlState, media: Option<&
     super::glass::set_control_dark(state.dark);
     super::glass::update_control_ink(rect);
     super::renderer::set_text_shadow(white_ink());
+    super::glass::set_cc_clear(true);
     let result = draw_panel(r, rect, state, media);
+    super::glass::set_cc_clear(false);
     super::renderer::set_text_shadow(false);
     result
 }

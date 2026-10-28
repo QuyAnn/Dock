@@ -90,9 +90,9 @@ pub fn add_bright_detail(frost: &mut LiquidBitmap, grab: &ScreenGrab, rect: Rect
         sum += 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
         cnt += 1.0;
     }
-    if sum / cnt < 175.0 {
-        return;
-    }
+    // Kept for every backdrop brightness: the dark/normal Control Center glass is clear too
+    // (`glass::set_cc_clear`); the mean is still computed for callers' logging/tests.
+    let _mean = sum / cnt;
     let detail = render_frost_with(grab, rect, dpr, &BRIGHT_DETAIL_LENS);
     if detail.w == frost.w && detail.h == frost.h {
         frost.plain = detail.rgba;

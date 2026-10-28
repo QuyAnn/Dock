@@ -331,7 +331,11 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     let hy = ph as f32 / 2.0;
     let r = radius.min(hx).min(hy);
     // Pale glass over a bright page refracts the lightly blurred detail frost when there is one.
-    let src: &[u8] = if matches!(layer, Layer::ControlInk | Layer::CcPanelInk) && bg.plain.len() == bg.rgba.len() {
+    let pale_layer = matches!(layer, Layer::ControlInk | Layer::CcPanelInk);
+    let cc_layer = matches!(layer, Layer::Control | Layer::ControlLight | Layer::CcPanel | Layer::CcPanelLight);
+    // Clear dark/normal Control Center glass: the same light detail frost as the bright page.
+    let clear_dark = cc_layer && cc_clear() && bg.plain.len() == bg.rgba.len();
+    let src: &[u8] = if (pale_layer || clear_dark) && bg.plain.len() == bg.rgba.len() {
         &bg.plain
     } else {
         &bg.rgba
@@ -370,6 +374,9 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     let (band, k) = if pale {
         // Bright-page glass: a thin lens at the rim only; a deep band reads as a puffy bubble.
         (8.0 * dpr, 6.0 * dpr)
+    } else if clear_dark {
+        // Clear glass over a sharp backdrop: a thin rim lens so code/text is not smeared.
+        (9.0 * dpr, 7.0 * dpr)
     } else if layer == Layer::ControlLight {
         // Light clear glass: a stronger lens so the backdrop visibly bends at the rim (macOS 27).
         (12.0 * dpr, 13.0 * dpr)
@@ -398,16 +405,27 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     // so a module over a white IDE reads like the same module over a dark window.
     let bright = if control { backdrop_brightness(bg, px, py, pw, ph) } else { 0.0 };
     let (veil, veil_a) = match layer {
+        // Clear dark glass: a light smoke that thickens only over bright content, so a dark
+        // editor stays readable behind it; white ink carries a soft halo instead.
+        Layer::Control if clear_dark => {
+            let g = 60.0 - 20.0 * bright;
+            ([g, g, g + 6.0], 0.30 + 0.34 * bright)
+        }
         Layer::Control => {
             let g = 72.0 - 24.0 * bright;
             ([g, g, g + 6.0], 0.63 + 0.22 * bright)
         }
+        Layer::ControlLight if clear_dark => ([112.0, 110.0, 112.0], 0.20 + 0.26 * bright),
         // Light glass stays milky; over very bright content it adds a touch of grey body so the
         // module edge and the dark ink still separate from a white page.
         // Clear light glass: a thin neutral-grey veil, so the blurred backdrop shows through.
         Layer::ControlLight => ([110.0, 106.0, 105.0], 0.50),
         // The panel is a lighter smoke than the modules (~30%), thickening on bright content so the
         // modules on top still read as darker, distinct pieces.
+        Layer::CcPanel if clear_dark => {
+            let g = 54.0 - 16.0 * bright;
+            ([g, g, g + 6.0], 0.16 + 0.30 * bright)
+        }
         Layer::CcPanel => {
             let g = 58.0 - 18.0 * bright;
             ([g, g, g + 6.0], 0.30 + 0.32 * bright)
@@ -662,6 +680,21 @@ pub fn set_control_dark(dark: bool) {
 }
 
 /// Light Control Center over a very bright backdrop: dark ink instead of white.
+thread_local! {
+    /// Set while the Control Center modules/panel are painted: every CC layer then refracts the
+    /// lightly blurred detail frost (clear glass), not only the bright-page ink layers. Other
+    /// popups sharing the backdrop keep the heavy frost.
+    static CC_CLEAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn set_cc_clear(on: bool) {
+    CC_CLEAR.with(|c| c.set(on));
+}
+
+fn cc_clear() -> bool {
+    CC_CLEAR.with(std::cell::Cell::get)
+}
+
 static CONTROL_INK_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn control_ink_dark() -> bool {
