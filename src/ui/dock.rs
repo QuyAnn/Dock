@@ -696,8 +696,9 @@ fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
     )
 }
 
-/// Git tile cell colours (0xRRGGBBAA): empty days dark grey, then GitHub-style greens.
-const GIT_EMPTY: u32 = 0x8A8A_9259;
+/// Git tile cell colours (0xRRGGBBAA): empty days a translucent grey (lighter than dark glass,
+/// darker than light glass), then GitHub-style greens.
+const GIT_EMPTY: u32 = 0x5A5A_60A6;
 const GIT_LEVELS: [u32; 4] = [0x1F6F_3AFF, 0x2EA0_43FF, 0x39D3_53FF, 0x6CEB_83FF];
 const GIT_ROWS: usize = 3;
 const GIT_CELL: f32 = 6.0;
