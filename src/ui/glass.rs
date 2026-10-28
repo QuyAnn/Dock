@@ -261,19 +261,20 @@ pub fn release_backdrop(bg: &Arc<LiquidBitmap>) {
     });
 }
 
-/// Light-appearance glass (macOS 27 light Control Center): flat, no bevel, lens or shading. The
-/// panel is a light grey frost over the blurred backdrop; a module is the same frost, lifted
-/// toward white over darker backdrops (a ~45% white veil) and a few percent darker over bright
-/// ones (white windows), so it separates from the panel without any shadow.
-fn render_light_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f32, module: bool) -> Piece {
+/// Flat frosted material (no bevel, lens or shading): light popups, and the Control Center over
+/// bright backdrops (white or light grey pages).
+fn render_light_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f32, layer: Layer) -> Piece {
+    // Bright-backdrop materials are flat frosted greys: the panel a light grey, modules clearly
+    // darker than it, so both separate from a white page without any soft shading.
+    let (veil, veil_a): ([f32; 3], f32) = match layer {
+        Layer::CcPanelInk => ([233.0, 233.0, 236.0], 0.88),
+        Layer::ControlInk => ([218.0, 218.0, 223.0], 0.92),
+        _ => ([236.0; 3], 0.58),
+    };
     let (w, h) = (pw.max(1) as u32, ph.max(1) as u32);
-    let bright = backdrop_brightness(bg, px, py, pw, ph);
     let (hx, hy) = (pw as f32 / 2.0, ph as f32 / 2.0);
     let r = radius.min(hx).min(hy);
     let mut out = vec![0u8; (w * h * 4) as usize];
-    let (veil, veil_a) = (236.0f32, 0.58f32);
-    let lift = 0.45 * (1.0 - bright);
-    let shade = 1.0 - 0.075 * bright;
     for j in 0..ph {
         let ly = j as f32 + 0.5 - hy;
         let sy = ((py + j).max(0) as usize).min(bg.h as usize - 1);
@@ -292,11 +293,7 @@ fn render_light_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, rad
             let src = (sy * bg.w as usize + sx) * 4;
             for c in 0..3 {
                 let mut v = bg.rgba[src + c] as f32;
-                v += (veil - v) * veil_a;
-                if module {
-                    v += (255.0 - v) * lift;
-                    v *= shade;
-                }
+                v += (veil[c] - v) * veil_a;
                 out[o + c] = v.round().clamp(0.0, 255.0) as u8;
             }
             out[o + 3] = (cov * 255.0 + 0.5) as u8;
@@ -330,8 +327,8 @@ fn backdrop_brightness(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32) ->
 /// CPU render of one glass piece (straight RGBA, `pw` x `ph`).
 #[allow(clippy::too_many_arguments)]
 fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f32, dpr: f32, layer: Layer) -> Piece {
-    if layer == Layer::PopupLight {
-        return render_light_piece(bg, px, py, pw, ph, radius, false);
+    if matches!(layer, Layer::PopupLight | Layer::ControlInk | Layer::CcPanelInk) {
+        return render_light_piece(bg, px, py, pw, ph, radius, layer);
     }
     let (w, h) = (pw as u32, ph as u32);
     let band = 7.0 * dpr;
@@ -646,7 +643,7 @@ pub fn update_control_ink(rect: RectF) {
             c.borrow().as_ref().is_some_and(|ctx| {
                 let (px, py) = ((rect.x * ctx.sx) as i32, (rect.y * ctx.sy) as i32);
                 let (pw, ph) = ((rect.w * ctx.sx) as i32, (rect.h * ctx.sy) as i32);
-                backdrop_brightness(&ctx.bg, px, py, pw, ph) > 0.86
+                backdrop_brightness(&ctx.bg, px, py, pw, ph) > 0.74
             })
         });
     CONTROL_INK_DARK.store(ink, std::sync::atomic::Ordering::Relaxed);
@@ -687,7 +684,10 @@ pub fn draw_control_panel(r: &mut Renderer, rect: RectF, radius: f32) -> Result<
         Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
         None => r.fill_rounded_rect(rect, radius, if dark { 0x2C2C_30A0 } else { 0x7C7A_7814 })?,
     }
-    draw_control_rims(r, rect, radius, if dark { 0.7 } else if ink { 0.8 } else { 0.35 })
+    if !dark && ink {
+        return draw_ink_rims(r, rect, radius, 0x0000_001A);
+    }
+    draw_control_rims(r, rect, radius, if dark { 0.7 } else { 0.35 })
 }
 
 /// Shared surface for every popup panel (widget/data popups, menus, calendar, gallery, tray):
@@ -719,6 +719,9 @@ fn draw_glass_surface(r: &mut Renderer, rect: RectF, radius: f32, shadow: bool, 
         Some(p) => r.draw_bitmap(p.w, p.h, &p.rgba, rect)?,
         None => r.fill_rounded_rect(rect, radius, if dark { 0x2C2C_30E0 } else { 0xF2F2_F6E8 })?,
     }
+    if layer == Layer::ControlInk {
+        return draw_ink_rims(r, rect, radius, 0x0000_0016);
+    }
     if layer == Layer::PopupLight { draw_light_rims(r, rect, radius) } else { draw_control_rims(r, rect, radius, if dark { 1.0 } else { 1.25 }) }
 }
 
@@ -732,14 +735,25 @@ fn draw_light_rims(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
     r.stroke_rounded_rect_linear(edge, rr, (x, y), 0xFFFF_FFE6, (x + w * 0.35, y + h), 0xFFFF_FF50, 1.0)
 }
 
-/// Light panel shadow: soft and subtle around the whole panel only.
+/// Bright-backdrop panel shadow: soft but visible all around, a little heavier below, so the
+/// panel lifts off a white page.
 fn draw_soft_panel_shadow(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
-    for i in 1..=4 {
-        let g = i as f32 * 0.9;
-        let sh = RectF { x: rect.x - g * 0.5, y: rect.y + 0.5 + g * 0.35, w: rect.w + g, h: rect.h + g * 0.45 };
-        r.fill_rounded_rect(sh, radius + g * 0.5, 0x0000_0005)?;
+    for i in 1..=6 {
+        let g = i as f32 * 1.1;
+        let sh = RectF { x: rect.x - g * 0.5, y: rect.y + 0.4 + g * 0.3, w: rect.w + g, h: rect.h + g * 0.5 };
+        r.fill_rounded_rect(sh, radius + g * 0.5, 0x0000_0007)?;
     }
     Ok(())
+}
+
+/// Bright-backdrop rims: a crisp 1 px dark contour all round plus a white hairline highlight
+/// along the top inside it. No glow or soft shading.
+fn draw_ink_rims(r: &mut Renderer, rect: RectF, radius: f32, contour: u32) -> Result<()> {
+    let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
+    let edge = RectF { x: x + 0.5, y: y + 0.5, w: (w - 1.0).max(0.0), h: (h - 1.0).max(0.0) };
+    r.stroke_rounded_rect(edge, (radius - 0.5).max(0.0), contour, 1.0)?;
+    let inner = RectF { x: x + 1.5, y: y + 1.5, w: (w - 3.0).max(0.0), h: (h - 3.0).max(0.0) };
+    r.stroke_rounded_rect_linear(inner, (radius - 1.5).max(0.0), (x, y), 0xFFFF_FFB4, (x, y + h * 0.5), 0xFFFF_FF00, 1.0)
 }
 
 /// Crisp 1.25 px specular rim (brightest top-left, faint at the bottom), a thin inner highlight
@@ -772,12 +786,9 @@ pub fn draw_control_active(r: &mut Renderer, rect: RectF, radius: f32, opacity: 
     if !control_dark() {
         // Light appearance: no shadow under the white disc; over a white page a hairline keeps
         // it apart from the pale glass.
-        r.fill_rounded_rect(rect, radius, 0xFFFF_FF00 | alpha)?;
-        if control_ink_dark() {
-            let e = RectF { x: rect.x + 0.5, y: rect.y + 0.5, w: rect.w - 1.0, h: rect.h - 1.0 };
-            r.stroke_rounded_rect(e, (radius - 0.5).max(0.0), alpha * 0x1C / 0xFF, 1.0)?;
-        }
-        return Ok(());
+        // Over a bright page a white disc vanishes: system blue (white glyph) instead.
+        let fill = if control_ink_dark() { 0x0A84_FF00 } else { 0xFFFF_FF00 };
+        return r.fill_rounded_rect(rect, radius, fill | alpha);
     }
     let sh = RectF { y: rect.y + 1.0, ..rect };
     r.fill_rounded_rect(sh, radius, 0x0000_0000 | (alpha * 18 / 255))?;
@@ -788,8 +799,10 @@ pub fn draw_control_active(r: &mut Renderer, rect: RectF, radius: f32, opacity: 
 /// brighter clear disc with a faint rim.
 pub fn draw_control_badge(r: &mut Renderer, rect: RectF, radius: f32) -> Result<()> {
     if !control_dark() && control_ink_dark() {
-        // Dark-ink fallback over a white page: a flat, faintly darker disc.
-        return r.fill_rounded_rect(rect, radius, 0x0000_0010);
+        // Dark-ink fallback over a white page: a flat, slightly darker disc with a crisp edge.
+        r.fill_rounded_rect(rect, radius, 0x0000_0012)?;
+        let e = RectF { x: rect.x + 0.5, y: rect.y + 0.5, w: rect.w - 1.0, h: rect.h - 1.0 };
+        return r.stroke_rounded_rect(e, (radius - 0.5).max(0.0), 0x0000_0012, 1.0);
     }
     r.fill_rounded_rect(rect, radius, 0xFFFF_FF24)?;
     r.stroke_rounded_rect_linear(rect, radius, (rect.x, rect.y), 0xFFFF_FF50, (rect.x, rect.y + rect.h), 0xFFFF_FF10, 1.0)

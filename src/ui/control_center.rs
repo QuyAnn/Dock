@@ -273,12 +273,12 @@ fn sub() -> u32 {
 
 /// Slider track: translucent line.
 fn track() -> u32 {
-    if white_ink() { 0xFFFF_FF3C } else { 0x0000_001C }
+    if white_ink() { 0xFFFF_FF3C } else { 0x0000_001F }
 }
 
 /// Slider fill: a solid bar.
 fn fill() -> u32 {
-    if white_ink() { 0xFFFF_FFFF } else { 0x5A5A_5FFF }
+    if white_ink() { 0xFFFF_FFFF } else { 0x3A3A_3CFF }
 }
 
 /// Bottom shortcut circles: glyph and the URI they open.
@@ -392,6 +392,8 @@ fn draw_round_with(r: &mut Renderer, rect: RectF, glyph: Glyph, size: f32, on: b
         (false, true) => super::glass::draw_control_badge(r, rect, radius)?,
         (false, false) => super::glass::draw_control_card(r, rect, radius)?,
     }
+    // Over a bright page the active disc is system blue, so its glyph turns white.
+    let on_color = if white_ink() { on_color } else { WHITE };
     draw_glyph(r, rect, glyph, size, fade(if on { on_color } else { text() }, icon_k))
 }
 

@@ -126,7 +126,7 @@ jobs:
             if ($r) { $failures += $r }
           }
           # Wallpaper matrix: every test backdrop in both appearances.
-          foreach ($wp in @("wp_black", "wp_white", "wp_grey", "wp_colorful", "wp_city", "wp_sky", "wp_navy", "wp_nature", "wp_bloom",
+          foreach ($wp in @("wp_black", "wp_white", "wp_lightgrey", "wp_grey", "wp_colorful", "wp_city", "wp_sky", "wp_navy", "wp_nature", "wp_bloom",
                             "user_desktop", "macos27_replica", "white_ide", "dark_ui")) {
             foreach ($mode in @("light", "dark")) {
               $r = Invoke-Render "render-output\wall_${wp}_$mode.png" "render-inputs\$wp.jpg" $mode

@@ -9,6 +9,7 @@ def lerp(a, b, t): return np.array(a, np.float32) * (1 - t[..., None]) + np.arra
 save("black", np.zeros((H, W, 3)))
 save("white", np.full((H, W, 3), 255.0))
 save("grey", np.full((H, W, 3), 128.0))
+save("lightgrey", np.full((H, W, 3), 214.0))
 t = (xx / W * 0.7 + yy / H * 0.3)
 col = np.where((t < 0.5)[..., None], lerp((255, 64, 160), (255, 140, 40), t / 0.5), lerp((255, 140, 40), (120, 40, 220), (t - 0.5) / 0.5))
 save("colorful", col)

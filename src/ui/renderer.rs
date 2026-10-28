@@ -1046,8 +1046,6 @@ thread_local! {
     static POPUP_TEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Enables the popup text weights (see `popup_text`) for subsequent text draws and measurements.
-/// Set only while popup panels paint their content, so the dock bar keeps its own type.
 thread_local! {
     static TEXT_SHADOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1063,6 +1061,8 @@ pub fn text_shadow_for(rgba: u32) -> bool {
     TEXT_SHADOW.with(std::cell::Cell::get) && r > 0xD0 && g > 0xD0 && b > 0xD0
 }
 
+/// Enables the popup text weights (see `popup_text`) for subsequent text draws and measurements.
+/// Set only while popup panels paint their content, so the dock bar keeps its own type.
 pub fn set_popup_text(on: bool) {
     POPUP_TEXT.with(|c| c.set(on));
 }
