@@ -697,10 +697,10 @@ fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
 }
 
 /// Git tile cell colours (0xRRGGBBAA): empty days dark grey, then GitHub-style greens.
-const GIT_EMPTY: u32 = 0x3A3A_3CD9;
+const GIT_EMPTY: u32 = 0x8A8A_9259;
 const GIT_LEVELS: [u32; 4] = [0x1F6F_3AFF, 0x2EA0_43FF, 0x39D3_53FF, 0x6CEB_83FF];
 const GIT_ROWS: usize = 3;
-const GIT_CELL: f32 = 5.5;
+const GIT_CELL: f32 = 6.0;
 const GIT_GAP: f32 = 1.5;
 /// Side padding of the stat line and the grid inside the wide (horizontal) tile.
 const GIT_PAD: f32 = 9.0;
@@ -709,7 +709,7 @@ const GIT_PAD: f32 = 9.0;
 /// left by `GIT_PAD` on both sides; the grid is centred horizontally and sits under the stat
 /// line, clear of the 12 DIP rounded corners.
 pub fn git_grid(rc: RectF, compact: bool) -> (f32, f32, usize) {
-    let pad = if compact { 7.0 } else { GIT_PAD };
+    let pad = if compact { 6.0 } else { GIT_PAD };
     let pitch = GIT_CELL + GIT_GAP;
     let cols = (((rc.w - 2.0 * pad + GIT_GAP) / pitch).floor() as usize).max(1);
     let grid_w = cols as f32 * pitch - GIT_GAP;
@@ -748,31 +748,47 @@ fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<
     let (left, top, cols) = git_grid(rc, false);
     draw_git_grid(r, &t.cells, left, top, cols)?;
     // Stat line: bold numbers, medium labels; three groups spread over the grid's width.
-    let (num, lab) = (12.0, 10.0);
-    let groups: [(&str, &str, &str); 3] = [("", t.title.as_str(), " today"), ("", t.value.as_str(), " week"), ("\u{1F525}", t.sub.as_str(), " streak")];
-    let flame_w = 13.0;
-    let mut widths = [0.0f32; 3];
-    for (i, (icon, n, l)) in groups.iter().enumerate() {
-        let w_icon = if icon.is_empty() { 0.0 } else { flame_w };
-        widths[i] = w_icon + r.measure_text(n, num, TextStyle::Bold)? + r.measure_text(l, lab, TextStyle::SemiBold)?;
-    }
-    let span_l = left;
+    // When the dock squeezes the tile, labels shrink, then the streak label goes, then all
+    // labels go (numbers and the flame always stay).
     let span_w = cols as f32 * (GIT_CELL + GIT_GAP) - GIT_GAP;
-    let total: f32 = widths.iter().sum();
-    let gap = ((span_w - total) / 2.0).max(4.0);
+    let num = 12.0;
+    let flame_w = 13.0;
+    let nums = [t.title.as_str(), t.value.as_str(), t.sub.as_str()];
+    let mut nw = [0.0f32; 3];
+    for (i, n) in nums.iter().enumerate() {
+        nw[i] = r.measure_text(n, num, TextStyle::Bold)?;
+    }
+    let mut chosen = (10.0f32, [" today", " week", ""], [0.0f32; 3], f32::MAX);
+    for (lab, labels) in [
+        (10.0f32, [" today", " week", " streak"]),
+        (9.0, [" today", " week", " streak"]),
+        (9.0, [" today", " week", ""]),
+        (9.0, ["", "", ""]),
+    ] {
+        let mut lw = [0.0f32; 3];
+        for (i, l) in labels.iter().enumerate() {
+            lw[i] = if l.is_empty() { 0.0 } else { r.measure_text(l, lab, TextStyle::SemiBold)? };
+        }
+        let total = flame_w + nw.iter().sum::<f32>() + lw.iter().sum::<f32>();
+        chosen = (lab, labels, lw, total);
+        if total + 2.0 * 6.0 <= span_w {
+            break;
+        }
+    }
+    let (lab, labels, lw, total) = chosen;
+    let gap = ((span_w - total) / 2.0).max(3.0);
     let line = RectF { x: 0.0, y: rc.y + 3.5, w: 0.0, h: (top - rc.y - 3.5 - 1.0).max(12.0) };
-    let mut x = span_l;
-    for (i, (icon, n, l)) in groups.iter().enumerate() {
-        if !icon.is_empty() {
-            r.draw_text(icon, RectF { x: x - 1.0, w: flame_w + 2.0, ..line }, 9.5, 0xFFFF_FFFF, Align::Left)?;
+    let mut x = left;
+    for i in 0..3 {
+        if i == 2 {
+            r.draw_text("\u{1F525}", RectF { x: x - 1.0, w: flame_w + 2.0, ..line }, 9.5, 0xFFFF_FFFF, Align::Left)?;
             x += flame_w;
         }
-        let nw = r.measure_text(n, num, TextStyle::Bold)?;
-        r.draw_text_styled(n, RectF { x, w: nw + 1.0, ..line }, num, TEXT, Align::Left, TextStyle::Bold)?;
-        let lw = widths[i] - nw - if icon.is_empty() { 0.0 } else { flame_w };
-        let right = rc.x + rc.w - 4.0;
-        r.draw_text_styled(l, RectF { x: x + nw, w: (lw + 1.0).min((right - x - nw).max(0.0)), ..line }, lab, GIT_LABEL, Align::Left, TextStyle::SemiBold)?;
-        x += nw + lw + gap;
+        r.draw_text_styled(nums[i], RectF { x, w: nw[i] + 1.0, ..line }, num, TEXT, Align::Left, TextStyle::Bold)?;
+        if !labels[i].is_empty() {
+            r.draw_text_styled(labels[i], RectF { x: x + nw[i], w: lw[i] + 1.0, ..line }, lab, GIT_LABEL, Align::Left, TextStyle::SemiBold)?;
+        }
+        x += nw[i] + lw[i] + gap;
     }
     Ok(())
 }

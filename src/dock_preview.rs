@@ -35,7 +35,9 @@ pub fn render(out: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
     let side = edge::resolve("auto");
     edge::set_current(side);
     let popup = std::env::var("SMARTDOCK_DOCK_POPUP").unwrap_or_else(|_| "calendar".into());
-    let (sw, sh) = (SCREEN_W, SCREEN_H);
+    // Strip-only renders (SMARTDOCK_DOCK_SCALE) use a 1920x1080 screen like the user's monitor.
+    let strip_only = std::env::var("SMARTDOCK_DOCK_SCALE").is_ok();
+    let (sw, sh) = if strip_only { (1920, 1080) } else { (SCREEN_W, SCREEN_H) };
     let (src_w, src_h, src) = wallpaper::thumbnail(wallpaper_path, 1920)?;
     if src_w == 0 || src_h == 0 {
         return Err(Error::from(E_INVALIDARG));
