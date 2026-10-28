@@ -366,7 +366,18 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     };
     let control = !matches!(layer, Layer::Tile | Layer::Plate);
     // Control modules are thicker "lenses": a wider refraction band and a gentle edge brightening.
-    let (band, k) = if control { (11.0 * dpr, 9.0 * dpr) } else { (band, k) };
+    let (band, k) = if layer == Layer::ControlLight {
+        // Light clear glass: a stronger lens so the backdrop visibly bends at the rim (macOS 27).
+        (12.0 * dpr, 13.0 * dpr)
+    } else if control {
+        (11.0 * dpr, 9.0 * dpr)
+    } else {
+        (band, k)
+    };
+    // Crisper optics for the clear light glass: a tight 1 px specular, a firm dark contour and a
+    // fainter bottom glow (the soft glow reads puffy over a light backdrop).
+    let clear = layer == Layer::ControlLight;
+    let (rim_w, rim_k, glow_k) = if clear { (0.65, 1.25, 0.07) } else { (1.1, 1.0, 0.16) };
     let edge_glow = if control { 0.0 } else { 0.0 };
     // Control material (macOS 27): smoky dark (or milky light) veil over the heavily blurred
     // backdrop, then a thick-glass bevel lit from the top-left.
@@ -468,15 +479,15 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                 let top = lit.max(0.0);
                 let bottom = (-lit).max(0.0);
                 // Specular rim: a bright soft line ~2-3 DIP wide, strongest on top, weaker below.
-                let rim = (-d / 1.1).exp() * (top.powf(1.4) * 0.62 + bottom.powf(1.4) * 0.50);
+                let rim = (-d / rim_w).exp() * (top.powf(1.4) * 0.62 + bottom.powf(1.4) * 0.50) * rim_k;
                 // Bottom inner glow: a lighter band rising ~6 DIP from the lower edge.
-                let glow = if ny > 0.0 { ny.powf(2.0) * (1.0 - d / 7.0).max(0.0).powf(1.5) * 0.16 } else { 0.0 };
+                let glow = if ny > 0.0 { ny.powf(2.0) * (1.0 - d / 7.0).max(0.0).powf(1.5) * glow_k } else { 0.0 };
                 // Thick-glass sides: darker toward the middle of the left/right edges.
                 // Pale (dark-ink) glass over white pages keeps the shading light, or it turns puffy.
                 let pale = matches!(layer, Layer::ControlInk | Layer::CcPanelInk);
                 let side = (1.0 - top - bottom).clamp(0.0, 1.0) * (1.0 - d / 6.0).max(0.0) * if pale { 0.07 } else { 0.20 };
                 // Dark outer contour right at the silhouette, under the specular.
-                let contour = (1.0 - d / 0.9).max(0.0) * (1.0 - top * 0.8) * if dark_ctl { 0.45 } else if pale { 0.08 } else { 0.18 };
+                let contour = (1.0 - d / 0.9).max(0.0) * (1.0 - top * 0.8) * if dark_ctl { 0.45 } else if pale { 0.08 } else if clear { 0.32 } else { 0.18 };
                 let add = ((rim + glow) * spec_k).min(0.85);
                 let mul = 1.0 - side - contour;
                 for v in &mut c {
