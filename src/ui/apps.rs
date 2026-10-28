@@ -152,13 +152,9 @@ fn pinned_launchers(pins: &[(String, String)], open: &[WindowEntry]) -> Vec<Wind
 pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()> {
     let pointer = POINTER.with(Cell::get);
     let t = now_secs();
-    for (w, s) in state.windows.iter().zip(slots(rect, state.windows.len())) {
-        let cx = s.x + SLOT / 2.0;
-        let k = magnify(cx, pointer);
-        let size = ICON * k;
-        // Scales around the bottom centre; the base position never moves.
-        let base_bottom = s.y + ICON_TOP + ICON;
-        let ico = RectF { x: cx - size / 2.0, y: base_bottom - size, w: size, h: size };
+    let edge = crate::win::edge::current();
+    for (w, s) in state.windows.iter().zip(slots_on(edge.vertical(), rect, state.windows.len())) {
+        let (ico, dot) = icon_geometry(edge, s, pointer);
         let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
         match state.icons.get(key) {
             Some(icon) => draw_icon(r, icon, ico)?,
@@ -170,20 +166,63 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
         if let Some(badge) = badge_of(w) {
             draw_badge(r, ico, badge, t)?;
         }
-        // Small white running dot under the icon.
-        let dot = RectF { x: cx - DOT / 2.0, y: base_bottom + DOT_GAP, w: DOT, h: DOT };
+        // Small white running dot between the icon and the screen edge.
         r.fill_rounded_rect(dot, DOT / 2.0, DOT_RGBA)?;
     }
     Ok(())
 }
 
+/// Icon rect (magnified for `pointer`, the pointer's position along the dock) and running-dot
+/// rect for slot `s`. The icon's screen-edge side never moves; it grows away from the edge.
+/// Bottom is the original geometry.
+fn icon_geometry(edge: crate::win::edge::AbEdge, s: RectF, pointer: Option<f32>) -> (RectF, RectF) {
+    use crate::win::edge::AbEdge;
+    match edge {
+        AbEdge::Bottom | AbEdge::Top => {
+            let cx = s.x + SLOT / 2.0;
+            let size = ICON * magnify(cx, pointer);
+            if edge == AbEdge::Bottom {
+                // Scales around the bottom centre; the base position never moves.
+                let base_bottom = s.y + ICON_TOP + ICON;
+                let ico = RectF { x: cx - size / 2.0, y: base_bottom - size, w: size, h: size };
+                (ico, RectF { x: cx - DOT / 2.0, y: base_bottom + DOT_GAP, w: DOT, h: DOT })
+            } else {
+                let base_top = s.y + s.h - ICON_TOP - ICON;
+                let ico = RectF { x: cx - size / 2.0, y: base_top, w: size, h: size };
+                (ico, RectF { x: cx - DOT / 2.0, y: base_top - DOT_GAP - DOT, w: DOT, h: DOT })
+            }
+        }
+        AbEdge::Left | AbEdge::Right => {
+            let cy = s.y + SLOT / 2.0;
+            let size = ICON * magnify(cy, pointer);
+            if edge == AbEdge::Left {
+                let base_left = s.x + s.w - ICON_TOP - ICON;
+                let ico = RectF { x: base_left, y: cy - size / 2.0, w: size, h: size };
+                (ico, RectF { x: base_left - DOT_GAP - DOT, y: cy - DOT / 2.0, w: DOT, h: DOT })
+            } else {
+                let base_right = s.x + ICON_TOP + ICON;
+                let ico = RectF { x: base_right - size, y: cy - size / 2.0, w: size, h: size };
+                (ico, RectF { x: base_right + DOT_GAP, y: cy - DOT / 2.0, w: DOT, h: DOT })
+            }
+        }
+    }
+}
+
 /// Plate rect of the Start / Search button: same size and bottom line as an app icon, growing
 /// like one when hovered.
 fn button_plate(rc: RectF, hovered: bool) -> RectF {
+    use crate::win::edge::AbEdge;
     let size = ICON * if hovered { 1.0 + MAG_MAX } else { 1.0 };
-    let cx = rc.x + rc.w / 2.0;
-    let bottom = rc.y + ICON_TOP + ICON;
-    RectF { x: cx - size / 2.0, y: bottom - size, w: size, h: size }
+    let (cx, cy) = (rc.x + rc.w / 2.0, rc.y + rc.h / 2.0);
+    match crate::win::edge::current() {
+        AbEdge::Bottom => {
+            let bottom = rc.y + ICON_TOP + ICON;
+            RectF { x: cx - size / 2.0, y: bottom - size, w: size, h: size }
+        }
+        AbEdge::Top => RectF { x: cx - size / 2.0, y: rc.y + rc.h - ICON_TOP - ICON, w: size, h: size },
+        AbEdge::Left => RectF { x: rc.x + rc.w - ICON_TOP - ICON, y: cy - size / 2.0, w: size, h: size },
+        AbEdge::Right => RectF { x: rc.x + ICON_TOP + ICON - size, y: cy - size / 2.0, w: size, h: size },
+    }
 }
 
 const BUTTON_RADIUS: f32 = ICON * ICON_GLASS_RADIUS;
@@ -234,17 +273,24 @@ pub fn draw_search_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()
 /// are split between neighbours), and any height counts, so a click at the very bottom edge of the
 /// screen (where the pointer tends to rest) or between two icons is never swallowed. Callers gate on
 /// the dock's own bounds.
-pub fn hit_app_index(x: f32, _y: f32, rect: RectF, state: &AppsState) -> Option<usize> {
+pub fn hit_app_index(x: f32, y: f32, rect: RectF, state: &AppsState) -> Option<usize> {
+    let half_gap = GAP / 2.0;
+    if crate::win::edge::current().vertical() {
+        // Same rule along a vertical dock: y picks the slot, any x counts.
+        if y < rect.y || y >= rect.y + rect.h {
+            return None;
+        }
+        return slots_on(true, rect, state.windows.len()).iter().position(|s| y >= s.y - half_gap && y < s.y + s.h + half_gap);
+    }
     if x < rect.x || x >= rect.x + rect.w {
         return None;
     }
-    let half_gap = GAP / 2.0;
     slots(rect, state.windows.len()).iter().position(|s| x >= s.x - half_gap && x < s.x + s.w + half_gap)
 }
 
 /// Slot rect for window index `i`, if it fits.
 pub fn slot_rect(rect: RectF, state: &AppsState, i: usize) -> Option<RectF> {
-    slots(rect, state.windows.len()).get(i).copied()
+    slots_on(crate::win::edge::current().vertical(), rect, state.windows.len()).get(i).copied()
 }
 
 /// Display name for an app icon (exe stem, else window title).
@@ -299,6 +345,21 @@ fn slots(rect: RectF, n: usize) -> Vec<RectF> {
     let x0 = rect.x + (rect.w - group_w).max(0.0) / 2.0;
     (0..count)
         .map(|i| RectF { x: x0 + i as f32 * PITCH, y: rect.y, w: SLOT, h: rect.h })
+        .collect()
+}
+
+/// `slots` along either axis: a vertical dock stacks the slots top to bottom, centred in
+/// `rect`, each spanning the full width.
+fn slots_on(vertical: bool, rect: RectF, n: usize) -> Vec<RectF> {
+    if !vertical {
+        return slots(rect, n);
+    }
+    let fit = ((rect.h + GAP) / PITCH).floor().max(0.0) as usize;
+    let count = n.min(fit);
+    let group_h = count as f32 * SLOT + count.saturating_sub(1) as f32 * GAP;
+    let y0 = rect.y + (rect.h - group_h).max(0.0) / 2.0;
+    (0..count)
+        .map(|i| RectF { x: rect.x, y: y0 + i as f32 * PITCH, w: rect.w, h: SLOT })
         .collect()
 }
 
@@ -595,6 +656,31 @@ mod tests {
         assert_eq!(launchers.len(), 1, "running pin is not duplicated");
         assert_eq!(launchers[0].hwnd, 0);
         assert_eq!(launchers[0].exe, "C:\\Apps\\Notes.exe");
+    }
+
+    #[test]
+    fn dock_layout_edge_icons_grow_away_from_screen_edge() {
+        use crate::win::edge::AbEdge;
+        // Bottom keeps the original geometry exactly.
+        let s = RectF { x: 100.0, y: 3.0, w: SLOT, h: CLUSTER_H };
+        let (ico, dot) = icon_geometry(AbEdge::Bottom, s, None);
+        assert_eq!(ico, RectF { x: 100.0, y: 3.0 + ICON_TOP, w: ICON, h: ICON });
+        assert_eq!(dot.y, 3.0 + ICON_TOP + ICON + DOT_GAP);
+        // Top: dot above the icon, magnified icon keeps its top line.
+        let s = RectF { x: 100.0, y: 7.0, w: SLOT, h: CLUSTER_H };
+        let (ico, dot) = icon_geometry(AbEdge::Top, s, Some(117.0));
+        assert_eq!(ico.y, 7.0 + ICON_TOP);
+        assert!(ico.w > ICON && dot.y + dot.h <= ico.y);
+        // Left/right: slots stack vertically; the dot sits on the screen side.
+        let band = RectF { x: 7.0, y: 300.0, w: CLUSTER_H, h: cluster_width(3) };
+        let v = slots_on(true, band, 3);
+        assert_eq!(v.len(), 3);
+        assert!((v[1].y - v[0].y - PITCH).abs() < 1e-4 && v[0].y == 300.0);
+        let (ico, dot) = icon_geometry(AbEdge::Left, v[0], Some(v[0].y + SLOT / 2.0));
+        assert!(dot.x + dot.w <= ico.x && (ico.x - (7.0 + ICON_TOP)).abs() < 1e-4);
+        let band = RectF { x: 3.0, ..band };
+        let (ico, dot) = icon_geometry(AbEdge::Right, slots_on(true, band, 3)[2], None);
+        assert!(dot.x >= ico.x + ico.w && (ico.x + ico.w - (3.0 + ICON_TOP + ICON)).abs() < 1e-4);
     }
 }
 

@@ -5,6 +5,7 @@
 mod background;
 mod cache;
 mod data;
+mod dock_preview;
 mod model;
 mod settings;
 mod ui;
@@ -56,6 +57,51 @@ use win::tasks::{self, Attention, ShellEvent};
 use win::{monitors, wallpaper};
 
 const DOCK_HEIGHT: f32 = dock::DOCK_H;
+
+/// Screen edge the docks currently sit on (see `win::edge`).
+fn dock_edge() -> AbEdge {
+    win::edge::current()
+}
+
+/// Pointer position along the dock: x on a horizontal (top/bottom) dock, y on a vertical one.
+fn along(x: f32, y: f32) -> f32 {
+    if dock_edge().vertical() { y } else { x }
+}
+
+/// Start and length of a dock-local rect along the dock.
+fn span(r: &RectF) -> (f32, f32) {
+    if dock_edge().vertical() { (r.y, r.h) } else { (r.x, r.w) }
+}
+
+/// Screen-px popup anchor for dock-local rect `r`: its extent along the dock, across the dock's
+/// full thickness. Top/bottom: the same rect as always.
+fn dock_anchor(origin: (f32, f32), scale: f32, r: RectF) -> RectF {
+    if dock_edge().vertical() {
+        RectF { x: origin.0, y: origin.1 + r.y * scale, w: DOCK_HEIGHT * scale, h: r.h * scale }
+    } else {
+        RectF { x: origin.0 + r.x * scale, y: origin.1, w: r.w * scale, h: DOCK_HEIGHT * scale }
+    }
+}
+
+/// Window rect (x, y, w, h) of a dock whose AppBar strip is `strip`. A bottom dock extends
+/// `corner_px` below the monitor so DWM's lower corners stay off-screen (unchanged); the other
+/// edges use the strip itself.
+fn dock_window_rect(edge: AbEdge, strip: RECT, dock_px: i32, corner_px: i32) -> (i32, i32, i32, i32) {
+    let w = strip.right - strip.left;
+    match edge {
+        AbEdge::Bottom => (strip.left, strip.top, w, dock_px + corner_px),
+        _ => (strip.left, strip.top, w, strip.bottom - strip.top),
+    }
+}
+
+/// Dock length in DIPs along its edge (the `width` the layout gets).
+fn dock_length_dip(edge: AbEdge, strip: RECT, dpi_value: u32) -> f32 {
+    if edge.vertical() {
+        dpi::px_to_dip(strip.bottom - strip.top, dpi_value)
+    } else {
+        dpi::px_to_dip(strip.right - strip.left, dpi_value)
+    }
+}
 const POPUP_W: f32 = 320.0;
 const CONTROL_POPUP_W: f32 = control_center::WIDTH;
 const SETTINGS_POPUP_W: f32 = 460.0;
@@ -215,7 +261,7 @@ fn default_repos() -> Vec<PathBuf> {
 fn render_control_center_cli() -> Option<i32> {
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let mode = args.get(1)?.to_string_lossy().to_string();
-    if !matches!(mode.as_str(), "--render-cc" | "--render-popup" | "--render-icons") {
+    if !matches!(mode.as_str(), "--render-cc" | "--render-popup" | "--render-icons" | "--render-dock") {
         return None;
     }
     // `--render-popup <name> ...` takes the same arguments as `--render-cc` after the name.
@@ -234,7 +280,7 @@ fn render_control_center_cli() -> Option<i32> {
     };
     if !valid {
         let msg = format!(
-            "Usage: smartdock.exe --render-cc <out.png> <wallpaper> [dark|light]\n       smartdock.exe --render-popup <{}> <out.png> <wallpaper> [dark|light]\n       smartdock.exe --render-icons <out.png>\n",
+            "Usage: smartdock.exe --render-cc <out.png> <wallpaper> [dark|light]\n       smartdock.exe --render-popup <{}> <out.png> <wallpaper> [dark|light]\n       smartdock.exe --render-icons <out.png>\n       smartdock.exe --render-dock <out.png> <wallpaper> [dark|light]  (SMARTDOCK_DOCK_EDGE, SMARTDOCK_DOCK_POPUP)\n",
             ui::cc_preview::POPUPS.join("|")
         );
         eprint!("{msg}");
@@ -256,6 +302,7 @@ fn render_control_center_cli() -> Option<i32> {
         let dark = appearance.as_deref() != Some("light");
         match mode.as_str() {
             "--render-icons" => ui::cc_preview::render_icons(&out),
+            "--render-dock" => dock_preview::render(&out, std::path::Path::new(&args[3]), dark),
             "--render-popup" => ui::cc_preview::render_popup(
                 name.as_deref().unwrap_or_default(),
                 &out,
@@ -398,27 +445,24 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
                 match wallpaper::load(max_w) {
                     Ok(wp) => {
                         let mut map = HashMap::new();
+                        // A left/right bar is rendered as a top/bottom one on the transposed
+                        // wallpaper (the lens works along the bar's long side), then turned back.
+                        let edge = win::edge::current();
+                        let turned = edge.vertical().then(|| transposed_wallpaper(&wp));
                         for monitor in &monitors {
-                            let (bar, screen) = if wp.mode == wallpaper::FitMode::Span {
-                                (
-                                    RectF {
-                                        x: (monitor.left - virtual_screen.left) as f32,
-                                        y: (monitor.bottom - virtual_screen.top - dock_height_px) as f32,
-                                        w: (monitor.right - monitor.left) as f32,
-                                        h: dock_height_px as f32,
-                                    },
-                                    virtual_size,
-                                )
+                            let (mw, mh) = (monitor.right - monitor.left, monitor.bottom - monitor.top);
+                            let (origin, screen) = if wp.mode == wallpaper::FitMode::Span {
+                                ((monitor.left - virtual_screen.left, monitor.top - virtual_screen.top), virtual_size)
                             } else {
-                                (
-                                    RectF {
-                                        x: 0.0,
-                                        y: (monitor.bottom - monitor.top - dock_height_px) as f32,
-                                        w: (monitor.right - monitor.left) as f32,
-                                        h: dock_height_px as f32,
-                                    },
-                                    (monitor.right - monitor.left, monitor.bottom - monitor.top),
-                                )
+                                ((0, 0), (mw, mh))
+                            };
+                            let local = RECT { left: origin.0, top: origin.1, right: origin.0 + mw, bottom: origin.1 + mh };
+                            let (_, strip) = appbar::edge_rect(local, edge, dock_height_px);
+                            let bar = RectF {
+                                x: strip.left as f32,
+                                y: strip.top as f32,
+                                w: (strip.right - strip.left) as f32,
+                                h: (strip.bottom - strip.top) as f32,
                             };
                             log(&format!(
                                 "wallpaper source={} mode={:?} monitor=({},{}..{},{}) bar=({:.0},{:.0},{:.0},{:.0})",
@@ -433,7 +477,14 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
                                 bar.w,
                                 bar.h,
                             ));
-                            let bitmap = liquid::render_liquid(&wp, bar, screen);
+                            let bitmap = match &turned {
+                                Some(twp) => untranspose_liquid(liquid::render_liquid(
+                                    twp,
+                                    RectF { x: bar.y, y: bar.x, w: bar.h, h: bar.w },
+                                    (screen.1, screen.0),
+                                )),
+                                None => liquid::render_liquid(&wp, bar, screen),
+                            };
                             map.insert(
                                 (monitor.left, monitor.top, monitor.right, monitor.bottom),
                                 Arc::new(bitmap),
@@ -454,6 +505,43 @@ fn start_background_refresh(shared: Arc<Shared>, dock_height_px: i32) {
             thread::sleep(Duration::from_millis(if have { 1000 } else { 250 }));
         }
     });
+}
+
+/// Swaps rows and columns of a `w`×`h` RGBA image (the result is `h`×`w`); applying it twice is identity.
+fn transpose_rgba(src: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let (w, h) = (w as usize, h as usize);
+    if src.len() < w * h * 4 {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let s = (y * w + x) * 4;
+            let d = (x * h + y) * 4;
+            out[d..d + 4].copy_from_slice(&src[s..s + 4]);
+        }
+    }
+    out
+}
+
+/// The wallpaper mirrored across its diagonal, for rendering a vertical dock's backdrop.
+fn transposed_wallpaper(wp: &wallpaper::WallpaperPixels) -> wallpaper::WallpaperPixels {
+    wallpaper::WallpaperPixels {
+        source: wp.source.clone(),
+        w: wp.h,
+        h: wp.w,
+        rgba: transpose_rgba(&wp.rgba, wp.w, wp.h),
+        orig_w: wp.orig_h,
+        orig_h: wp.orig_w,
+        mode: wp.mode,
+        background: wp.background,
+    }
+}
+
+/// Turns a backdrop rendered on the transposed wallpaper back into screen orientation.
+fn untranspose_liquid(b: LiquidBitmap) -> LiquidBitmap {
+    let plain = if b.plain.is_empty() { Vec::new() } else { transpose_rgba(&b.plain, b.w, b.h) };
+    LiquidBitmap { w: b.h, h: b.w, rgba: transpose_rgba(&b.rgba, b.w, b.h), plain }
 }
 
 fn start_audio_meter(shared: Arc<Shared>) {
@@ -583,13 +671,16 @@ fn build_secondary_docks(
         let approx_dpi = 96u32;
         let dock_h = dpi::dip_to_px(dock_height_dip, approx_dpi);
         let corner = dpi::dip_to_px(16.0, approx_dpi);
+        let edge = dock_edge();
+        let (_, strip) = appbar::edge_rect(mon, edge, dock_h);
+        let (wx, wy, ww, wh) = dock_window_rect(edge, strip, dock_h, corner);
         let Ok(hwnd) = create_dock_window_at(
             hinst,
             class,
-            mon.left,
-            mon.bottom - dock_h,
-            mon_w,
-            dock_h + corner,
+            wx,
+            wy,
+            ww,
+            wh,
             "SmartDockSecondary",
         ) else {
             log(&format!(
@@ -601,15 +692,14 @@ fn build_secondary_docks(
         let dpi_value = dpi::window_dpi(hwnd);
         let dock_h = dpi::dip_to_px(dock_height_dip, dpi_value);
         let corner = dpi::dip_to_px(16.0, dpi_value);
-        let Ok(rect) = appbar::register_appbar_on(hwnd, AbEdge::Bottom, dock_h, mon) else {
+        let Ok(rect) = appbar::register_appbar_on(hwnd, edge, dock_h, mon) else {
             log("secondary appbar register failed");
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
             continue;
         };
-        let pixel_w = rect.right - rect.left;
-        let window_h = dock_h + corner;
+        let (_, _, pixel_w, window_h) = dock_window_rect(edge, rect, dock_h, corner);
         // Position but keep hidden — showing before APP owns the dock lets WM_PAINT
         // validate an empty frame (EndPaint) that never gets tiles.
         unsafe {
@@ -634,7 +724,7 @@ fn build_secondary_docks(
             monitor: mon,
             origin: (rect.left as f32, rect.top as f32),
             dpi: dpi_value,
-            width: dpi::px_to_dip(pixel_w, dpi_value),
+            width: dock_length_dip(edge, rect, dpi_value),
             renderer,
             tiles: Vec::new(),
             hover: None,
@@ -709,9 +799,8 @@ fn run() -> windows::core::Result<()> {
     let dpi_value = dpi::window_dpi(hwnd);
     let dock_height_px = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
     let corner_px = dpi::dip_to_px(16.0, dpi_value);
-    // Extend the HWND below rcMonitor so DWM's lower rounded corners are off-screen. Only the
-    // 48-DIP dock surface is visible; its upper corners retain compositor antialiasing.
-    let dock_window_height_px = dock_height_px + corner_px;
+    // A bottom dock's HWND extends below rcMonitor so DWM's lower rounded corners are off-screen
+    // (see `dock_window_rect`). Only the 48-DIP dock surface is visible.
 
     // Remove the taskbar's edge claim before asking the shell to place our AppBar. Otherwise
     // ABM_QUERYPOS can return a rect one taskbar-height above rcMonitor.bottom.
@@ -719,11 +808,15 @@ fn run() -> windows::core::Result<()> {
     appbar::install_tray_show_hook();
     tasks::install_foreground_hook(Some(data::usage::on_foreground));
 
-    // Reserve the work area at the bottom so maximized windows stop above the dock.
-    let rect: RECT = appbar::register_appbar(hwnd, AbEdge::Bottom, dock_height_px)?;
+    // The dock sits on the taskbar's edge (or settings.json `dockEdge`); bottom by default.
+    let edge = win::edge::resolve(&initial_settings.dock_edge);
+    win::edge::set_current(edge);
+    log(&format!("dock edge: {} (setting {:?}, taskbar {})", edge.name(), initial_settings.dock_edge, win::edge::taskbar_edge().name()));
+    // Reserve the work area on that edge so maximized windows stop short of the dock.
+    let rect: RECT = appbar::register_appbar(hwnd, edge, dock_height_px)?;
     log(&format!("appbar rect {:?}", (rect.left, rect.top, rect.right, rect.bottom)));
-    let pixel_width = rect.right - rect.left;
-    let width = dpi::px_to_dip(pixel_width, dpi_value);
+    let (_, _, pixel_width, dock_window_height_px) = dock_window_rect(edge, rect, dock_height_px, corner_px);
+    let width = dock_length_dip(edge, rect, dpi_value);
     unsafe {
         // SAFETY: hwnd is our live window.
         let _ = SetWindowPos(
@@ -850,11 +943,36 @@ fn run() -> windows::core::Result<()> {
     repaint();
 
     log("message loop");
+    // Explorer writes the taskbar's edge to StuckRects3 when it is moved; the registry signals an
+    // event that this same loop waits on alongside its messages (no extra thread).
+    let watch = win::edge::TaskbarWatch::new();
+    if watch.is_none() {
+        log("dock edge: StuckRects3 watch unavailable; WM_SETTINGCHANGE still re-checks the edge");
+    }
     let mut msg = MSG::default();
     unsafe {
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        match &watch {
+            None => {
+                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            Some(watch) => 'pump: loop {
+                let events = [watch.event()];
+                let r = MsgWaitForMultipleObjectsEx(Some(&events), windows::Win32::System::Threading::INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                if r == windows::Win32::Foundation::WAIT_OBJECT_0 {
+                    watch.arm();
+                    check_dock_edge(hwnd, "taskbar registry", true);
+                }
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        break 'pump;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            },
         }
     }
     log("message loop ended");
@@ -1279,10 +1397,35 @@ fn paint_surface(
     settings: &settings::Settings,
     backdrop: Option<&Arc<LiquidBitmap>>,
 ) {
+    let res = renderer.begin().and_then(|_| {
+        draw_surface(renderer, width, hover, tiles_out, apps_state, stats, data, control, audio_peak, settings, backdrop)
+    });
+    let res = res.and_then(|_| renderer.end());
+    if let Err(e) = res {
+        log(&format!("paint failed: {e}"));
+    }
+}
+
+/// Draws one dock surface (between `begin` and `end`), laid out along the current dock edge.
+#[allow(clippy::too_many_arguments)]
+fn draw_surface(
+    renderer: &mut Renderer,
+    width: f32,
+    hover: Option<usize>,
+    tiles_out: &mut Vec<(&'static str, RectF)>,
+    apps_state: &AppsState,
+    stats: &Stats,
+    data: &DataState,
+    control: &ControlState,
+    audio_peak: f32,
+    settings: &settings::Settings,
+    backdrop: Option<&Arc<LiquidBitmap>>,
+) -> windows::core::Result<()> {
     glass::set_style(&settings.dock_style);
     win::deskglass::set_enabled(settings.desktop_glass);
     let zones = layout_tiles(apps_state.windows.len(), settings);
-    let rects = dock::layout(&zones.left, &zones.center, &zones.right, width);
+    let edge = dock_edge();
+    let rects = dock::layout_edge(edge, &zones.left, &zones.center, &zones.right, width);
     let defs: Vec<&Tile> = zones.left.iter().chain(&zones.center).chain(&zones.right).collect();
     let views: Vec<TileView> = defs
         .iter()
@@ -1291,26 +1434,21 @@ fn paint_surface(
     *tiles_out = defs.iter().zip(rects.iter()).map(|(t, r)| (t.id, *r)).collect();
     // Glass shelf behind the whole centre cluster (Start .. last app), centred with it.
     let c0 = zones.left.len();
-    let shelf = (!zones.center.is_empty()).then(|| dock::shelf_for(rects[c0], rects[c0 + zones.center.len() - 1]));
+    let shelf = (!zones.center.is_empty()).then(|| dock::shelf_for_edge(edge, rects[c0], rects[c0 + zones.center.len() - 1]));
     dock::set_shelf(shelf);
     let apps_rect = tiles_out.iter().find(|(id, _)| *id == "apps").map(|(_, r)| *r);
-    let res = renderer
-        .begin()
-        .and_then(|_| {
-            // Glass tiles/plates sample this dock's own wallpaper crop at their positions.
-            glass::set_backdrop(backdrop.cloned(), width, dock::DOCK_H);
-            dock::draw_dock(renderer, &views, &rects, hover, backdrop.map(|b| b.as_ref()), settings.glass_opacity)
-        })
+    // The backdrop crop covers the bar: DOCK_H across the dock, `width` along it.
+    let (bar_w, bar_h) = if edge.vertical() { (dock::DOCK_H, width) } else { (width, dock::DOCK_H) };
+    // Glass tiles/plates sample this dock's own wallpaper crop at their positions.
+    glass::set_backdrop(backdrop.cloned(), bar_w, bar_h);
+    let res = dock::draw_dock(renderer, &views, &rects, hover, backdrop.map(|b| b.as_ref()), settings.glass_opacity)
         .and_then(|_| match apps_rect {
             Some(r) => apps::draw_apps(renderer, r, apps_state),
             None => Ok(()),
         })
-        .and_then(|_| draw_drag_overlay(renderer, tiles_out))
-        .and_then(|_| renderer.end());
-    glass::set_backdrop(None, width, dock::DOCK_H);
-    if let Err(e) = res {
-        log(&format!("paint failed: {e}"));
-    }
+        .and_then(|_| draw_drag_overlay(renderer, tiles_out));
+    glass::set_backdrop(None, bar_w, bar_h);
+    res
 }
 
 fn liquid_for(map: &HashMap<(i32, i32, i32, i32), Arc<LiquidBitmap>>, mon: RECT) -> Option<Arc<LiquidBitmap>> {
@@ -1425,7 +1563,7 @@ thread_local! {
     static NEAR_APPS: Cell<bool> = const { Cell::new(false) };
 }
 
-/// True when `x` (dock-local DIP) is within magnification range of this dock's app icons.
+/// True when `x` (dock-local DIP along the dock) is within magnification range of this dock's app icons.
 fn near_apps(hwnd: HWND, x: f32) -> bool {
     APP.with(|a| {
         let Ok(slot) = a.try_borrow() else { return true };
@@ -1440,7 +1578,10 @@ fn near_apps(hwnd: HWND, x: f32) -> bool {
         tiles
             .iter()
             .find(|(id, _)| *id == "apps")
-            .is_some_and(|(_, r)| x >= r.x - 70.0 && x <= r.x + r.w + 70.0)
+            .is_some_and(|(_, r)| {
+                let (start, len) = span(r);
+                x >= start - 70.0 && x <= start + len + 70.0
+            })
     })
 }
 
@@ -1448,6 +1589,9 @@ fn near_apps(hwnd: HWND, x: f32) -> bool {
 /// just its 34-DIP icon row, so clicks near the top/bottom edge still reach the icons.
 fn in_tile(id: &str, r: &RectF, x: f32, y: f32) -> bool {
     if id == "apps" {
+        if dock_edge().vertical() {
+            return y >= r.y && y < r.y + r.h && (0.0..DOCK_HEIGHT).contains(&x);
+        }
         return x >= r.x && x < r.x + r.w && (0.0..DOCK_HEIGHT).contains(&y);
     }
     dock::hit_test(x, y, &[*r]).is_some()
@@ -1461,7 +1605,7 @@ fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
             else { let sec = app.secondaries.iter().find(|s| s.hwnd == hwnd)?; (&sec.tiles, sec.origin, sec.dpi) };
         let (id,rc) = tiles.iter().find(|(id,rc)| matches!(*id,"stopwatch"|"recentshots") && in_tile(id,rc,x,y))?;
         let scale = dpi::scale(dpi_value);
-        Some((*id, RectF { x:origin.0+rc.x*scale,y:origin.1,w:rc.w*scale,h:DOCK_HEIGHT*scale }))
+        Some((*id, dock_anchor(origin, scale, *rc)))
     });
     if let Some((id, anchor)) = special {
         if id == "stopwatch" { data::productivity::lap(); }
@@ -1495,12 +1639,7 @@ fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
         ));
         let scale = dpi::scale(dpi_value);
         let slot = apps::slot_rect(*rect, &app.apps, idx)?;
-        Some(RectF {
-            x: origin.0 + slot.x * scale,
-            y: origin.1,
-            w: slot.w * scale,
-            h: DOCK_HEIGHT * scale,
-        })
+        Some(dock_anchor(origin, scale, slot))
     });
     if let Some(anchor) = anchor {
         // Peeks stay off while the menu is up (and the pending hover timer is cancelled).
@@ -1527,7 +1666,7 @@ fn open_app_context_menu(hwnd: HWND, x: f32, y: f32) {
         let settings = app.shared.settings.lock().ok()?.clone();
         DOCK_MENU_H.with(|h| h.set(appmenu::open_dock_menu(target, &settings)));
         let scale = dpi::scale(dpi_value);
-        Some(RectF { x: origin.0 + (x - 1.0) * scale, y: origin.1, w: 2.0 * scale, h: DOCK_HEIGHT * scale })
+        Some(dock_anchor(origin, scale, RectF { x: x - 1.0, y: y - 1.0, w: 2.0, h: 2.0 }))
     });
     if let Some(anchor) = anchor {
         log("dockmenu: opened on empty dock area");
@@ -1560,11 +1699,12 @@ fn update_app_thumbnails(hwnd: HWND, x: f32, y: f32) {
         }
         let scale = dpi::scale(dpi_value);
         let slot = apps::slot_rect(*rect, &app.apps, idx)?;
+        let a = dock_anchor(origin, scale, slot);
         let anchor = RECT {
-            left: (origin.0 + slot.x * scale).round() as i32,
-            top: origin.1.round() as i32,
-            right: (origin.0 + (slot.x + slot.w) * scale).round() as i32,
-            bottom: (origin.1 + DOCK_HEIGHT * scale).round() as i32,
+            left: a.x.round() as i32,
+            top: a.y.round() as i32,
+            right: (a.x + a.w).round() as i32,
+            bottom: (a.y + a.h).round() as i32,
         };
         Some((wins, anchor))
     });
@@ -1595,7 +1735,17 @@ thread_local! {
 }
 
 fn on_speaker(tiles: &TileRects, x: f32, y: f32) -> bool {
-    tiles.iter().any(|(id, r)| *id == "cc" && in_tile(id, r, x, y) && x >= r.x + SPEAKER_X)
+    let vertical = dock_edge().vertical();
+    tiles.iter().any(|(id, r)| {
+        // Vertical dock: the speaker is the middle of the three stacked icons.
+        let on = if vertical { y >= r.y + r.h / 3.0 && y < r.y + r.h * 2.0 / 3.0 } else { x >= r.x + SPEAKER_X };
+        *id == "cc" && in_tile(id, r, x, y) && on
+    })
+}
+
+/// Volume-drag axis: right is louder on a horizontal dock, up on a vertical one.
+fn volume_axis(x: f32, y: f32) -> f32 {
+    if dock_edge().vertical() { -y } else { x }
 }
 
 fn current_volume() -> f32 {
@@ -1684,7 +1834,10 @@ fn widget_id_at(tiles: &TileRects, x: f32, y: f32) -> Option<&'static str> {
 /// x of the middle of the centre cluster; widgets left of it are on the left side.
 fn center_mid(tiles: &TileRects) -> f32 {
     let centre = tiles.iter().filter(|(id, _)| matches!(*id, "start" | "search" | "sep" | "apps" | "sep2" | "trash"));
-    let (lo, hi) = centre.fold((f32::MAX, f32::MIN), |(lo, hi), (_, r)| (lo.min(r.x), hi.max(r.x + r.w)));
+    let (lo, hi) = centre.fold((f32::MAX, f32::MIN), |(lo, hi), (_, r)| {
+        let (start, len) = span(r);
+        (lo.min(start), hi.max(start + len))
+    });
     if lo > hi { 0.0 } else { (lo + hi) / 2.0 }
 }
 
@@ -1693,7 +1846,11 @@ fn side_widgets(tiles: &TileRects, left: bool, skip: &str) -> Vec<(&'static str,
     let mid = center_mid(tiles);
     tiles
         .iter()
-        .filter(|(id, r)| *id != skip && settings::WIDGET_IDS.contains(id) && ((r.x + r.w / 2.0) < mid) == left)
+        // Zero-size rects are widgets a vertical dock had no room for.
+        .filter(|(id, r)| *id != skip && settings::WIDGET_IDS.contains(id) && r.w > 0.0 && r.h > 0.0 && {
+            let (start, len) = span(r);
+            (start + len / 2.0 < mid) == left
+        })
         .copied()
         .collect()
 }
@@ -1701,7 +1858,7 @@ fn side_widgets(tiles: &TileRects, left: bool, skip: &str) -> Vec<(&'static str,
 /// Where a widget dropped at dock-local `x` would land: (left side?, slot among that side's widgets).
 fn drop_slot(tiles: &TileRects, id: &str, x: f32) -> (bool, usize) {
     let left = x < center_mid(tiles);
-    let k = side_widgets(tiles, left, id).iter().filter(|(_, r)| r.x + r.w / 2.0 < x).count();
+    let k = side_widgets(tiles, left, id).iter().filter(|(_, r)| { let (start, len) = span(r); start + len / 2.0 < x }).count();
     (left, k)
 }
 
@@ -1709,14 +1866,15 @@ fn drop_slot(tiles: &TileRects, id: &str, x: f32) -> (bool, usize) {
 fn drop_line_x(tiles: &TileRects, id: &str, left: bool, k: usize) -> f32 {
     let side = side_widgets(tiles, left, id);
     if let Some((_, r)) = side.get(k) {
-        r.x - 2.5
+        span(r).0 - 2.5
     } else if let Some((_, r)) = side.last() {
-        r.x + r.w + 2.5
+        let (start, len) = span(r);
+        start + len + 2.5
     } else if left {
         5.0
     } else {
         // Empty right side: just after the Control Center button.
-        tiles.iter().find(|(i, _)| *i == "cc").map_or(5.0, |(_, r)| r.x + r.w + 2.5)
+        tiles.iter().find(|(i, _)| *i == "cc").map_or(5.0, |(_, r)| { let (start, len) = span(r); start + len + 2.5 })
     }
 }
 
@@ -1774,7 +1932,12 @@ fn draw_drag_overlay(r: &mut Renderer, tiles: &TileRects) -> windows::core::Resu
         r.fill_rounded_rect(*rc, 12.0, 0x0000_0099)?;
     }
     let lx = drop_line_x(tiles, id, left, k);
-    r.fill_rounded_rect(RectF { x: lx - 1.5, y: 8.0, w: 3.0, h: DOCK_HEIGHT - 16.0 }, 1.5, 0x0A84_FFFF)
+    let marker = if dock_edge().vertical() {
+        RectF { x: 8.0, y: lx - 1.5, w: DOCK_HEIGHT - 16.0, h: 3.0 }
+    } else {
+        RectF { x: lx - 1.5, y: 8.0, w: 3.0, h: DOCK_HEIGHT - 16.0 }
+    };
+    r.fill_rounded_rect(marker, 1.5, 0x0A84_FFFF)
 }
 
 fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
@@ -1792,12 +1955,9 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
             return Click::None;
         };
         let scale = dpi::scale(dpi_value);
-        let anchor = RectF {
-            x: origin.0 + rect.x * scale,
-            y: origin.1,
-            w: rect.w * scale,
-            h: DOCK_HEIGHT * scale,
-        };
+        let anchor = dock_anchor(origin, scale, rect);
+        let (start, len) = span(&rect);
+        let pos = along(x, y);
         match id {
             "apps" => match apps::hit_app_index(x, y, rect, &app.apps).map(|i| &app.apps.windows[i]) {
                 Some(w) if w.hwnd == 0 => Click::Launch(w.exe.clone()),
@@ -1816,9 +1976,9 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
             },
             "start" => Click::Start,
             "systemsearch" => Click::Search,
-            "pomodoro" => Click::Action(if x >= rect.x + rect.w - 32.0 { "pomodoro_skip" } else { "pomodoro" }),
+            "pomodoro" => Click::Action(if !dock_edge().vertical() && x >= rect.x + rect.w - 32.0 { "pomodoro_skip" } else { "pomodoro" }),
             "stopwatch" => Click::Action("stopwatch"),
-            "recentshots" => Click::Action(match (((x-rect.x-5.0)/((rect.w-12.0)/3.0)) as usize).min(2) { 0=>"shot0",1=>"shot1",_=>"shot2" }),
+            "recentshots" => Click::Action(match (((pos-start-5.0)/((len-12.0)/3.0)).max(0.0) as usize).min(2) { 0=>"shot0",1=>"shot1",_=>"shot2" }),
             "theme" | "screenshot" | "recyclebin" => Click::Action(id),
             "analog" | "flipclock" | "segclock" | "daynum" | "dayprog" | "monthprog" | "yearprog" => Click::Open(OpenPopup::Data("clock"), anchor),
             id if ui::more_widgets::has_popup(id) => Click::Open(OpenPopup::Widget(id), anchor),
@@ -2942,16 +3102,16 @@ const RESTORE_SETTLE: std::time::Duration = std::time::Duration::from_secs(15);
 fn attach_primary(app: &mut App) -> Option<RECT> {
     let dpi_value = dpi::window_dpi(app.hwnd);
     let dock_h = dpi::dip_to_px(DOCK_HEIGHT, dpi_value);
-    let rect = appbar::register_appbar(app.hwnd, AbEdge::Bottom, dock_h).ok()?;
-    let pixel_w = rect.right - rect.left;
-    let window_h = dock_h + dpi::dip_to_px(16.0, dpi_value);
+    let edge = dock_edge();
+    let rect = appbar::register_appbar(app.hwnd, edge, dock_h).ok()?;
+    let (_, _, pixel_w, window_h) = dock_window_rect(edge, rect, dock_h, dpi::dip_to_px(16.0, dpi_value));
     // SAFETY: our own dock window; the position is the rect Explorer just reserved.
     unsafe {
         let _ = SetWindowPos(app.hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_w, window_h, SWP_NOACTIVATE);
     }
     app.origin = (rect.left as f32, rect.top as f32);
     app.dpi = dpi_value;
-    app.width = dpi::px_to_dip(pixel_w, dpi_value);
+    app.width = dock_length_dip(edge, rect, dpi_value);
     app.renderer.resize(pixel_w, window_h, dpi_value);
     Some(rect)
 }
@@ -2959,21 +3119,15 @@ fn attach_primary(app: &mut App) -> Option<RECT> {
 /// Registers an existing secondary dock's AppBar again on its own monitor.
 fn attach_secondary(sec: &SecondaryDock) {
     let dock_h = dpi::dip_to_px(DOCK_HEIGHT, sec.dpi);
-    let Ok(rect) = appbar::register_appbar_on(sec.hwnd, AbEdge::Bottom, dock_h, sec.monitor) else {
+    let edge = dock_edge();
+    let Ok(rect) = appbar::register_appbar_on(sec.hwnd, edge, dock_h, sec.monitor) else {
         log("secondary appbar re-register failed");
         return;
     };
+    let (x, y, w, h) = dock_window_rect(edge, rect, dock_h, dpi::dip_to_px(16.0, sec.dpi));
     // SAFETY: our own dock window, placed on the strip Explorer just reserved.
     unsafe {
-        let _ = SetWindowPos(
-            sec.hwnd,
-            HWND_TOPMOST,
-            rect.left,
-            rect.top,
-            rect.right - rect.left,
-            dock_h + dpi::dip_to_px(16.0, sec.dpi),
-            SWP_NOACTIVATE,
-        );
+        let _ = SetWindowPos(sec.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     }
 }
 
@@ -3095,6 +3249,38 @@ fn update_remote_state(app: &mut App) {
 
 /// Explorer restarted: tray listener off, taskbars hidden once, AppBars registered with the
 /// new Explorer, then the listener back on (if enabled).
+/// Re-resolves the dock edge (SMARTDOCK_DOCK_EDGE, settings.json `dockEdge`, then the taskbar's
+/// own edge). When it moved, closes popups and peeks and, with `rebuild`, posts the
+/// WM_DISPLAYCHANGE rebuild that re-registers every AppBar, resizes the docks and re-renders the
+/// backdrop on the new edge. Returns whether the edge changed.
+fn check_dock_edge(primary: HWND, reason: &str, rebuild: bool) -> bool {
+    // Unknown while APP is busy; the next trigger (or the registry event) re-checks.
+    let Some(setting) = APP.with(|a| {
+        a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.shared.settings.lock().unwrap().dock_edge.clone()))
+    }) else {
+        return false;
+    };
+    let next = win::edge::resolve(&setting);
+    let prev = win::edge::current();
+    if next == prev {
+        return false;
+    }
+    log(&format!("dock edge: {} -> {} ({reason})", prev.name(), next.name()));
+    win::edge::set_current(next);
+    if OPEN.with(Cell::get).is_some() {
+        popup::hide();
+        set_open(None);
+    }
+    thumbnails::hide();
+    if rebuild {
+        // SAFETY: posting to our own primary window.
+        unsafe {
+            let _ = PostMessageW(primary, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
+        }
+    }
+    true
+}
+
 fn reattach_to_explorer(primary: HWND) {
     // Released docks hold no AppBar; bringing them back registers them with the new Explorer.
     if APP.with(|a| a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.docks_released)).unwrap_or(false)) {
@@ -3106,6 +3292,8 @@ fn reattach_to_explorer(primary: HWND) {
     });
     win::traysvc::shutdown();
     appbar::enforce_taskbar_hidden();
+    // The new Explorer may have the taskbar on another edge; the rebuild below uses it.
+    check_dock_edge(primary, "explorer restart", false);
     unsafe {
         // Synchronous: ABM_REMOVE + ABM_NEW for the primary, secondaries rebuilt.
         SendMessageW(primary, WM_DISPLAYCHANGE, WPARAM(0), LPARAM(0));
@@ -3268,6 +3456,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                                 if let Some(disk_settings) = SETTINGS_SEEN.with(|s| settings::load_if_changed(&mut s.borrow_mut())) {
                                     if **current_settings != disk_settings {
                                         appbar::set_hidden_mode(disk_settings.taskbar_mode == "hidden");
+                                        if current_settings.dock_edge != disk_settings.dock_edge {
+                                            // Re-checked once APP is free again.
+                                            // SAFETY: posting to our own primary window.
+                                            unsafe {
+                                                let _ = PostMessageW(app.hwnd, WM_SETTINGCHANGE, WPARAM(0), LPARAM(0));
+                                            }
+                                        }
                                         *current_settings = Arc::new(disk_settings);
                                         app.shared.refresh_slow.store(true, Ordering::SeqCst);
                                     }
@@ -3381,10 +3576,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let tiles_now = dock_tiles_of(hwnd);
             if tiles_now.as_ref().is_some_and(|t| on_speaker(t, x, y)) {
                 // Dragging sideways on the speaker changes the volume; a plain click still opens the panel.
-                VOL_DRAG.with(|d| d.set(Some((x, current_volume(), false))));
+                VOL_DRAG.with(|d| d.set(Some((volume_axis(x, y), current_volume(), false))));
                 let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
             } else if let Some(id) = tiles_now.and_then(|t| widget_id_at(&t, x, y)) {
-                DRAG.with(|d| *d.borrow_mut() = Some(Drag { id, start_x: x, active: false }));
+                DRAG.with(|d| *d.borrow_mut() = Some(Drag { id, start_x: along(x, y), active: false }));
                 let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(hwnd);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -3393,7 +3588,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let (x, y) = client_point(lparam);
             // Finish the drag first: releasing the capture sends WM_CAPTURECHANGED, which cancels one.
             let vol_dragged = VOL_DRAG.with(|d| d.take()).is_some_and(|(_, _, moved)| moved);
-            let dragged = drag_finish(hwnd, x) || vol_dragged;
+            let dragged = drag_finish(hwnd, along(x, y)) || vol_dragged;
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
             if dragged {
                 return LRESULT(0);
@@ -3445,15 +3640,16 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 if wparam.0 & 1 == 0 {
                     VOL_DRAG.with(|d| d.set(None));
                 } else {
-                    let moved = moved || (x - x0).abs() > DRAG_THRESHOLD;
+                    let a = volume_axis(x, y);
+                    let moved = moved || (a - x0).abs() > DRAG_THRESHOLD;
                     VOL_DRAG.with(|d| d.set(Some((x0, v0, moved))));
                     if moved {
-                        set_volume_live(v0 + (x - x0) * VOLUME_PER_DIP);
+                        set_volume_live(v0 + (a - x0) * VOLUME_PER_DIP);
                         return LRESULT(0);
                     }
                 }
             }
-            if drag_mouse_move(hwnd, x, wparam.0 & 1 != 0) {
+            if drag_mouse_move(hwnd, along(x, y), wparam.0 & 1 != 0) {
                 return LRESULT(0);
             }
             // Ask for WM_MOUSELEAVE; Windows cancels the request after each leave.
@@ -3467,9 +3663,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let _ = TrackMouseEvent(&mut tme);
             // Only this dock repaints, and only when something visible changes: the hovered
             // tile, or icon magnification near the apps zone (also once after leaving it).
-            apps::set_pointer(Some(x));
+            apps::set_pointer(Some(along(x, y)));
             let hover_changed = set_hover_on(hwnd, Some((x, y)));
-            let near = near_apps(hwnd, x);
+            let near = near_apps(hwnd, along(x, y));
             let was_near = NEAR_APPS.with(|c| c.replace(near));
             update_app_thumbnails(hwnd, x, y);
             if hover_changed || near || was_near {
@@ -3579,6 +3775,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         }
         WM_SETTINGCHANGE => {
             appbar::enforce_taskbar_hidden();
+            // Explorer broadcasts this after the taskbar is moved (and after any work-area
+            // change, ours included); a no-op unless the edge actually changed.
+            let is_primary = APP.with(|a| a.try_borrow().ok().and_then(|b| b.as_ref().map(|app| app.hwnd == hwnd))).unwrap_or(false);
+            if is_primary {
+                check_dock_edge(hwnd, "setting change", true);
+            }
             LRESULT(0)
         }
         WM_ENDSESSION | WM_CLOSE => {

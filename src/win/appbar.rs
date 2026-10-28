@@ -10,7 +10,7 @@ use windows::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Shell::{
-    SHAppBarMessage, ABE_BOTTOM, ABE_TOP, ABM_GETSTATE, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
+    SHAppBarMessage, ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETSTATE, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
     ABM_SETPOS, ABM_SETSTATE, ABS_ALWAYSONTOP, ABS_AUTOHIDE, APPBARDATA,
 };
 use windows::Win32::UI::Accessibility::{SetWinEventHook, HWINEVENTHOOK};
@@ -29,6 +29,8 @@ const STILL_ACTIVE: u32 = 259;
 pub enum AbEdge {
     Top,
     Bottom,
+    Left,
+    Right,
 }
 
 /// True while the taskbar is hidden by us.
@@ -68,16 +70,44 @@ pub fn enum_monitor_rects() -> Vec<RECT> {
     crate::win::monitors::enum_bounds().into_iter().map(|b| b.to_rect()).collect()
 }
 
-fn edge_rect(mon: RECT, edge: AbEdge, height_px: i32) -> (u32, RECT) {
+/// The AppBar strip of `thickness_px` physical pixels along `edge` of monitor `mon`
+/// (full monitor width for top/bottom, full height for left/right) and its ABE_* code.
+pub fn edge_rect(mon: RECT, edge: AbEdge, thickness_px: i32) -> (u32, RECT) {
     match edge {
         AbEdge::Top => (
             ABE_TOP,
-            RECT { left: mon.left, top: mon.top, right: mon.right, bottom: mon.top + height_px },
+            RECT { left: mon.left, top: mon.top, right: mon.right, bottom: mon.top + thickness_px },
         ),
         AbEdge::Bottom => (
             ABE_BOTTOM,
-            RECT { left: mon.left, top: mon.bottom - height_px, right: mon.right, bottom: mon.bottom },
+            RECT { left: mon.left, top: mon.bottom - thickness_px, right: mon.right, bottom: mon.bottom },
         ),
+        AbEdge::Left => (
+            ABE_LEFT,
+            RECT { left: mon.left, top: mon.top, right: mon.left + thickness_px, bottom: mon.bottom },
+        ),
+        AbEdge::Right => (
+            ABE_RIGHT,
+            RECT { left: mon.right - thickness_px, top: mon.top, right: mon.right, bottom: mon.bottom },
+        ),
+    }
+}
+
+/// The work area a monitor needs so maximized windows stop at a dock on `edge` whose window
+/// rect is `dock`, or `None` when `work` already leaves the dock free (or the dock does not sit
+/// on that edge of `mon`). Bottom keeps the original rule: the dock top in the lower half.
+pub fn work_area_fix(edge: AbEdge, mon: RECT, work: RECT, dock: RECT) -> Option<RECT> {
+    let mid_y = mon.top + (mon.bottom - mon.top) / 2;
+    let mid_x = mon.left + (mon.right - mon.left) / 2;
+    match edge {
+        AbEdge::Bottom => (dock.top > mid_y && dock.top < mon.bottom && work.bottom > dock.top)
+            .then_some(RECT { bottom: dock.top, ..work }),
+        AbEdge::Top => (dock.bottom < mid_y && dock.bottom > mon.top && work.top < dock.bottom)
+            .then_some(RECT { top: dock.bottom, ..work }),
+        AbEdge::Left => (dock.right < mid_x && dock.right > mon.left && work.left < dock.right)
+            .then_some(RECT { left: dock.right, ..work }),
+        AbEdge::Right => (dock.left > mid_x && dock.left < mon.right && work.right > dock.left)
+            .then_some(RECT { right: dock.left, ..work }),
     }
 }
 
@@ -424,25 +454,30 @@ pub fn recover_from_previous_crash() {
 }
 
 
-/// True when the work area of `dock`'s monitor reaches below the dock top.
+/// True when the work area of `dock`'s monitor reaches under the dock (its inner edge).
 pub fn work_area_missing(dock: HWND) -> bool {
+    dock_work_area(dock).is_some_and(|(_, _, fix)| fix.is_some())
+}
+
+/// Monitor rect, work area and the needed fix (`work_area_fix`) for one dock window.
+fn dock_work_area(dock: HWND) -> Option<(RECT, RECT, Option<RECT>)> {
     use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindow};
     // SAFETY: plain queries on our own dock window.
     unsafe {
         if !IsWindow(dock).as_bool() {
-            return false;
+            return None;
         }
         let mut wr = RECT::default();
         if GetWindowRect(dock, &mut wr).is_err() {
-            return false;
+            return None;
         }
         let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
         if !GetMonitorInfoW(MonitorFromWindow(dock, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
-            return false;
+            return None;
         }
-        let m = mi.rcMonitor;
-        wr.top > m.top + (m.bottom - m.top) / 2 && wr.top < m.bottom && mi.rcWork.bottom > wr.top
+        let fix = work_area_fix(crate::win::edge::current(), mi.rcMonitor, mi.rcWork, wr);
+        Some((mi.rcMonitor, mi.rcWork, fix))
     }
 }
 
@@ -450,46 +485,24 @@ pub fn work_area_missing(dock: HWND) -> bool {
 static WORK_AREA_FORCED: AtomicBool = AtomicBool::new(false);
 static WORK_AREA_LOGS: AtomicU32 = AtomicU32::new(0);
 
-/// If the work area of `dock`'s monitor extends below the dock's top edge (maximized windows
-/// would slide under the dock), set it explicitly to end at the dock top. Returns true when
+/// If the work area of `dock`'s monitor reaches under the dock (maximized windows would slide
+/// under it), set it explicitly to end at the dock's inner edge. Returns true when
 /// it had to fix something.
 pub fn ensure_work_area(dock: HWND) -> bool {
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowRect, IsWindow, SystemParametersInfoW, SPIF_SENDCHANGE, SPI_SETWORKAREA,
-    };
-    // SAFETY: plain queries on our own dock window; the rect outlives the SPI call.
-    unsafe {
-        if !IsWindow(dock).as_bool() {
-            return false;
-        }
-        let mut wr = RECT::default();
-        if GetWindowRect(dock, &mut wr).is_err() {
-            return false;
-        }
-        let mon = MonitorFromWindow(dock, MONITOR_DEFAULTTONEAREST);
-        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
-        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
-            return false;
-        }
-        let (m, work) = (mi.rcMonitor, mi.rcWork);
-        let top = wr.top;
-        // Sanity: the dock must sit in the lower part of this monitor.
-        if top <= m.top + (m.bottom - m.top) / 2 || top >= m.bottom || work.bottom <= top {
-            return false;
-        }
-        let mut want = RECT { left: work.left, top: work.top, right: work.right, bottom: top };
-        let ok = SystemParametersInfoW(SPI_SETWORKAREA, 0, Some(&mut want as *mut RECT as *mut _), SPIF_SENDCHANGE).is_ok();
-        WORK_AREA_FORCED.store(true, Ordering::SeqCst);
-        let n = WORK_AREA_LOGS.fetch_add(1, Ordering::SeqCst);
-        if n < 20 || n % 100 == 0 {
-            crate::log(&format!(
-                "workarea: monitor ({},{}..{},{}) work bottom {} was below dock top {}; set ({},{}..{},{}) ok={ok}",
-                m.left, m.top, m.right, m.bottom, work.bottom, top, want.left, want.top, want.right, want.bottom
-            ));
-        }
-        true
+    use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPIF_SENDCHANGE, SPI_SETWORKAREA};
+    let Some((m, work, Some(mut want))) = dock_work_area(dock) else { return false };
+    // SAFETY: want is a valid RECT that outlives the SPI call.
+    let ok = unsafe { SystemParametersInfoW(SPI_SETWORKAREA, 0, Some(&mut want as *mut RECT as *mut _), SPIF_SENDCHANGE) }.is_ok();
+    WORK_AREA_FORCED.store(true, Ordering::SeqCst);
+    let n = WORK_AREA_LOGS.fetch_add(1, Ordering::SeqCst);
+    if n < 20 || n % 100 == 0 {
+        crate::log(&format!(
+            "workarea: monitor ({},{}..{},{}) work ({},{}..{},{}) overlapped the {} dock; set ({},{}..{},{}) ok={ok}",
+            m.left, m.top, m.right, m.bottom, work.left, work.top, work.right, work.bottom,
+            crate::win::edge::current().name(), want.left, want.top, want.right, want.bottom
+        ));
     }
+    true
 }
 
 /// On exit: give every monitor its full area back if we ever forced one, so nothing stays
@@ -503,5 +516,42 @@ fn release_forced_work_areas() {
         // SAFETY: m is a valid RECT for the call.
         let ok = unsafe { SystemParametersInfoW(SPI_SETWORKAREA, 0, Some(&mut m as *mut RECT as *mut _), SPIF_SENDCHANGE) }.is_ok();
         crate::log(&format!("workarea: released ({},{}..{},{}) ok={ok}", m.left, m.top, m.right, m.bottom));
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+
+    const MON: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+
+    #[test]
+    fn dock_edge_rect_covers_each_edge() {
+        assert_eq!(edge_rect(MON, AbEdge::Bottom, 65), (ABE_BOTTOM, RECT { left: 0, top: 1015, right: 1920, bottom: 1080 }));
+        assert_eq!(edge_rect(MON, AbEdge::Top, 65), (ABE_TOP, RECT { left: 0, top: 0, right: 1920, bottom: 65 }));
+        assert_eq!(edge_rect(MON, AbEdge::Left, 65), (ABE_LEFT, RECT { left: 0, top: 0, right: 65, bottom: 1080 }));
+        assert_eq!(edge_rect(MON, AbEdge::Right, 65), (ABE_RIGHT, RECT { left: 1855, top: 0, right: 1920, bottom: 1080 }));
+        // A secondary monitor left of the primary (negative coordinates).
+        let sec = RECT { left: -1280, top: 100, right: 0, bottom: 1124 };
+        assert_eq!(edge_rect(sec, AbEdge::Right, 52).1, RECT { left: -52, top: 100, right: 0, bottom: 1124 });
+        assert_eq!(edge_rect(sec, AbEdge::Left, 52).1, RECT { left: -1280, top: 100, right: -1228, bottom: 1124 });
+    }
+
+    #[test]
+    fn dock_edge_work_area_fix_per_edge() {
+        // Bottom: unchanged rule (window may extend below the monitor for the corner).
+        let dock = RECT { left: 0, top: 1028, right: 1920, bottom: 1096 };
+        assert_eq!(work_area_fix(AbEdge::Bottom, MON, MON, dock), Some(RECT { bottom: 1028, ..MON }));
+        assert_eq!(work_area_fix(AbEdge::Bottom, MON, RECT { bottom: 1028, ..MON }, dock), None);
+        let dock = edge_rect(MON, AbEdge::Top, 52).1;
+        assert_eq!(work_area_fix(AbEdge::Top, MON, MON, dock), Some(RECT { top: 52, ..MON }));
+        assert_eq!(work_area_fix(AbEdge::Top, MON, RECT { top: 52, ..MON }, dock), None);
+        let dock = edge_rect(MON, AbEdge::Left, 52).1;
+        assert_eq!(work_area_fix(AbEdge::Left, MON, MON, dock), Some(RECT { left: 52, ..MON }));
+        assert_eq!(work_area_fix(AbEdge::Left, MON, RECT { left: 60, ..MON }, dock), None);
+        let dock = edge_rect(MON, AbEdge::Right, 52).1;
+        assert_eq!(work_area_fix(AbEdge::Right, MON, MON, dock), Some(RECT { right: 1868, ..MON }));
+        // A dock that is not on that edge is never "fixed".
+        assert_eq!(work_area_fix(AbEdge::Left, MON, MON, edge_rect(MON, AbEdge::Right, 52).1), None);
     }
 }

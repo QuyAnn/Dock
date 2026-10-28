@@ -114,6 +114,10 @@ pub fn max_height_for(anchor: RectF) -> f32 {
     let monitor = monitor_rect(anchor);
     let margin = dpi::dip_to_px(MARGIN, dpi);
     let gap = dpi::dip_to_px(GAP, dpi);
+    if beside_side_dock(crate::win::edge::current(), anchor, monitor) {
+        // Beside a left/right dock the popup may use the monitor's full height.
+        return (monitor.bottom - monitor.top - 2 * margin).max(1) as f32 * 96.0 / dpi as f32;
+    }
     let below = anchor.y + anchor.h / 2.0 < (monitor.top + monitor.bottom) as f32 / 2.0;
     let px = if below {
         monitor.bottom - margin - ((anchor.y + anchor.h).round() as i32 + gap)
@@ -364,10 +368,43 @@ fn monitor_rect(anchor: RectF) -> RECT {
 }
 
 fn popup_rect_for(anchor: RectF, width: i32, height: i32, dpi: u32, monitor: RECT) -> RECT {
+    popup_rect_on(crate::win::edge::current(), anchor, width, height, dpi, monitor)
+}
+
+/// True when `anchor` sits on the dock of a left/right `edge` (its centre within the outer
+/// quarter of the monitor on that side): such popups open beside the dock.
+fn beside_side_dock(edge: crate::win::edge::AbEdge, anchor: RectF, monitor: RECT) -> bool {
+    use crate::win::edge::AbEdge;
+    let cx = anchor.x + anchor.w / 2.0;
+    let quarter = (monitor.right - monitor.left) as f32 / 4.0;
+    match edge {
+        AbEdge::Left => cx < monitor.left as f32 + quarter,
+        AbEdge::Right => cx > monitor.right as f32 - quarter,
+        _ => false,
+    }
+}
+
+/// Popup window rect (physical px) for a dock on `edge`: above a bottom dock / below a top dock
+/// (the anchor's half of the monitor decides, as always), beside a left or right dock, centred
+/// on the anchor along the dock and kept `MARGIN` inside the monitor.
+pub(crate) fn popup_rect_on(edge: crate::win::edge::AbEdge, anchor: RectF, width: i32, height: i32, dpi: u32, monitor: RECT) -> RECT {
+    use crate::win::edge::AbEdge;
     let margin = dpi::dip_to_px(MARGIN, dpi);
     let gap = dpi::dip_to_px(GAP, dpi);
     let min_x = monitor.left + margin;
     let max_x = (monitor.right - width - margin).max(min_x);
+    if beside_side_dock(edge, anchor, monitor) {
+        let x = if edge == AbEdge::Left {
+            (anchor.x + anchor.w).round() as i32 + gap
+        } else {
+            anchor.x.round() as i32 - width - gap
+        }
+        .clamp(min_x, max_x);
+        let min_y = monitor.top + margin;
+        let max_y = (monitor.bottom - height - margin).max(min_y);
+        let y = ((anchor.y + anchor.h / 2.0).round() as i32 - height / 2).clamp(min_y, max_y);
+        return RECT { left: x, top: y, right: x + width, bottom: y + height };
+    }
     let x = ((anchor.x + anchor.w / 2.0).round() as i32 - width / 2).clamp(min_x, max_x);
     let below = anchor.y + anchor.h / 2.0 < (monitor.top + monitor.bottom) as f32 / 2.0;
     let preferred_y = if below {
@@ -665,5 +702,36 @@ mod memory_tests {
         });
         assert_eq!(Arc::strong_count(&bg), 1);
         POPUP.with(|p| { p.borrow_mut().take(); });
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+    use crate::win::edge::AbEdge;
+
+    const MON: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+
+    #[test]
+    fn dock_edge_popup_opens_toward_the_screen() {
+        // Bottom dock: above the anchor; top dock: below it (unchanged rule).
+        let a = RectF { x: 900.0, y: 1028.0, w: 40.0, h: 52.0 };
+        let r = popup_rect_on(AbEdge::Bottom, a, 300, 200, 96, MON);
+        assert!(r.bottom <= 1028 && r.left == 770);
+        let a = RectF { x: 900.0, y: 0.0, w: 40.0, h: 52.0 };
+        let r = popup_rect_on(AbEdge::Top, a, 300, 200, 96, MON);
+        assert!(r.top >= 52 && r.left == 770);
+        // Left dock: right of the dock, centred on the anchor vertically.
+        let a = RectF { x: 0.0, y: 500.0, w: 52.0, h: 40.0 };
+        let r = popup_rect_on(AbEdge::Left, a, 300, 200, 96, MON);
+        assert!(r.left >= 52 && r.top == 420, "{r:?}");
+        // Right dock: left of the dock, clamped inside the monitor near the bottom.
+        let a = RectF { x: 1868.0, y: 1000.0, w: 52.0, h: 40.0 };
+        let r = popup_rect_on(AbEdge::Right, a, 300, 200, 96, MON);
+        assert!(r.right <= 1868 && r.bottom <= 1080, "{r:?}");
+        // An anchor away from the side dock falls back to the above/below rule.
+        let a = RectF { x: 900.0, y: 100.0, w: 40.0, h: 40.0 };
+        let r = popup_rect_on(AbEdge::Left, a, 300, 200, 96, MON);
+        assert!(r.top >= 140);
     }
 }

@@ -263,9 +263,15 @@ fn show(pending: Pending) {
     let pad = dpi::dip_to_px(PAD, dpi);
     let gap = dpi::dip_to_px(GAP, dpi);
 
-    let cx = (pending.anchor.left + pending.anchor.right) / 2;
-    let x = cx - width / 2;
-    let y = pending.anchor.top - height - dpi::dip_to_px(LIFT, dpi);
+    // Above a bottom dock (as before), below a top dock, beside a left/right one.
+    let edge = crate::win::edge::current();
+    let (x, y) = if edge == crate::win::edge::AbEdge::Bottom {
+        let cx = (pending.anchor.left + pending.anchor.right) / 2;
+        (cx - width / 2, pending.anchor.top - height - dpi::dip_to_px(LIFT, dpi))
+    } else {
+        let free = RECT { left: i32::MIN / 4, top: i32::MIN / 4, right: i32::MAX / 4, bottom: i32::MAX / 4 };
+        crate::win::edge::place_beside(edge, pending.anchor, (width, height), dpi::dip_to_px(LIFT, dpi), free)
+    };
 
     let mut thumbs = Vec::new();
     HOST.with(|h| {
@@ -378,7 +384,14 @@ fn poll_leave(dock: HWND) {
         let a = host.anchor;
         // Bridge the gap between the icon and the peek so moving up never flickers it away.
         let in_host = pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom;
-        let in_bridge = pt.x >= a.left && pt.x < a.right && pt.y >= rc.bottom && pt.y < a.top;
+        let in_span_x = pt.x >= a.left && pt.x < a.right;
+        let in_span_y = pt.y >= a.top && pt.y < a.bottom;
+        let in_bridge = match crate::win::edge::current() {
+            crate::win::edge::AbEdge::Bottom => in_span_x && pt.y >= rc.bottom && pt.y < a.top,
+            crate::win::edge::AbEdge::Top => in_span_x && pt.y >= a.bottom && pt.y < rc.top,
+            crate::win::edge::AbEdge::Left => in_span_y && pt.x >= a.right && pt.x < rc.left,
+            crate::win::edge::AbEdge::Right => in_span_y && pt.x >= rc.right && pt.x < a.left,
+        };
         let in_anchor = pt.x >= a.left && pt.x < a.right && pt.y >= a.top && pt.y < a.bottom;
         if in_host || in_bridge || in_anchor {
             host.outside_ms = 0;
