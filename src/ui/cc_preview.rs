@@ -372,6 +372,13 @@ pub fn render_popup(
     let settings = crate::settings::Settings::default();
     let mut data = crate::ui::tiles::DataState { weather: Some(sample_weather()), ..Default::default() };
     data.media = Some(Media { title: "Golden Hour".into(), artist: "SmartDock Demo".into(), playing: true });
+    // Sample usage (the same rows as a real Cursor plan) so the AI popup shows its bars.
+    let win = |label: &str, used_pct: f32, reset: &str| crate::model::AiWindow { label: label.into(), used_pct, reset_text: reset.into() };
+    data.ai = vec![crate::model::AiUsage {
+        name: "Cursor".into(),
+        windows: vec![win("Plan (chu kỳ)", 356.0, "$71.24/$20.00"), win("Auto + Composer", 74.0, ""), win("API models", 84.0, "")],
+        ..Default::default()
+    }];
     let kind = match name {
         "calendar" => Some(PopupKind::Clock),
         "weather" => Some(PopupKind::Weather),
