@@ -395,7 +395,7 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
         // Light glass stays milky; over very bright content it adds a touch of grey body so the
         // module edge and the dark ink still separate from a white page.
         // Clear light glass: a thin neutral-grey veil, so the blurred backdrop shows through.
-        Layer::ControlLight => ([100.0, 97.0, 96.0], 0.48),
+        Layer::ControlLight => ([110.0, 106.0, 105.0], 0.50),
         // The panel is a lighter smoke than the modules (~30%), thickening on bright content so the
         // modules on top still read as darker, distinct pieces.
         Layer::CcPanel => {
