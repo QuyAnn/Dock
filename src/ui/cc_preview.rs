@@ -214,6 +214,78 @@ fn render_live(
     })
 }
 
+/// `--render-popup` with `SMARTDOCK_CC_LIVE=<scale>`: the live popup path. The desktop at `scale`
+/// (box-downsampled from the 2x crop), a popup window at (`x0`, `y0`) DIP whose backdrop is built
+/// like `glass::popup_backdrop_for(.., true)` (`render_frost_with(CONTROL_LENS)` over the window
+/// rect + `add_bright_detail`), painted like `popup::paint` (clear glass, panel at 0.5), composited.
+#[allow(clippy::too_many_arguments)]
+fn render_popup_live(
+    out_path: &Path,
+    background_2x: &[u8],
+    w2: u32,
+    h2: u32,
+    canvas: (f32, f32),
+    window: (f32, f32, f32, f32),
+    scale: f32,
+    radius: f32,
+    paint_content: impl Fn(&mut Renderer, RectF) -> Result<()>,
+) -> Result<()> {
+    let (px_w, px_h) = ((canvas.0 * scale).round() as u32, (canvas.1 * scale).round() as u32);
+    let k = SCALE as f32 / scale;
+    let mut desk = vec![0u8; (px_w * px_h * 4) as usize];
+    for y in 0..px_h {
+        for x in 0..px_w {
+            let (sx0, sy0) = (x as f32 * k, y as f32 * k);
+            let mut acc = [0f32; 4];
+            let mut n = 0f32;
+            let mut yy = sy0;
+            while yy < sy0 + k - 1e-3 {
+                let mut xx = sx0;
+                while xx < sx0 + k - 1e-3 {
+                    let (ix, iy) = ((xx as u32).min(w2 - 1), (yy as u32).min(h2 - 1));
+                    let o = ((iy * w2 + ix) * 4) as usize;
+                    for c in 0..4 {
+                        acc[c] += background_2x[o + c] as f32;
+                    }
+                    n += 1.0;
+                    xx += 1.0;
+                }
+                yy += 1.0;
+            }
+            let o = ((y * px_w + x) * 4) as usize;
+            for c in 0..4 {
+                desk[o + c] = (acc[c] / n.max(1.0)).round() as u8;
+            }
+        }
+    }
+    let to_px = |dip: f32| (dip * scale).round() as i32;
+    let (wx, wy, ww, wh) = (to_px(window.0), to_px(window.1), to_px(window.2), to_px(window.3));
+    let grab = ScreenGrab { x: 0, y: 0, w: px_w as i32, h: px_h as i32, rgba: desk.clone() };
+    let win = RectF { x: wx as f32, y: wy as f32, w: ww as f32, h: wh as f32 };
+    let mut frost = liquid::render_frost_with(&grab, win, scale, &liquid::CONTROL_LENS);
+    liquid::add_bright_detail(&mut frost, &grab, win, scale);
+    let frost = Arc::new(frost);
+    let dpi = (96.0 * scale).round() as u32;
+    let (w, h) = (ww as f32 / scale, wh as f32 / scale);
+    let tmp = out_path.with_extension("window.png");
+    Renderer::render_png(&tmp, ww as u32, wh as u32, dpi, |r| {
+        super::glass::set_backdrop(Some(frost.clone()), w, h);
+        let panel = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
+        let mut painted = Ok(());
+        let surface = super::popup::paint_clear_glass(r, panel, radius, |r, rc| painted = paint_content(r, rc));
+        super::glass::set_backdrop(None, w, h);
+        surface.and(painted)
+    })?;
+    let (tw, th, win_px) = wallpaper::thumbnail(&tmp, ww.max(wh) as u32)?;
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(tmp.with_extension("log"));
+    let dip = (px_w as f32 / scale, px_h as f32 / scale);
+    Renderer::render_png(out_path, px_w, px_h, dpi, |r| {
+        r.draw_bitmap(px_w, px_h, &desk, RectF { x: 0.0, y: 0.0, w: dip.0, h: dip.1 })?;
+        r.draw_bitmap(tw, th, &win_px, RectF { x: wx as f32 / scale, y: wy as f32 / scale, w, h })
+    })
+}
+
 /// Same test as `liquid::add_bright_detail`, over the panel area of the full-canvas preview frost.
 fn bright_behind(frost: &liquid::LiquidBitmap, r: RectF) -> bool {
     let (mut sum, mut n) = (0f32, 0f32);
@@ -377,6 +449,23 @@ pub fn render_popup(
     } else {
         (canvas_w - PANEL_RIGHT - w, PANEL_TOP.floor())
     };
+    let paint_content = |r: &mut Renderer, rect: RectF| -> Result<()> {
+        match kind {
+            Some(kind) => pc::draw_popup(r, kind, rect, &data),
+            None => match name {
+                "appmenu" => super::appmenu::paint(r, rect),
+                "dockmenu" => super::appmenu::paint_dock_menu(r, rect),
+                "gallery" => super::gallery::draw(r, rect, &entries),
+                id => super::more_widgets::paint_popup(r, id, rect, &data, &settings),
+            },
+        }
+    };
+    super::glass::set_control_dark(dark);
+    super::glass::set_panel_light(matches!(name, "calendar" | "gallery"));
+    let radius = if super::glass::panel_light() { 24.0 } else { 18.0 };
+    if let Some(scale) = live_scale() {
+        return render_popup_live(out_path, &background, px_w, px_h, (canvas_w, canvas_h), (x0, y0, w, h), scale, radius, paint_content);
+    }
     let s = SCALE as f32;
     // Popup-local backdrop, exactly like `popup_backdrop_for(.., true)` on the live desktop.
     let frost = Arc::new(liquid::render_frost_with(
@@ -386,33 +475,19 @@ pub fn render_popup(
         &liquid::CONTROL_LENS,
     ));
 
-    // Pass 1: the popup window alone (transparent outside its rounded panel).
+    // Pass 1: the popup window alone (transparent outside its rounded panel), in the Control
+    // Center's clear glass (`popup::paint_clear_glass`, the live path).
     let tmp = out_path.with_extension("popup.png");
-    super::glass::set_control_dark(dark);
-    super::glass::set_panel_light(matches!(name, "calendar" | "gallery"));
-    let radius = if super::glass::panel_light() { 24.0 } else { 18.0 };
     let pw = (w * s) as u32;
     let ph = (h * s) as u32;
     Renderer::render_png(&tmp, pw, ph, 96 * SCALE, |r| {
         let panel = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
         let rect = RectF { x: 0.0, y: 0.0, w, h };
         super::glass::set_backdrop(Some(frost.clone()), w, h);
-        let surface = super::glass::draw_popup_surface(r, panel, radius);
-        super::renderer::set_light_ink(!dark);
-        super::renderer::set_popup_text(true);
-        let painted = surface.and_then(|_| match kind {
-            Some(kind) => pc::draw_popup(r, kind, rect, &data),
-            None => match name {
-                "appmenu" => super::appmenu::paint(r, rect),
-                "dockmenu" => super::appmenu::paint_dock_menu(r, rect),
-                "gallery" => super::gallery::draw(r, rect, &entries),
-                id => super::more_widgets::paint_popup(r, id, rect, &data, &settings),
-            },
-        });
-        super::renderer::set_popup_text(false);
-        super::renderer::set_light_ink(false);
+        let mut painted = Ok(());
+        let surface = super::popup::paint_clear_glass(r, panel, radius, |r, _| painted = paint_content(r, rect));
         super::glass::set_backdrop(None, w, h);
-        painted
+        surface.and(painted)
     })?;
     let (tw, th, popup_px) = wallpaper::thumbnail(&tmp, pw.max(ph))?;
     let _ = std::fs::remove_file(&tmp);

@@ -586,6 +586,38 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+/// Every non-Control-Center popup panel in the Control Center's clear glass: the CC panel layer
+/// (light DPI-correct detail blur, local adaptive smoke, thin lens rim) instead of the milky
+/// popup frost, white text with the brightness-adaptive halo, and dark ink only over a
+/// near-white page (the CC rule, `update_control_ink`). `body` paints the content at `rect`.
+/// Needs the popup backdrop set (`glass::set_backdrop`) and `glass::set_control_dark`.
+pub(crate) fn paint_clear_glass(
+    r: &mut super::renderer::Renderer,
+    rect: RectF,
+    radius: f32,
+    body: impl FnOnce(&mut super::renderer::Renderer, RectF),
+) -> windows::core::Result<()> {
+    use super::{glass, renderer};
+    glass::update_control_ink(rect);
+    glass::set_cc_clear(true);
+    renderer::set_halo_sampler(Some(glass::local_brightness));
+    let res = glass::draw_control_panel(r, rect, radius);
+    let ink = glass::control_ink_dark();
+    renderer::set_light_ink(ink);
+    renderer::set_text_shadow(!ink);
+    // Heavier popup type (the Control Center sets its own weights).
+    renderer::set_popup_text(true);
+    if res.is_ok() {
+        body(r, rect);
+    }
+    renderer::set_popup_text(false);
+    renderer::set_text_shadow(false);
+    renderer::set_light_ink(false);
+    renderer::set_halo_sampler(None);
+    glass::set_cc_clear(false);
+    res
+}
+
 fn paint() {
     POPUP.with(|p| {
         // Skip the frame if the state is already borrowed; the next WM_PAINT retries.
@@ -602,18 +634,22 @@ fn paint() {
                 let radius = if super::glass::panel_light() { 24.0 } else { 18.0 };
                 // Every popup shares the Control Center glass (captured once per open).
                 super::glass::set_backdrop(backdrop.clone(), w, h);
-                if !pw.floating_modules {
-                    super::glass::draw_popup_surface(&mut pw.renderer, rect, radius)?;
-                }
-                super::renderer::set_light_ink(!pw.floating_modules && !super::glass::control_dark());
-                // Heavier popup type (the Control Center sets its own weights).
-                super::renderer::set_popup_text(!pw.floating_modules);
-                if let Some(f) = PAINTER.with(Cell::get) {
-                    f(&mut pw.renderer, rect);
-                }
-                super::renderer::set_popup_text(false);
-                super::renderer::set_light_ink(false);
+                let painter = PAINTER.with(Cell::get);
+                let res = if pw.floating_modules {
+                    // The Control Center draws its own panel, ink and halo.
+                    if let Some(f) = painter {
+                        f(&mut pw.renderer, rect);
+                    }
+                    Ok(())
+                } else {
+                    paint_clear_glass(&mut pw.renderer, rect, radius, |r, rc| {
+                        if let Some(f) = painter {
+                            f(r, rc);
+                        }
+                    })
+                };
                 super::glass::set_backdrop(None, w, h);
+                res?;
                 pw.renderer.end()
             });
             if let Err(e) = res {

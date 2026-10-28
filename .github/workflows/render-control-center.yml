@@ -316,6 +316,17 @@ jobs:
             $r = Invoke-Render "render-output\popup_${p}_light.png" "render-inputs\light.jpg" "light" $p
             if ($r) { $failures += $r }
           }
+          # Non-CC popups in the Control Center clear glass through the live path (100%).
+          $env:SMARTDOCK_CC_LIVE = "1"
+          foreach ($wp in @("dark_ide", "web_page", "mixed_top", "wp_city")) {
+            foreach ($p in @("ai", "calendar", "weather")) {
+              $r = Invoke-Render "render-output\popup_live_${p}_${wp}_light.png" "render-inputs\$wp.jpg" "light" $p
+              if ($r) { $failures += $r }
+            }
+            $r = Invoke-Render "render-output\popup_live_ai_${wp}_dark.png" "render-inputs\$wp.jpg" "dark" "ai"
+            if ($r) { $failures += $r }
+          }
+          Remove-Item Env:SMARTDOCK_CC_LIVE
           # Dock on each screen edge (SMARTDOCK_DOCK_EDGE) with a popup opened from its tile.
           foreach ($set in @(@("calendar", "user_desktop", "dark"), @("control", "ocean", "dark"))) {
             $env:SMARTDOCK_DOCK_POPUP = $set[0]
@@ -339,6 +350,31 @@ jobs:
           }
           Remove-Item Env:SMARTDOCK_DOCK_EDGE
           Remove-Item Env:SMARTDOCK_DOCK_POPUP
+          # Active-app pill (SMARTDOCK_DOCK_ACTIVE = foreground fake app) on bottom and right docks.
+          $env:SMARTDOCK_DOCK_ACTIVE = "1"
+          $env:SMARTDOCK_DOCK_POPUP = "weather"
+          foreach ($set in @(@("dark_ide", "light"), @("wp_city", "dark"))) {
+            foreach ($edge in @("bottom", "right")) {
+              $env:SMARTDOCK_DOCK_EDGE = $edge
+              $outPath = [System.IO.Path]::GetFullPath("render-output\dock_active_${edge}_$($set[0]).png")
+              $wallpaperPath = (Resolve-Path "render-inputs\$($set[0]).jpg").Path
+              Write-Host "Rendering $outPath (edge $edge, active app 1)"
+              $process = Start-Process -FilePath $exe `
+                -ArgumentList @("--render-dock", "`"$outPath`"", "`"$wallpaperPath`"", $set[1]) `
+                -RedirectStandardError ([System.IO.Path]::ChangeExtension($outPath, ".stderr.log")) `
+                -RedirectStandardOutput ([System.IO.Path]::ChangeExtension($outPath, ".stdout.log")) `
+                -NoNewWindow -PassThru
+              if (-not $process.WaitForExit(60000)) { $process.Kill($true); $failures += "timed out: dock active $edge" }
+              else {
+                $process.WaitForExit()
+                Show-Logs $outPath
+                if ($process.ExitCode -ne 0) { $failures += "exit $($process.ExitCode) : dock active $edge $($set[0])" }
+              }
+            }
+          }
+          Remove-Item Env:SMARTDOCK_DOCK_EDGE
+          Remove-Item Env:SMARTDOCK_DOCK_POPUP
+          Remove-Item Env:SMARTDOCK_DOCK_ACTIVE
           $icons = [System.IO.Path]::GetFullPath("render-output\icons_sheet.png")
           $process = Start-Process -FilePath $exe -ArgumentList @("--render-icons", "`"$icons`"") -NoNewWindow -PassThru
           if (-not $process.WaitForExit(60000)) { $process.Kill($true); $failures += "timed out: icons" }
@@ -361,6 +397,9 @@ jobs:
           $expected += Get-ChildItem "render-output\cc_*.png" | ForEach-Object { $_.FullName }
           if (@(Get-ChildItem "render-output\dock_edge_*.png").Count -lt 8) { throw "Missing dock edge renders" }
           $expected += Get-ChildItem "render-output\dock_edge_*.png" | ForEach-Object { $_.FullName }
+          if (@(Get-ChildItem "render-output\popup_live_*.png").Count -lt 16) { throw "Missing live popup renders" }
+          if (@(Get-ChildItem "render-output\dock_active_*.png").Count -lt 4) { throw "Missing dock active renders" }
+          $expected += Get-ChildItem "render-output\dock_active_*.png" | ForEach-Object { $_.FullName }
           if (@(Get-ChildItem "render-output\cc_edit*.png").Count -lt 8 -or @(Get-ChildItem "render-output\cc_custom*.png").Count -lt 8) { throw "Missing Edit Controls renders" }
           foreach ($path in $expected) {
             if (-not (Test-Path $path)) { throw "Missing render: $path" }

@@ -532,22 +532,27 @@ fn paint(hwnd: HWND, _hdc: HDC) {
         let panel = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: hgt - 1.0 };
         let _ = r.begin().and_then(|_| {
             super::glass::set_backdrop(backdrop, w, hgt);
-            let surface = super::glass::draw_popup_surface(r, panel, POPUP_CORNER_RADIUS + 4.0);
+            // The Control Center clear glass, like every other popup.
+            let mut drawn: windows::core::Result<()> = Ok(());
+            let surface = super::popup::paint_clear_glass(r, panel, POPUP_CORNER_RADIUS + 4.0, |r, _| {
+                drawn = (|| {
+                    for (title, rc) in &titles {
+                        // DirectWrite: full Unicode (Vietnamese) titles, ellipsized to the thumbnail width.
+                        r.draw_text(title, *rc, 11.0, 0xF4F4_F7FF, Align::Left)?;
+                    }
+                    for b in &buttons {
+                        // Soft translucent disc with a hairline white cross.
+                        r.fill_rounded_rect(*b, CLOSE_SIZE / 2.0, 0xFFFF_FF2E)?;
+                        let (cx, cy, k) = (b.x + b.w / 2.0, b.y + b.h / 2.0, 3.3);
+                        r.stroke_line(cx - k, cy - k, cx + k, cy + k, 0xFFFF_FFE6, 1.4)?;
+                        r.stroke_line(cx - k, cy + k, cx + k, cy - k, 0xFFFF_FFE6, 1.4)?;
+                    }
+                    Ok(())
+                })();
+            });
             super::glass::set_backdrop(None, w, hgt);
             surface?;
-            super::renderer::set_light_ink(!super::glass::control_dark());
-            for (title, rc) in &titles {
-                // DirectWrite: full Unicode (Vietnamese) titles, ellipsized to the thumbnail width.
-                r.draw_text(title, *rc, 11.0, 0xF4F4_F7FF, Align::Left)?;
-            }
-            for b in &buttons {
-                // Soft translucent disc with a hairline white cross.
-                r.fill_rounded_rect(*b, CLOSE_SIZE / 2.0, 0xFFFF_FF2E)?;
-                let (cx, cy, k) = (b.x + b.w / 2.0, b.y + b.h / 2.0, 3.3);
-                r.stroke_line(cx - k, cy - k, cx + k, cy + k, 0xFFFF_FFE6, 1.4)?;
-                r.stroke_line(cx - k, cy + k, cx + k, cy - k, 0xFFFF_FFE6, 1.4)?;
-            }
-            super::renderer::set_light_ink(false);
+            drawn?;
             r.end()
         });
     });

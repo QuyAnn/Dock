@@ -24,7 +24,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, SetLastError, BOOL, E_FAIL, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WIN32_ERROR, WPARAM,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT};
 use windows::Win32::System::Console::SetConsoleCtrlHandler;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -112,6 +112,27 @@ const TIMER_GUARD: usize = 2; // 500 ms: keep the Windows taskbar hidden
 const TIMER_EXPLORER: usize = 0x5E5E; // one-shot: Explorer restarted, re-attach after it settles
 const TIMER_VISUALIZER: usize = 3; // ~30 fps, enabled only while media is playing
 const TIMER_STOPWATCH: usize = 4; // tenths of a second, only while its widget/popup is visible
+const TIMER_ACTIVE: usize = 5; // ~60 fps for 0.18 s after the app in front changes, then killed
+
+/// The primary dock window, for the foreground hook's repaint request.
+static DOCK_MAIN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// Foreground observer (EVENT_SYSTEM_FOREGROUND, on the UI thread via the message loop): usage
+/// tracking plus the dock's active-app pill. It only invalidates the dock (WM_PAINT repaints
+/// every dock) and arms a short grow-in timer; nothing polls.
+fn on_foreground_change(hwnd: isize) {
+    data::usage::on_foreground(hwnd);
+    let (root, exe) = tasks::app_window_of(hwnd);
+    ui::apps::set_foreground(root, exe);
+    let main = DOCK_MAIN.load(std::sync::atomic::Ordering::Relaxed);
+    if main != 0 {
+        // SAFETY: our own window; both calls only queue work for the message loop.
+        unsafe {
+            let _ = InvalidateRect(HWND(main as _), None, false);
+            SetTimer(HWND(main as _), TIMER_ACTIVE, 16, None);
+        }
+    }
+}
 const HOTKEY_TOGGLE: i32 = 1;
 
 /// Data shared with the background refresh thread. Blocking calls run there, never on the UI thread.
@@ -806,7 +827,11 @@ fn run() -> windows::core::Result<()> {
     // ABM_QUERYPOS can return a rect one taskbar-height above rcMonitor.bottom.
     appbar::hide_taskbar(initial_settings.taskbar_mode == "hidden");
     appbar::install_tray_show_hook();
-    tasks::install_foreground_hook(Some(data::usage::on_foreground));
+    tasks::install_foreground_hook(Some(on_foreground_change));
+    {
+        let (root, exe) = tasks::app_window_of(tasks::foreground_hwnd());
+        ui::apps::set_foreground(root, exe);
+    }
 
     // The dock sits on the taskbar's edge (or settings.json `dockEdge`); bottom by default.
     let edge = win::edge::resolve(&initial_settings.dock_edge);
@@ -936,6 +961,7 @@ fn run() -> windows::core::Result<()> {
     unsafe {
         // SAFETY: hwnd is live; timers drive refresh and the taskbar guard.
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        DOCK_MAIN.store(hwnd.0 as isize, std::sync::atomic::Ordering::Relaxed);
         SetTimer(hwnd, TIMER_REFRESH, 1000, None);
         SetTimer(hwnd, TIMER_STOPWATCH, 100, None);
         SetTimer(hwnd, TIMER_GUARD, 500, None);
@@ -3549,6 +3575,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     guard_work_area(hwnd);
                 }
                 TIMER_VISUALIZER => repaint(),
+                TIMER_ACTIVE => {
+                    repaint();
+                    if !ui::apps::active_animating() {
+                        let _ = KillTimer(hwnd, TIMER_ACTIVE);
+                    }
+                }
                 TIMER_STOPWATCH => {
                     let (_,running,_) = data::productivity::watch_summary();
                     if running {

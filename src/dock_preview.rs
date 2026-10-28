@@ -98,6 +98,13 @@ pub fn render(out: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
         minimized: false,
     })
     .collect();
+    // SMARTDOCK_DOCK_ACTIVE=<index>: that fake app is the foreground app (blue active pill).
+    if let Some(i) = std::env::var("SMARTDOCK_DOCK_ACTIVE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        if let Some(w) = apps.windows.get(i) {
+            note(&format!("active app {i}: {}", w.exe));
+            crate::ui::apps::set_foreground_settled(w.hwnd, w.exe.clone());
+        }
+    }
     let mut data = DataState::default();
     data.media = Some(Media { title: "Golden Hour".into(), artist: "SmartDock Demo".into(), playing: true });
     let stats = Stats { cpu_pct: 23.0, ram_used_mb: 9200, ram_total_mb: 16384 };
@@ -164,7 +171,10 @@ pub fn render(out: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
     ));
     let grab = ScreenGrab { x: 0, y: 0, w: sw as i32, h: sh as i32, rgba: desk.clone() };
     let win = RectF { x: rect.left as f32, y: rect.top as f32, w, h };
-    let frost = Arc::new(liquid::render_frost_with(&grab, win, 1.0, &liquid::CONTROL_LENS));
+    // Same calls as `glass::popup_backdrop_for(.., true)`.
+    let mut frost = liquid::render_frost_with(&grab, win, 1.0, &liquid::CONTROL_LENS);
+    liquid::add_bright_detail(&mut frost, &grab, win, 1.0);
+    let frost = Arc::new(frost);
     let popup_tmp = out.with_extension("popup.png");
     crate::ui::glass::set_control_dark(dark);
     crate::ui::glass::set_panel_light(kind == Some(PopupKind::Clock));
@@ -174,14 +184,12 @@ pub fn render(out: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
         let full = RectF { x: 0.0, y: 0.0, w, h };
         crate::ui::glass::set_backdrop(Some(frost.clone()), w, h);
         let painted = match kind {
-            Some(kind) => crate::ui::glass::draw_popup_surface(r, panel, radius).and_then(|_| {
-                crate::ui::renderer::set_light_ink(!dark);
-                crate::ui::renderer::set_popup_text(true);
-                let res = pc::draw_popup(r, kind, full, &data);
-                crate::ui::renderer::set_popup_text(false);
-                crate::ui::renderer::set_light_ink(false);
-                res
-            }),
+            Some(kind) => {
+                // The live popup path: Control Center clear glass.
+                let mut res = Ok(());
+                let surface = crate::ui::popup::paint_clear_glass(r, panel, radius, |r, _| res = pc::draw_popup(r, kind, full, &data));
+                surface.and(res)
+            }
             None => control_center::draw(r, panel, &control, data.media.as_ref()),
         };
         crate::ui::glass::set_backdrop(None, w, h);
