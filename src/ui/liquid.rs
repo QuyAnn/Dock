@@ -33,8 +33,9 @@ pub struct LiquidBitmap {
     pub w: u32,
     pub h: u32,
     pub rgba: Vec<u8>,
-    /// Unblurred wallpaper crop of the same size, fully opaque. Painted as the bar itself so the
-    /// dock looks transparent between the tiles. Empty for popup backdrops.
+    /// Dock: unblurred wallpaper crop of the same size, fully opaque, painted as the bar itself so
+    /// the dock looks transparent between the tiles. Control Center over a bright page: a lightly
+    /// blurred frost for the pale glass (see `add_bright_detail`). Otherwise empty.
     pub plain: Vec<u8>,
 }
 
@@ -69,6 +70,34 @@ pub const FROST_LENS: LensOptions =
 /// behind each module stay readable, and almost no saturation boost (no colour cast).
 pub const CONTROL_LENS: LensOptions =
     LensOptions { radius: 8.0, band: 1.0, strength: 0.0, blur: 16.0, saturate: 1.25, aberration: 0.0 };
+
+/// Light frost kept beside `CONTROL_LENS` when the Control Center sits on a bright page: the pale
+/// glass samples it so page content (text lines, window edges) stays visible, softly blurred.
+pub const BRIGHT_DETAIL_LENS: LensOptions =
+    LensOptions { radius: 8.0, band: 1.0, strength: 0.0, blur: 3.0, saturate: 1.15, aberration: 0.0 };
+
+/// Adds the bright-page detail frost (`BRIGHT_DETAIL_LENS`) to a Control Center backdrop as its
+/// `plain` layer, but only when the frost is bright on average (otherwise nothing is kept).
+pub fn add_bright_detail(frost: &mut LiquidBitmap, grab: &ScreenGrab, rect: RectF, dpr: f32) {
+    let n = (frost.w * frost.h) as usize;
+    if n == 0 {
+        return;
+    }
+    let step = (n / 4096).max(1);
+    let (mut sum, mut cnt) = (0f32, 0f32);
+    for i in (0..n).step_by(step) {
+        let c = &frost.rgba[i * 4..i * 4 + 3];
+        sum += 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
+        cnt += 1.0;
+    }
+    if sum / cnt < 175.0 {
+        return;
+    }
+    let detail = render_frost_with(grab, rect, dpr, &BRIGHT_DETAIL_LENS);
+    if detail.w == frost.w && detail.h == frost.h {
+        frost.plain = detail.rgba;
+    }
+}
 
 /// Frosted backdrop from the wallpaper alone (used until a live screen grab is possible).
 pub fn render_popup(wallpaper: &WallpaperPixels, rect: RectF, screen: (i32, i32), dpr: f32) -> LiquidBitmap {

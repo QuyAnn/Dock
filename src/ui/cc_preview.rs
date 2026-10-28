@@ -49,12 +49,17 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
         rgba: background.clone(),
     };
     // Same material as the live Control Center popup (`popup_backdrop_for(.., true)`).
-    let frost = Arc::new(liquid::render_frost_with(
-        &grab,
-        RectF { x: 0.0, y: 0.0, w: px_w as f32, h: px_h as f32 },
-        SCALE as f32,
-        &liquid::CONTROL_LENS,
-    ));
+    let full = RectF { x: 0.0, y: 0.0, w: px_w as f32, h: px_h as f32 };
+    let mut frost = liquid::render_frost_with(&grab, full, SCALE as f32, &liquid::CONTROL_LENS);
+    // Live popups measure only the area behind the panel; do the same here.
+    let behind = RectF { x: (CANVAS_W as f32 - PANEL_RIGHT - control_center::WIDTH) * SCALE as f32, y: PANEL_TOP * SCALE as f32, w: control_center::WIDTH * SCALE as f32, h: control_center::HEIGHT * SCALE as f32 };
+    if bright_behind(&frost, behind) {
+        let detail = liquid::render_frost_with(&grab, full, SCALE as f32, &liquid::BRIGHT_DETAIL_LENS);
+        if detail.w == frost.w && detail.h == frost.h {
+            frost.plain = detail.rgba;
+        }
+    }
+    let frost = Arc::new(frost);
     trace(&format!("frost rendered {}x{}", frost.w, frost.h));
     let state = ControlState {
         volume: 0.60,
@@ -102,6 +107,22 @@ pub fn render(out_path: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> 
     });
     trace(&format!("render_png returned {result:?}"));
     result
+}
+
+/// Same test as `liquid::add_bright_detail`, over the panel area of the full-canvas preview frost.
+fn bright_behind(frost: &liquid::LiquidBitmap, r: RectF) -> bool {
+    let (mut sum, mut n) = (0f32, 0f32);
+    let (x0, y0) = (r.x.max(0.0) as u32, r.y.max(0.0) as u32);
+    let (x1, y1) = (((r.x + r.w) as u32).min(frost.w), ((r.y + r.h) as u32).min(frost.h));
+    for y in (y0..y1).step_by(8) {
+        for x in (x0..x1).step_by(8) {
+            let o = ((y * frost.w + x) * 4) as usize;
+            let c = &frost.rgba[o..o + 3];
+            sum += 0.2126 * c[0] as f32 + 0.7152 * c[1] as f32 + 0.0722 * c[2] as f32;
+            n += 1.0;
+        }
+    }
+    n > 0.0 && sum / n >= 175.0
 }
 
 /// Nearest-neighbour cover crop is intentional: Direct2D only sees this as the desktop behind the

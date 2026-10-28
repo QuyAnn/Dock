@@ -330,12 +330,18 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
     let hx = pw as f32 / 2.0;
     let hy = ph as f32 / 2.0;
     let r = radius.min(hx).min(hy);
+    // Pale glass over a bright page refracts the lightly blurred detail frost when there is one.
+    let src: &[u8] = if matches!(layer, Layer::ControlInk | Layer::CcPanelInk) && bg.plain.len() == bg.rgba.len() {
+        &bg.plain
+    } else {
+        &bg.rgba
+    };
     let sample = |x: f32, y: f32| -> [f32; 3] {
         let fx = (x - 0.5).clamp(0.0, bg.w as f32 - 1.001);
         let fy = (y - 0.5).clamp(0.0, bg.h as f32 - 1.001);
         let (ix, iy) = (fx as usize, fy as usize);
         let (tx, ty) = (fx - ix as f32, fy - iy as f32);
-        let at = |xx: usize, yy: usize, c: usize| bg.rgba[(yy * bg.w as usize + xx) * 4 + c] as f32;
+        let at = |xx: usize, yy: usize, c: usize| src[(yy * bg.w as usize + xx) * 4 + c] as f32;
         let ix1 = (ix + 1).min(bg.w as usize - 1);
         let iy1 = (iy + 1).min(bg.h as usize - 1);
         [0, 1, 2].map(|c| {
@@ -571,7 +577,11 @@ pub fn popup_backdrop_for(
             w: (rect.right - rect.left) as f32,
             h: (rect.bottom - rect.top) as f32,
         };
-        return Some(Arc::new(super::liquid::render_frost_with(&grab, r, dpr, lens)));
+        let mut frost = super::liquid::render_frost_with(&grab, r, dpr, lens);
+        if control_center {
+            super::liquid::add_bright_detail(&mut frost, &grab, r, dpr);
+        }
+        return Some(Arc::new(frost));
     }
     let source = WALLPAPER.lock().ok()?.clone()?;
     let wp = source.load().ok()?;

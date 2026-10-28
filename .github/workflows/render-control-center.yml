@@ -58,8 +58,8 @@ jobs:
           }
           New-Gradient "render-inputs/ocean.jpg" "#1598A5" "#063D57"
           New-Gradient "render-inputs/light.jpg" "#E9F6FF" "#8BC7E8"
-          # A bright light-theme editor: white page, grey gutter, dark code lines (worst case for
-          # dark glass legibility).
+          # A bright light-theme editor: white page, grey gutter, dark code lines long enough to run
+          # under the Control Center (worst case for dark glass; show-through for the pale glass).
           $bitmap = [System.Drawing.Bitmap]::new(1280, 720)
           $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
           $graphics.Clear([System.Drawing.Color]::White)
@@ -68,7 +68,7 @@ jobs:
           $ink = @([System.Drawing.Color]::FromArgb(36, 41, 47), [System.Drawing.Color]::FromArgb(0, 92, 197), [System.Drawing.Color]::FromArgb(215, 58, 73), [System.Drawing.Color]::FromArgb(111, 66, 193))
           for ($i = 0; $i -lt 38; $i++) {
             $brush = [System.Drawing.SolidBrush]::new($ink[$i % 4])
-            $graphics.DrawString(("    let value_{0} = compute(item, {1}) + offset; // note" -f $i, ($i * 7)), $font, $brush, 240, 8 + $i * 18.5)
+            $graphics.DrawString(("    let value_{0} = compute(item, {1}) + offset * scale.factor(); // note: keep in sync with the table" -f $i, ($i * 7)), $font, $brush, 240, 8 + $i * 18.5)
             $brush.Dispose()
           }
           $graphics.Dispose()
