@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::mem::size_of;
 
-use windows::core::{s, w, Result, HRESULT};
+use windows::core::{s, w, Interface, Result, HRESULT};
 
 /// D2DERR_RECREATE_TARGET: the render target was lost and must be rebuilt.
 const D2DERR_RECREATE_TARGET: HRESULT = HRESULT(0x8899_000C_u32 as i32);
@@ -17,6 +17,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, ID2D1Bitmap, ID2D1Factory1, ID2D1HwndRenderTarget, ID2D1SolidColorBrush,
+    ID2D1RenderTarget,
     ID2D1StrokeStyle, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
@@ -156,6 +157,8 @@ pub struct Renderer {
     pixel_h: u32,
     dpi: u32,
     target: Option<ID2D1HwndRenderTarget>,
+    /// Base target used by both the normal HWND surface and the Control Center PNG renderer.
+    base_target: Option<ID2D1RenderTarget>,
     brush: Option<ID2D1SolidColorBrush>,
     /// GPU bitmaps reused across frames (liquid backdrop, app icons). Keyed by the source
     /// buffer address/size plus a content fingerprint; dropped with the render target.
@@ -172,9 +175,133 @@ impl Renderer {
             pixel_h: pixel_h.max(1) as u32,
             dpi: dpi.max(96),
             target: None,
+            base_target: None,
             brush: None,
             bitmaps: crate::cache::ByteCache::new(32 * 1024 * 1024),
             frame: 0,
+        }
+    }
+
+    /// Renders one deterministic frame into an offscreen WIC bitmap and saves it as PNG.
+    /// This is used only by the Control Center developer preview command.
+    pub fn render_png(
+        path: &std::path::Path,
+        pixel_w: u32,
+        pixel_h: u32,
+        dpi: u32,
+        draw: impl FnOnce(&mut Renderer) -> Result<()>,
+    ) -> Result<()> {
+        use std::io::Write;
+        use std::iter::once;
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::GENERIC_WRITE;
+        use windows::Win32::Graphics::Imaging::{
+            CLSID_WICImagingFactory, GUID_ContainerFormatPng, GUID_WICPixelFormat32bppPBGRA,
+            IWICBitmapFrameEncode, IWICImagingFactory, WICBitmapCacheOnLoad,
+            WICBitmapEncoderNoCache,
+        };
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows::Win32::System::Com::StructuredStorage::IPropertyBag2;
+
+        let mut trace = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.with_extension("log"))
+            .ok();
+        macro_rules! trace {
+            ($message:expr) => {
+                if let Some(file) = trace.as_mut() {
+                    let _ = writeln!(file, "render-wic: {}", $message);
+                    let _ = file.flush();
+                }
+            };
+        }
+        trace!("initializing COM");
+        let _com = crate::win::com::Apartment::mta();
+        trace!("creating WIC factory");
+        let wic: IWICImagingFactory =
+            unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? };
+        trace!("creating WIC PBGRA bitmap");
+        let bitmap = unsafe {
+            wic.CreateBitmap(
+                pixel_w,
+                pixel_h,
+                &GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapCacheOnLoad,
+            )?
+        };
+        trace!("creating Direct2D WIC render target");
+        let props = D2D1_RENDER_TARGET_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+            },
+            dpiX: dpi.max(96) as f32,
+            dpiY: dpi.max(96) as f32,
+            ..Default::default()
+        };
+        let target = unsafe { d2d_factory()?.CreateWicBitmapRenderTarget(&bitmap, &props)? };
+        trace!("creating Direct2D brush");
+        let brush = unsafe { target.CreateSolidColorBrush(&color(0), None)? };
+        unsafe {
+            target.SetDpi(dpi.max(96) as f32, dpi.max(96) as f32);
+            target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        }
+        let mut renderer = Renderer {
+            hwnd: HWND::default(),
+            pixel_w,
+            pixel_h,
+            dpi: dpi.max(96),
+            target: None,
+            base_target: Some(target),
+            brush: Some(brush),
+            bitmaps: crate::cache::ByteCache::new(32 * 1024 * 1024),
+            frame: 0,
+        };
+        trace!("beginning Direct2D frame");
+        renderer.begin()?;
+        trace!("drawing Control Center");
+        let drawn = draw(&mut renderer);
+        trace!(format!("draw returned {drawn:?}; ending Direct2D frame"));
+        // The offscreen renderer only has `base_target` (no HWND target), so `Renderer::end`
+        // would skip EndDraw and leave the WIC bitmap write-locked. Always pair BeginDraw here.
+        let ended = match renderer.base_target.as_ref() {
+            Some(rt) => unsafe { rt.EndDraw(None, None) },
+            None => Ok(()),
+        };
+        drawn?;
+        ended?;
+        // A WIC bitmap render target owns a write lock until every D2D reference is released.
+        // Drop the target and its brush before handing the bitmap to the PNG encoder.
+        renderer.release();
+        trace!("released Direct2D target");
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(once(0)).collect();
+        unsafe {
+            trace!("creating output stream");
+            let stream = wic.CreateStream()?;
+            stream.InitializeFromFilename(PCWSTR(wide.as_ptr()), GENERIC_WRITE.0)?;
+            trace!("creating PNG encoder");
+            let encoder = wic.CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())?;
+            encoder.Initialize(&stream, WICBitmapEncoderNoCache)?;
+            trace!("creating PNG frame");
+            let mut frame: Option<IWICBitmapFrameEncode> = None;
+            let mut options: Option<IPropertyBag2> = None;
+            encoder.CreateNewFrame(&mut frame, &mut options)?;
+            let frame = frame.ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
+            frame.Initialize(options.as_ref())?;
+            trace!("configuring PNG frame");
+            frame.SetSize(pixel_w, pixel_h)?;
+            frame.SetResolution(dpi as f64, dpi as f64)?;
+            let mut format = GUID_WICPixelFormat32bppPBGRA;
+            frame.SetPixelFormat(&mut format)?;
+            trace!("writing WIC bitmap to PNG frame");
+            frame.WriteSource(&bitmap, std::ptr::null())?;
+            trace!("committing PNG frame");
+            frame.Commit()?;
+            trace!("committing PNG encoder");
+            encoder.Commit()
         }
     }
 
@@ -207,14 +334,17 @@ impl Renderer {
     pub fn release(&mut self) {
         self.bitmaps.clear();
         self.brush = None;
+        self.base_target = None;
         self.target = None;
     }
 
     #[cfg(test)]
-    pub fn is_released(&self) -> bool { self.target.is_none() && self.brush.is_none() }
+    pub fn is_released(&self) -> bool {
+        self.target.is_none() && self.base_target.is_none() && self.brush.is_none()
+    }
 
-    fn parts(&mut self) -> Result<(&ID2D1HwndRenderTarget, &ID2D1SolidColorBrush)> {
-        if self.target.is_none() {
+    fn parts(&mut self) -> Result<(&ID2D1RenderTarget, &ID2D1SolidColorBrush)> {
+        if self.base_target.is_none() {
             let factory = d2d_factory()?;
             let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
                 pixelFormat: D2D1_PIXEL_FORMAT {
@@ -238,17 +368,26 @@ impl Renderer {
                 rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
                 rt.CreateSolidColorBrush(&color(0), None)?
             };
+            self.base_target = Some(rt.cast()?);
             self.target = Some(rt);
             self.brush = Some(brush);
         }
         Ok((
-            self.target.as_ref().expect("created above"),
+            self.base_target.as_ref().expect("created above"),
             self.brush.as_ref().expect("created above"),
         ))
     }
 
     fn set_color(brush: &ID2D1SolidColorBrush, rgba: u32) {
-        let c = color(rgba);
+        let c = color(light_ink(rgba));
+        // SAFETY: `c` lives for the call.
+        unsafe { brush.SetColor(&c) };
+    }
+
+    /// Area fills: like `set_color`, but in light-ink mode opaque white surfaces (switch knobs,
+    /// slider thumbs) stay white and dark wells (inputs, tracks) turn into milky white wells.
+    fn set_fill_color(brush: &ID2D1SolidColorBrush, rgba: u32) {
+        let c = color(light_fill(rgba));
         // SAFETY: `c` lives for the call.
         unsafe { brush.SetColor(&c) };
     }
@@ -286,7 +425,7 @@ impl Renderer {
 
     pub fn fill_rounded_rect(&mut self, rect: RectF, radius: f32, rgba: u32) -> Result<()> {
         let (rt, brush) = self.parts()?;
-        Self::set_color(brush, rgba);
+        Self::set_fill_color(brush, rgba);
         let rr = rounded(rect, radius);
         // SAFETY: `rr` lives for the call.
         unsafe { rt.FillRoundedRectangle(&rr, brush) };
@@ -324,7 +463,7 @@ impl Renderer {
 
     pub fn fill_rect(&mut self, rect: RectF, rgba: u32) -> Result<()> {
         let (rt, brush) = self.parts()?;
-        Self::set_color(brush, rgba);
+        Self::set_fill_color(brush, rgba);
         let r = d2d_rect(rect);
         // SAFETY: `r` lives for the call.
         unsafe { rt.FillRectangle(&r, brush) };
@@ -362,6 +501,20 @@ impl Renderer {
             )
         };
         Ok(())
+    }
+
+    /// Width in DIPs of `text` laid out on one line with the given size and style.
+    pub fn measure_text(&self, text: &str, size: f32, style: TextStyle) -> Result<f32> {
+        let format = text_format(size, Align::Left, style)?;
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        let dw = dwrite_factory()?;
+        // SAFETY: the slice and format live for the call; metrics is a plain out-struct.
+        unsafe {
+            let layout = dw.CreateTextLayout(&wide, &format, 10_000.0, 1_000.0)?;
+            let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut m)?;
+            Ok(m.widthIncludingTrailingWhitespace)
+        }
     }
 
     /// Linear top-to-bottom gradient inside a rounded rect (`.clock-time`, `.dock` tint).
@@ -470,7 +623,7 @@ impl Renderer {
         &mut self,
         rect: RectF,
         radius: f32,
-        draw: impl FnOnce(&ID2D1HwndRenderTarget, &ID2D1SolidColorBrush, &ID2D1Geometry) -> Result<()>,
+        draw: impl FnOnce(&ID2D1RenderTarget, &ID2D1SolidColorBrush, &ID2D1Geometry) -> Result<()>,
         rgba: u32,
     ) -> Result<()> {
         let r = radius.max(0.0).min(rect.w / 2.0).min(rect.h);
@@ -515,7 +668,7 @@ impl Renderer {
             sink.Close()?;
         }
         let (rt, brush) = self.parts()?;
-        Self::set_color(brush, rgba);
+        Self::set_fill_color(brush, rgba);
         let g: &ID2D1Geometry = &geo;
         draw(rt, brush, g)
     }
@@ -867,6 +1020,48 @@ impl Renderer {
             0,
         )
     }
+}
+
+thread_local! {
+    /// Set while popup content is painted on the light (milky) glass: neutral white ink becomes
+    /// near-black so every popup keeps its contrast without per-popup colour tables.
+    static LIGHT_INK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Enables the light-appearance ink remap (see `light_ink`) for subsequent solid-colour draws.
+pub fn set_light_ink(on: bool) {
+    LIGHT_INK.with(|c| c.set(on));
+}
+
+/// In light-ink mode, near-white neutral colours (text, glyphs, hairlines, subtle white fills)
+/// map to their dark counterparts: opaque ink to #1D1D1F, translucent fills to black at the same
+/// alpha. Coloured accents pass through unchanged.
+pub fn light_ink(rgba: u32) -> u32 {
+    if !LIGHT_INK.with(std::cell::Cell::get) {
+        return rgba;
+    }
+    let (r, g, b, a) = (rgba >> 24, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF, rgba & 0xFF);
+    let (lo, hi) = (r.min(g).min(b), r.max(g).max(b));
+    if lo < 0xB0 || hi - lo > 0x30 {
+        return rgba;
+    }
+    if a >= 0x60 { 0x1D1D_1F00 | a } else { a }
+}
+
+/// Fill variant of `light_ink` (see `Renderer::set_fill_color`).
+pub fn light_fill(rgba: u32) -> u32 {
+    if !LIGHT_INK.with(std::cell::Cell::get) {
+        return rgba;
+    }
+    let (r, g, b, a) = (rgba >> 24, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF, rgba & 0xFF);
+    let (lo, hi) = (r.min(g).min(b), r.max(g).max(b));
+    if hi - lo <= 0x18 && lo >= 0xE8 && a >= 0xE0 {
+        return rgba;
+    }
+    if hi <= 0x40 && hi - lo <= 0x18 && a < 0xA0 {
+        return 0xFFFF_FF00 | (a * 2).min(0xC0);
+    }
+    light_ink(rgba)
 }
 
 /// Path-geometry drawing used by `svgpath`. Kept in its own block so it does not touch the core API.

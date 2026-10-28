@@ -65,10 +65,20 @@ pub fn render_liquid(wallpaper: &WallpaperPixels, bar: RectF, screen: (i32, i32)
 pub const FROST_LENS: LensOptions =
     LensOptions { radius: 8.0, band: 1.0, strength: 0.0, blur: 30.0, saturate: 1.7, aberration: 0.0 };
 
+/// Control Center modules (macOS 26/27 clear glass): only a light blur, so the shapes and highlights
+/// behind each module stay readable, and almost no saturation boost (no colour cast).
+pub const CONTROL_LENS: LensOptions =
+    LensOptions { radius: 8.0, band: 1.0, strength: 0.0, blur: 16.0, saturate: 1.25, aberration: 0.0 };
+
 /// Frosted backdrop from the wallpaper alone (used until a live screen grab is possible).
 pub fn render_popup(wallpaper: &WallpaperPixels, rect: RectF, screen: (i32, i32), dpr: f32) -> LiquidBitmap {
+    render_popup_with(wallpaper, rect, screen, dpr, &FROST_LENS)
+}
+
+/// `render_popup` with an explicit material (the Control Center uses `CONTROL_LENS`).
+pub fn render_popup_with(wallpaper: &WallpaperPixels, rect: RectF, screen: (i32, i32), dpr: f32, lens: &LensOptions) -> LiquidBitmap {
     let place = Placement::new(wallpaper, screen);
-    render_with(&|x, y| place.sample(wallpaper, x, y), rect, &FROST_LENS, dpr.clamp(1.0, MAX_DPR), false)
+    render_with(&|x, y| place.sample(wallpaper, x, y), rect, lens, dpr.clamp(1.0, MAX_DPR), false)
 }
 
 /// A grab of the screen: straight RGBA, `w * h * 4` bytes, at virtual-screen position (x, y).
@@ -83,13 +93,18 @@ pub struct ScreenGrab {
 /// Frosted backdrop of a live screen grab behind the popup. `rect` is the popup in the same
 /// pixel space as the grab's (x, y) origin (virtual-screen px).
 pub fn render_frost(grab: &ScreenGrab, rect: RectF, dpr: f32) -> LiquidBitmap {
+    render_frost_with(grab, rect, dpr, &FROST_LENS)
+}
+
+/// `render_frost` with an explicit material (the Control Center uses `CONTROL_LENS`).
+pub fn render_frost_with(grab: &ScreenGrab, rect: RectF, dpr: f32, lens: &LensOptions) -> LiquidBitmap {
     let sample = |x: f32, y: f32| -> [f32; 3] {
         let ix = ((x - grab.x as f32).floor() as i32).clamp(0, grab.w - 1);
         let iy = ((y - grab.y as f32).floor() as i32).clamp(0, grab.h - 1);
         let i = ((iy * grab.w + ix) * 4) as usize;
         [grab.rgba[i] as f32, grab.rgba[i + 1] as f32, grab.rgba[i + 2] as f32]
     };
-    render_with(&sample, rect, &FROST_LENS, dpr.clamp(1.0, MAX_DPR), false)
+    render_with(&sample, rect, lens, dpr.clamp(1.0, MAX_DPR), false)
 }
 
 fn render_with(

@@ -57,7 +57,7 @@ use win::{monitors, wallpaper};
 
 const DOCK_HEIGHT: f32 = dock::DOCK_H;
 const POPUP_W: f32 = 320.0;
-const CONTROL_POPUP_W: f32 = 296.0;
+const CONTROL_POPUP_W: f32 = control_center::WIDTH;
 const SETTINGS_POPUP_W: f32 = 460.0;
 /// Height used when the popup content cannot be measured yet.
 const POPUP_H_DEFAULT: f32 = 260.0;
@@ -210,7 +210,103 @@ fn default_repos() -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Handles the developer-only offscreen renderer before any SmartDock/DPI/appbar/window setup.
+/// Returning `Some` means the process must terminate immediately with that exit code.
+fn render_control_center_cli() -> Option<i32> {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let mode = args.get(1)?.to_string_lossy().to_string();
+    if !matches!(mode.as_str(), "--render-cc" | "--render-popup" | "--render-icons") {
+        return None;
+    }
+    // `--render-popup <name> ...` takes the same arguments as `--render-cc` after the name.
+    let name = (mode == "--render-popup").then(|| args.get(2).map(|a| a.to_string_lossy().to_string())).flatten();
+    let args: Vec<std::ffi::OsString> = if mode == "--render-popup" {
+        args.iter().enumerate().filter(|(i, _)| *i != 2).map(|(_, a)| a.clone()).collect()
+    } else {
+        args
+    };
+    let appearance = args.get(4).map(|a| a.to_string_lossy().to_ascii_lowercase());
+    let valid = if mode == "--render-icons" {
+        args.len() == 3
+    } else {
+        (mode != "--render-popup" || name.as_deref().is_some_and(|n| ui::cc_preview::POPUPS.contains(&n)))
+            && (args.len() == 4 || (args.len() == 5 && matches!(appearance.as_deref(), Some("dark" | "light"))))
+    };
+    if !valid {
+        let msg = format!(
+            "Usage: smartdock.exe --render-cc <out.png> <wallpaper> [dark|light]\n       smartdock.exe --render-popup <{}> <out.png> <wallpaper> [dark|light]\n       smartdock.exe --render-icons <out.png>\n",
+            ui::cc_preview::POPUPS.join("|")
+        );
+        eprint!("{msg}");
+        let _ = std::fs::write("render-control-center.log", msg);
+        return Some(2);
+    }
+    let out = std::path::PathBuf::from(&args[2]);
+    let log_path = out.with_extension("log");
+    let _ = std::fs::write(&log_path, "render-cli: entered before SmartDock initialization\n");
+    let panic_log = log_path.clone();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&panic_log) {
+            let _ = writeln!(file, "render-cli: panic: {info}");
+            let _ = file.flush();
+        }
+    }));
+    let rendered = std::panic::catch_unwind(|| {
+        let dark = appearance.as_deref() != Some("light");
+        match mode.as_str() {
+            "--render-icons" => ui::cc_preview::render_icons(&out),
+            "--render-popup" => ui::cc_preview::render_popup(
+                name.as_deref().unwrap_or_default(),
+                &out,
+                std::path::Path::new(&args[3]),
+                dark,
+                &preview_gallery_entries,
+            ),
+            _ => ui::cc_preview::render(&out, std::path::Path::new(&args[3]), dark),
+        }
+    });
+    match rendered {
+        Ok(Ok(())) => Some(0),
+        Ok(Err(e)) => {
+            let msg = format!("Control Center render failed: {e}\n");
+            eprint!("{msg}");
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, msg.as_bytes()));
+            Some(1)
+        }
+        Err(_) => {
+            let msg = "Control Center renderer panicked before producing the PNG.\n";
+            eprint!("{msg}");
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, msg.as_bytes()));
+            Some(1)
+        }
+    }
+}
+
 fn main() {
+    if let Some(code) = render_control_center_cli() {
+        // The PNG is fully written and closed at this point. Skip CRT/TLS/COM teardown: on the
+        // headless CI runner it aborts with STATUS_INVALID_PARAMETER after a successful render.
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        let _ = std::io::stdout().flush();
+        unsafe {
+            // SAFETY: terminating the current process with a plain exit code.
+            let _ = windows::Win32::System::Threading::TerminateProcess(
+                windows::Win32::System::Threading::GetCurrentProcess(),
+                code as u32,
+            );
+        }
+        std::process::exit(code);
+    }
     dpi::enable_per_monitor_v2();
     appbar::recover_from_previous_crash();
 
@@ -1880,7 +1976,7 @@ fn open_popup(which: OpenPopup, anchor: RectF) {
             CONTROL_VIEW.with(|c| *c.borrow_mut() = state);
             control_center::hide_outputs();
             POPUP_W_CUR.with(|w| w.set(CONTROL_POPUP_W));
-            if popup::show(anchor, CONTROL_POPUP_W, control_center::HEIGHT as i32).is_ok() {
+            if popup::show_floating_modules(anchor, CONTROL_POPUP_W, control_center::HEIGHT as i32).is_ok() {
                 set_open(Some(which));
             }
         }
@@ -1930,6 +2026,30 @@ thread_local! {
 
 /// Shows SmartDock Settings in the popup, anchored where the current popup was opened.
 /// Entries for the widget gallery: every widget with its live preview tile.
+/// Gallery entries for `--render-popup gallery`: default settings and sample data, no running app.
+fn preview_gallery_entries(data: &DataState) -> Vec<ui::gallery::Entry> {
+    let settings = settings::Settings::default();
+    let control = ControlState::default();
+    let stats = data::stats::read_stats();
+    ui::gallery::ITEMS
+        .iter()
+        .map(|&(id, cat)| ui::gallery::Entry {
+            id,
+            name: settings::widget_label(id),
+            cat,
+            view: tile_view(id, data, &control, &stats, 0.0, &settings),
+            width: if settings::is_fixed_widget(id) {
+                widget_width(id)
+            } else {
+                (widget_width(id) * settings.widget_scale()).round()
+            },
+            on: settings.widget_shown(id),
+            fixed: settings::is_fixed_widget(id),
+            disabled: false,
+        })
+        .collect()
+}
+
 fn gallery_entries() -> Vec<ui::gallery::Entry> {
     APP.with(|a| {
         let slot = a.borrow();

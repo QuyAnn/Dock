@@ -46,6 +46,8 @@ struct Popup {
     /// Liquid Glass backdrop cut from the wallpaper at this popup's position; None until the
     /// wallpaper is decoded (plain acrylic panel then).
     backdrop: Option<Arc<LiquidBitmap>>,
+    /// Control Center-only mode: body modules float over the transparent window without a panel.
+    floating_modules: bool,
 }
 
 impl Drop for Popup {
@@ -194,6 +196,18 @@ pub fn show_centered(width: f32, height: i32) -> Result<()> {
 /// Opens the popup above (or below, if the anchor is in the top half) `anchor`, centered on it.
 /// `anchor` and the result are in screen coordinates. Replaces any open popup.
 pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
+    show_impl(anchor, width, height, false)
+}
+
+/// Opens the shared popup window without its usual outer panel. The body painter can still sample
+/// the one cached popup backdrop, allowing independent glass modules without per-frame captures.
+pub fn show_floating_modules(anchor: RectF, width: f32, height: i32) -> Result<()> {
+    show_impl(anchor, width, height, true)
+}
+
+fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> Result<()> {
+    // Popups follow the system appearance: smoky dark or milky light glass.
+    super::glass::set_control_dark(crate::win::system::dark_mode());
     let dpi = dpi::system_dpi();
     let width_px = dpi::dip_to_px(width, dpi);
     let height_px = dpi::dip_to_px(height as f32, dpi);
@@ -209,6 +223,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         let mut state = p.borrow_mut();
         let Some(pw) = state.as_mut() else { return false };
         pw.anchor = anchor;
+        pw.floating_modules = floating_modules;
         pw.mouse_down = true;
         pw.esc_down = true;
         // Swapping popups: take the old one off screen first so the grab behind the new one is clean.
@@ -221,7 +236,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         }
         pw.renderer.release();
         if let Some(bg) = pw.backdrop.take() { super::glass::release_backdrop(&bg); }
-        pw.backdrop = super::glass::popup_backdrop(rect, monitor, dpi);
+        pw.backdrop = super::glass::popup_backdrop_for(rect, monitor, dpi, true);
         pw.renderer.resize(width_px, height_px, dpi);
         unsafe {
             let _ = SetWindowPos(
@@ -269,7 +284,8 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         anchor,
         mouse_down: true,
         esc_down: true,
-        backdrop: super::glass::popup_backdrop(rect, monitor, dpi),
+        backdrop: super::glass::popup_backdrop_for(rect, monitor, dpi, true),
+        floating_modules,
     };
     style_window(hwnd);
     POPUP.with(|p| *p.borrow_mut() = Some(pw));
@@ -514,17 +530,17 @@ fn paint() {
             let res = pw.renderer.begin().and_then(|_| {
                 // Apple-style continuous-looking corners: the window is fully transparent and the
                 // panel is drawn (anti-aliased) with its own radius.
-                let radius = if super::glass::panel_light() { 24.0 } else { 14.0 };
-                match &backdrop {
-                    Some(bd) => {
-                        super::glass::set_backdrop(Some(bd.clone()), w, h);
-                        super::glass::draw_panel_glass(&mut pw.renderer, rect, radius)?;
-                    }
-                    None => super::glass::draw_panel(&mut pw.renderer, rect, radius)?,
+                let radius = if super::glass::panel_light() { 24.0 } else { 18.0 };
+                // Every popup shares the Control Center glass (captured once per open).
+                super::glass::set_backdrop(backdrop.clone(), w, h);
+                if !pw.floating_modules {
+                    super::glass::draw_popup_surface(&mut pw.renderer, rect, radius)?;
                 }
+                super::renderer::set_light_ink(!pw.floating_modules && !super::glass::control_dark());
                 if let Some(f) = PAINTER.with(Cell::get) {
                     f(&mut pw.renderer, rect);
                 }
+                super::renderer::set_light_ink(false);
                 super::glass::set_backdrop(None, w, h);
                 pw.renderer.end()
             });
@@ -595,6 +611,7 @@ mod memory_tests {
         POPUP.with(|p| *p.borrow_mut() = Some(Popup {
             hwnd, renderer, anchor: RectF::default(), mouse_down: false, esc_down: false,
             backdrop: Some(bg.clone()),
+            floating_modules: false,
         }));
         hide();
         paint();

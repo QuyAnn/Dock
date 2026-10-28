@@ -65,11 +65,6 @@ const BLUE: u32 = 0x4AA8_FFFF;
 /// Heatmap levels: empty, then 4 greens (.hm.l0..l4).
 const HEAT: [u32; 5] = [0xFFFF_FF14, 0x0E44_29FF, 0x006D_32FF, 0x26A6_41FF, 0x39D3_53FF];
 
-const PREV: &str = "\u{E892}";
-const NEXT: &str = "\u{E893}";
-const PLAY: &str = "\u{E768}";
-const PAUSE: &str = "\u{E769}";
-
 const WEEKDAYS: [&str; 7] = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"];
 const AI_NOTE: &str = "Đọc từ đăng nhập cục bộ của bạn trên máy này; token chỉ gửi tới endpoint của chính nhà cung cấp. Claude: tối đa 15 phút/lần do giới hạn API.";
 const OPEN_METEO: &str = "Thời tiết: Open-Meteo (không cần key).";
@@ -821,10 +816,14 @@ fn draw_media(c: &mut Ctx<'_>, top: f32, m: Option<&Media>) -> Result<f32> {
 
     // Buttons use the same rects as `hit_media_button`.
     let [prev, play, next] = media_buttons(c.rect);
-    let play_glyph = if playing { PAUSE } else { PLAY };
-    for (b, glyph, big) in [(prev, PREV, false), (play, play_glyph, true), (next, NEXT, false)] {
+    use super::ccicons::Icon;
+    let play_glyph = if playing { Icon::Pause } else { Icon::Play };
+    for (b, glyph, big) in [(prev, Icon::Prev, false), (play, play_glyph, true), (next, Icon::Next, false)] {
         c.round(b, b.w / 2.0, if big { BTN_BIG } else { BTN })?;
-        c.text(glyph, b, font(if big { 18.0 } else { 14.0 }, if big { BTN_BIG_TEXT } else { TEXT }).icon().center())?;
+        // Same vector media glyphs as the Control Center.
+        if let Some(r) = c.r.as_deref_mut() {
+            super::ccicons::draw_in(r, glyph, b, if big { 22.0 } else { 18.0 }, if big { BTN_BIG_TEXT } else { TEXT })?;
+        }
     }
     section_end(c, top + MEDIA_PLAY_Y + MEDIA_PLAY_D + 16.0)
 }

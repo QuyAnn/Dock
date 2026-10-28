@@ -284,6 +284,31 @@ pub fn draw_path(
     )
 }
 
+/// `draw_path` with round caps and joins (icon strokes).
+pub fn draw_path_round(r: &mut Renderer, d: &str, rect: RectF, view_box: f32, rgba: u32, stroke: Option<f32>) -> Result<()> {
+    if view_box <= 0.0 {
+        return Err(bad());
+    }
+    let ops = parse(d)?;
+    let scale = rect.w.min(rect.h) / view_box;
+    let ox = rect.x + (rect.w - view_box * scale) / 2.0;
+    let oy = rect.y + (rect.h - view_box * scale) / 2.0;
+    let map = move |p: P| D2D_POINT_2F { x: ox + p.0 * scale, y: oy + p.1 * scale };
+    r.draw_geometry_round(
+        |sink| {
+            emit(sink, &ops, map, scale);
+            Ok(())
+        },
+        rgba,
+        stroke.map(|w| w * scale),
+    )
+}
+
+#[cfg(test)]
+pub fn parse_ok(d: &str) -> bool {
+    parse(d).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
