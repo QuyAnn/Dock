@@ -943,11 +943,11 @@ fn run() -> windows::core::Result<()> {
     repaint();
 
     log("message loop");
-    // Explorer writes the taskbar's edge to StuckRects3 when it is moved; the registry signals an
+    // Explorer writes the taskbar edge to Explorer\\Advanced TaskbarLocation (Win11 Settings) or StuckRects3; the registry signals an
     // event that this same loop waits on alongside its messages (no extra thread).
     let watch = win::edge::TaskbarWatch::new();
     if watch.is_none() {
-        log("dock edge: StuckRects3 watch unavailable; WM_SETTINGCHANGE still re-checks the edge");
+        log("dock edge: taskbar registry watch unavailable; WM_SETTINGCHANGE still re-checks the edge");
     }
     let mut msg = MSG::default();
     unsafe {

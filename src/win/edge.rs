@@ -1,4 +1,4 @@
-//! Which screen edge the dock sits on: follows the Windows taskbar position (StuckRects3) unless
+//! Which screen edge the dock sits on: follows the Windows taskbar position (TaskbarLocation / StuckRects3) unless
 //! settings.json `dockEdge` pins one. One process-wide value (`current`), read by layout, drawing,
 //! popup placement and the wallpaper thread. Change detection runs on the UI thread only
 //! (WM_SETTINGCHANGE, TaskbarCreated, and a registry-change event waited on by the message loop);
@@ -9,13 +9,17 @@ use windows::core::w;
 use windows::Win32::Foundation::{HANDLE, RECT};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegGetValueW, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_NOTIFY,
-    REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_THREAD_AGNOSTIC, RRF_RT_REG_BINARY,
+    REG_NOTIFY_CHANGE_LAST_SET, REG_NOTIFY_THREAD_AGNOSTIC, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD,
 };
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABE_BOTTOM, ABE_LEFT, ABE_RIGHT, ABE_TOP, ABM_GETTASKBARPOS, APPBARDATA};
 
 pub use super::appbar::AbEdge;
 
 const STUCK_RECTS: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StuckRects3");
+/// Windows 11 (26xxx) Settings > Taskbar behaviors > Taskbar position writes DWORD
+/// `TaskbarLocation` here (ABE_* order: 0 left, 1 top, 2 right, 3 bottom); StuckRects3 is no
+/// longer updated by that page.
+const EXPLORER_ADVANCED: windows::core::PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced");
 
 /// ABE_* value of the current edge (bottom until told otherwise).
 static CURRENT: AtomicU8 = AtomicU8::new(ABE_BOTTOM as u8);
@@ -104,6 +108,37 @@ fn registry_edge() -> Option<AbEdge> {
     parse_stuck_rects(&buf[..(len as usize).min(buf.len())])
 }
 
+/// Edge for an Explorer\Advanced `TaskbarLocation` DWORD (ABE_* code; anything else ignored).
+pub fn parse_taskbar_location(value: u32) -> Option<AbEdge> {
+    AbEdge::from_abe(value)
+}
+
+fn location_edge() -> Option<AbEdge> {
+    let mut value = 0u32;
+    let mut len = std::mem::size_of::<u32>() as u32;
+    // SAFETY: value/len describe a valid writable DWORD for the call.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            EXPLORER_ADVANCED,
+            w!("TaskbarLocation"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut len),
+        )
+    };
+    if status.is_err() {
+        return None;
+    }
+    parse_taskbar_location(value)
+}
+
+/// Taskbar edge from the sources in priority order; the first that answers wins.
+pub fn pick_edge(location: Option<AbEdge>, stuck: Option<AbEdge>, appbar: impl FnOnce() -> Option<AbEdge>) -> AbEdge {
+    location.or(stuck).or_else(appbar).unwrap_or(AbEdge::Bottom)
+}
+
 fn appbar_edge() -> Option<AbEdge> {
     let mut data = APPBARDATA { cbSize: std::mem::size_of::<APPBARDATA>() as u32, ..Default::default() };
     // SAFETY: data is a valid APPBARDATA for the call.
@@ -113,9 +148,10 @@ fn appbar_edge() -> Option<AbEdge> {
     AbEdge::from_abe(data.uEdge)
 }
 
-/// Where the Windows taskbar is configured: StuckRects3, then ABM_GETTASKBARPOS, then bottom.
+/// Where the Windows taskbar is configured: Explorer\Advanced `TaskbarLocation`, then
+/// StuckRects3, then ABM_GETTASKBARPOS, then bottom.
 pub fn taskbar_edge() -> AbEdge {
-    registry_edge().or_else(appbar_edge).unwrap_or(AbEdge::Bottom)
+    pick_edge(location_edge(), registry_edge(), appbar_edge)
 }
 
 /// The dock edge for a `dockEdge` setting: a fixed edge, or the taskbar's for `auto`.
@@ -155,31 +191,40 @@ extern "system" {
     fn CreateEventW(attrs: *const core::ffi::c_void, manual_reset: i32, initial_state: i32, name: *const u16) -> isize;
 }
 
-/// Registry watch on StuckRects3: an auto-reset event the message loop waits on next to its
-/// messages. Re-armed after each signal (RegNotifyChangeKeyValue fires once per arm).
+/// Registry watch on StuckRects3 and Explorer\Advanced: one auto-reset event (shared by both
+/// keys) the message loop waits on next to its messages. Re-armed after each signal
+/// (RegNotifyChangeKeyValue fires once per arm).
 pub struct TaskbarWatch {
-    key: HKEY,
+    keys: Vec<HKEY>,
     event: HANDLE,
 }
 
 impl TaskbarWatch {
     pub fn new() -> Option<TaskbarWatch> {
-        let mut key = HKEY::default();
-        // SAFETY: opening an existing HKCU key for notifications only.
-        if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, STUCK_RECTS, 0, KEY_NOTIFY, &mut key) }.is_err() {
+        let mut keys = Vec::new();
+        for path in [EXPLORER_ADVANCED, STUCK_RECTS] {
+            let mut key = HKEY::default();
+            // SAFETY: opening an existing HKCU key for notifications only.
+            if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_NOTIFY, &mut key) }.is_ok() {
+                keys.push(key);
+            }
+        }
+        if keys.is_empty() {
             return None;
         }
         // SAFETY: no security attributes, auto-reset, initially unsignalled, unnamed.
         let raw = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
         let event = HANDLE(raw as _);
         let Some(event) = (!event.is_invalid() && raw != 0).then_some(event) else {
-            // SAFETY: key was opened above.
-            unsafe {
-                let _ = RegCloseKey(key);
+            // SAFETY: keys were opened above.
+            for key in keys {
+                unsafe {
+                    let _ = RegCloseKey(key);
+                }
             }
             return None;
         };
-        let watch = TaskbarWatch { key, event };
+        let watch = TaskbarWatch { keys, event };
         watch.arm().then_some(watch)
     }
 
@@ -187,13 +232,17 @@ impl TaskbarWatch {
         self.event
     }
 
-    /// Asks for the next change of the key's values.
+    /// Asks for the next change of the keys' values. True if at least one key is armed.
     pub fn arm(&self) -> bool {
-        // SAFETY: key and event stay valid while self lives.
-        unsafe {
-            RegNotifyChangeKeyValue(self.key, false, REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC, self.event, true)
+        let mut any = false;
+        for &key in &self.keys {
+            // SAFETY: keys and event stay valid while self lives.
+            any |= unsafe {
+                RegNotifyChangeKeyValue(key, false, REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_THREAD_AGNOSTIC, self.event, true)
+            }
+            .is_ok();
         }
-        .is_ok()
+        any
     }
 }
 
@@ -221,6 +270,22 @@ mod tests {
         assert_eq!(parse_stuck_rects(&blob(7)), None);
         assert_eq!(parse_stuck_rects(&blob(3)[..12]), None);
         assert_eq!(parse_stuck_rects(&[]), None);
+    }
+
+    #[test]
+    fn dock_edge_prefers_taskbar_location_over_stale_stuck_rects() {
+        // Windows 11 26300: Settings says Right (TaskbarLocation = 2) while StuckRects3 still says bottom.
+        assert_eq!(parse_taskbar_location(0), Some(AbEdge::Left));
+        assert_eq!(parse_taskbar_location(1), Some(AbEdge::Top));
+        assert_eq!(parse_taskbar_location(2), Some(AbEdge::Right));
+        assert_eq!(parse_taskbar_location(3), Some(AbEdge::Bottom));
+        assert_eq!(parse_taskbar_location(4), None);
+        let stale = parse_stuck_rects(&blob(3));
+        assert_eq!(pick_edge(parse_taskbar_location(2), stale, || Some(AbEdge::Bottom)), AbEdge::Right);
+        // Value missing or out of range: StuckRects3, then the AppBar query, then bottom.
+        assert_eq!(pick_edge(parse_taskbar_location(7), parse_stuck_rects(&blob(1)), || None), AbEdge::Top);
+        assert_eq!(pick_edge(None, None, || Some(AbEdge::Left)), AbEdge::Left);
+        assert_eq!(pick_edge(None, None, || None), AbEdge::Bottom);
     }
 
     #[test]
