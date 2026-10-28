@@ -107,6 +107,11 @@ pub fn render(out: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
     }
     let mut data = DataState::default();
     data.media = Some(Media { title: "Golden Hour".into(), artist: "SmartDock Demo".into(), playing: true });
+    // SMARTDOCK_DOCK_GIT=1: sample git activity (6 today, 37 this week, 23-day streak).
+    if std::env::var("SMARTDOCK_DOCK_GIT").is_ok_and(|v| v.trim() == "1") {
+        data.git = Some(sample_git());
+        note("sample git data");
+    }
     let stats = Stats { cpu_pct: 23.0, ram_used_mb: 9200, ram_total_mb: 16384 };
     let control = ControlState {
         volume: 0.60,
@@ -122,6 +127,18 @@ pub fn render(out: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
     };
 
     let mut tiles: Vec<(&'static str, RectF)> = Vec::new();
+    // SMARTDOCK_DOCK_SCALE=<factor>: only the dock strip, at that display scale (1, 1.5, ...).
+    if let Some(scale) = std::env::var("SMARTDOCK_DOCK_SCALE").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
+        let (pw, ph) = ((dw as f32 * scale).round() as u32, (dh as f32 * scale).round() as u32);
+        note(&format!("strip only at scale {scale}: {pw}x{ph}"));
+        Renderer::render_png(out, pw, ph, (96.0 * scale).round() as u32, |r| {
+            crate::draw_surface(r, length, None, &mut tiles, &apps, &stats, &data, &control, 0.0, &settings, Some(&backdrop))
+        })?;
+        for (id, r) in &tiles {
+            note(&format!("tile {id} ({:.1},{:.1} {:.1}x{:.1})", r.x, r.y, r.w, r.h));
+        }
+        return Ok(());
+    }
     let dock_tmp = out.with_extension("dock.png");
     Renderer::render_png(&dock_tmp, dw as u32, dh as u32, 96, |r| {
         crate::draw_surface(r, length, None, &mut tiles, &apps, &stats, &data, &control, 0.0, &settings, Some(&backdrop))
@@ -205,6 +222,41 @@ pub fn render(out: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
         r.draw_bitmap(tw, th, &dock_px, bar)?;
         r.draw_bitmap(pw, ph, &popup_px, win)
     })
+}
+
+/// Deterministic git history for renders: 119 days ending today, a 23-day streak, 37 commits
+/// over the last 7 days and 6 today.
+fn sample_git() -> crate::data::git::GitSummary {
+    let mut counts = vec![0u32; 119];
+    // Older days: a repeatable mix of empty and busy days.
+    for (i, c) in counts.iter_mut().enumerate() {
+        let h = (i as u32).wrapping_mul(2_654_435_761) >> 27; // 0..31
+        *c = match h % 8 {
+            0 | 1 | 2 => 0,
+            3 | 4 => 1,
+            5 => 3,
+            6 => 5,
+            _ => 8,
+        };
+    }
+    // Streak: the last 23 days all have commits, the day before has none.
+    let n = counts.len();
+    counts[n - 24] = 0;
+    for c in &mut counts[n - 23..n - 7] {
+        *c = (*c).max(1);
+    }
+    counts[n - 7..].copy_from_slice(&[4, 7, 3, 8, 2, 7, 6]);
+    let today = chrono::Local::now().date_naive();
+    let heatmap: Vec<crate::model::GitDay> = counts
+        .iter()
+        .enumerate()
+        .map(|(i, &commits)| crate::model::GitDay {
+            date: (today - chrono::Duration::days((n - 1 - i) as i64)).format("%Y-%m-%d").to_string(),
+            commits,
+        })
+        .collect();
+    let (today, week, streak) = crate::data::git::git_stats(&heatmap);
+    crate::data::git::GitSummary { today, week, streak, heatmap, error: None }
 }
 
 /// Nearest-neighbour cover crop of the wallpaper to the simulated screen.

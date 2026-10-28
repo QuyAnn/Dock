@@ -264,17 +264,27 @@ pub fn refresh_git(repos: &[PathBuf], configured_author: &str) -> GitSummary {
         })
         .collect();
 
-    let today_count = heatmap.last().map_or(0, |d| d.commits);
-    let week: u32 = heatmap.iter().rev().take(7).map(|d| d.commits).sum();
-    // Today may still be empty; the streak then starts from yesterday.
-    let skip = if today_count > 0 { 0 } else { 1 };
-    let streak = heatmap.iter().rev().skip(skip).take_while(|d| d.commits > 0).count() as u32;
+    let (today_count, week, streak) = git_stats(&heatmap);
 
     if let Some(err) = &error {
         git_log(&format!("git status: {err}"));
     }
 
     GitSummary { today: today_count, week, streak, heatmap, error }
+}
+
+/// (today, week, streak) from a per-day heatmap that is oldest first and ends with today.
+/// - today: commits on the last day.
+/// - week: commits over the last 7 days including today (rolling week).
+/// - streak (GitHub-like): consecutive days with at least one commit ending today; while today
+///   has no commit yet, the streak ending yesterday still counts (it only breaks after a full
+///   empty day).
+pub fn git_stats(heatmap: &[GitDay]) -> (u32, u32, u32) {
+    let today = heatmap.last().map_or(0, |d| d.commits);
+    let week: u32 = heatmap.iter().rev().take(7).map(|d| d.commits).sum();
+    let skip = usize::from(today == 0);
+    let streak = heatmap.iter().rev().skip(skip).take_while(|d| d.commits > 0).count() as u32;
+    (today, week, streak)
 }
 
 fn git_log(msg: &str) {
@@ -289,4 +299,36 @@ fn git_log(msg: &str) {
 
 fn ymd(d: NaiveDate) -> String {
     d.format("%Y-%m-%d").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn days(counts: &[u32]) -> Vec<GitDay> {
+        counts.iter().map(|&commits| GitDay { date: String::new(), commits }).collect()
+    }
+
+    #[test]
+    fn git_stats_today_week_and_streak_ending_today() {
+        // Oldest first, last entry is today.
+        let h = days(&[5, 0, 1, 2, 0, 3, 4, 1, 2, 6]);
+        // today 6; week = last 7 days (2+0+3+4+1+2+6); streak = 3,4,1,2,6.
+        assert_eq!(git_stats(&h), (6, 18, 5));
+    }
+
+    #[test]
+    fn git_stats_streak_survives_an_empty_today() {
+        let h = days(&[0, 1, 1, 1, 0]);
+        assert_eq!(git_stats(&h), (0, 3, 3));
+        // Yesterday empty too: the streak is broken.
+        assert_eq!(git_stats(&days(&[1, 1, 0, 0])), (0, 2, 0));
+    }
+
+    #[test]
+    fn git_stats_handles_short_and_empty_histories() {
+        assert_eq!(git_stats(&[]), (0, 0, 0));
+        assert_eq!(git_stats(&days(&[2])), (2, 2, 1));
+        assert_eq!(git_stats(&days(&[1; 30])), (1, 7, 30));
+    }
 }

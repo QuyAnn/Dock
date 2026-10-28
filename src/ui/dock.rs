@@ -31,8 +31,6 @@ const NO_BACKDROP_TOP: u32 = 0x6E68_62FF;
 const NO_BACKDROP_BOTTOM: u32 = 0x5A55_50FF;
 const CLOCK_TOP: u32 = 0xFF5A_3CFF;
 const CLOCK_BOTTOM: u32 = 0xE832_1EFF;
-const HM_EMPTY: u32 = 0xFFFF_FF26; // .hm.l0 (a bit lighter: the bar is clear glass)
-const HM_LEVELS: [u32; 4] = [0x1F8F_4EFF, 0x2FB8_63FF, 0x4AD6_7FFF, 0x8BF0_AAFF];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct RectF {
@@ -167,7 +165,8 @@ impl TileView {
 
 /// Fixed left-tile widths (Dock-Rc: .ai-tile 100px, .music-tile 142px, scaled up a little so
 /// "$52.59/$20.00" and Vietnamese titles fit). Every usage tile shares one width.
-pub const GIT_W: f32 = 152.0;
+/// Git: one stat line ("6 today  37 week  🔥 23 streak") over a 3-row strip of recent days.
+pub const GIT_W: f32 = 188.0;
 pub const USAGE_W: f32 = 112.0;
 pub const MEDIA_W: f32 = 200.0;
 
@@ -450,6 +449,7 @@ pub fn draw_tile(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Re
 fn draw_tile_vertical(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     match t.style {
         Style::Ring | Style::Label | Style::Bare | Style::Start | Style::Search | Style::Trash => draw_tile(r, t, rc, hovered),
+        Style::Git => draw_git_compact(r, t, rc, hovered),
         Style::Widget if t.extra == "analog" => draw_tile(r, t, rc, hovered),
         Style::Separator => r.fill_rect(RectF { x: rc.x, y: rc.y + (rc.h - 1.0) / 2.0, w: rc.w, h: 1.0 }, 0xFFFF_FF4D),
         Style::Button if t.chevron.is_some() => draw_button(r, t, rc, hovered),
@@ -696,33 +696,108 @@ fn draw_clock(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Resul
     )
 }
 
-fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
-    card_frame(r, rc, hovered)?;
-    let off = (rc.h - 38.0) / 2.0;
-    // Right: the whole week (7 rows, Monday on top) for the last weeks, newest column at the edge.
-    // Left: today's commits (bold), then the week and streak totals.
-    let rows = 7usize;
-    let cols = (t.cells.len() / rows).max(1);
-    let gap = 1.0;
-    let cell = ((rc.h - 6.0 - (rows - 1) as f32 * gap) / rows as f32).clamp(2.5, 4.5);
-    let grid_w = cols as f32 * cell + (cols - 1) as f32 * gap;
-    let grid_h = rows as f32 * cell + (rows - 1) as f32 * gap;
-    let left = rc.x + rc.w - 7.0 - grid_w;
-    let top = rc.y + (rc.h - grid_h) / 2.0;
-    for (i, level) in t.cells.iter().enumerate() {
-        let (col, row) = (i / rows, i % rows);
-        let color = match level {
-            0 => HM_EMPTY,
-            l => HM_LEVELS[(*l as usize - 1).min(3)],
-        };
-        let rect = RectF { x: left + col as f32 * (cell + gap), y: top + row as f32 * (cell + gap), w: cell, h: cell };
-        r.fill_rounded_rect(rect, 1.0, color)?;
-    }
-    let text_w = (left - 6.0 - (rc.x + 8.0)).max(0.0);
-    r.draw_text_styled(&t.title, RectF { x: rc.x + 8.0, y: rc.y + off + 6.0, w: text_w, h: 14.0 }, 11.5, TEXT, Align::Left, TextStyle::Bold)?;
-    r.draw_text(&t.value, RectF { x: rc.x + 8.0, y: rc.y + off + 21.0, w: text_w, h: 11.0 }, 8.0, MUTED, Align::Left)
+/// Git tile cell colours (0xRRGGBBAA): empty days dark grey, then GitHub-style greens.
+const GIT_EMPTY: u32 = 0x3A3A_3CD9;
+const GIT_LEVELS: [u32; 4] = [0x1F6F_3AFF, 0x2EA0_43FF, 0x39D3_53FF, 0x6CEB_83FF];
+const GIT_ROWS: usize = 3;
+const GIT_CELL: f32 = 5.5;
+const GIT_GAP: f32 = 1.5;
+/// Side padding of the stat line and the grid inside the wide (horizontal) tile.
+const GIT_PAD: f32 = 9.0;
+
+/// Where the recent-days grid sits in a git tile: (left, top, columns). Columns fill the width
+/// left by `GIT_PAD` on both sides; the grid is centred horizontally and sits under the stat
+/// line, clear of the 12 DIP rounded corners.
+pub fn git_grid(rc: RectF, compact: bool) -> (f32, f32, usize) {
+    let pad = if compact { 7.0 } else { GIT_PAD };
+    let pitch = GIT_CELL + GIT_GAP;
+    let cols = (((rc.w - 2.0 * pad + GIT_GAP) / pitch).floor() as usize).max(1);
+    let grid_w = cols as f32 * pitch - GIT_GAP;
+    let grid_h = GIT_ROWS as f32 * pitch - GIT_GAP;
+    let top = rc.y + rc.h - 4.0 - grid_h;
+    (rc.x + (rc.w - grid_w) / 2.0, top, cols)
 }
 
+/// Colour for one day's heat level.
+fn git_cell_color(level: u8) -> u32 {
+    match level {
+        0 => GIT_EMPTY,
+        l => GIT_LEVELS[(l as usize - 1).min(3)],
+    }
+}
+
+/// The most recent `GIT_ROWS * cols` days, column-major (top to bottom, then left to right),
+/// so time runs left to right and today is the bottom-right cell.
+fn draw_git_grid(r: &mut Renderer, cells: &[u8], left: f32, top: f32, cols: usize) -> Result<()> {
+    let n = GIT_ROWS * cols;
+    let pitch = GIT_CELL + GIT_GAP;
+    for i in 0..n {
+        // Index from the end: the last cell drawn is the newest day.
+        let back = n - 1 - i;
+        let level = cells.len().checked_sub(1 + back).map_or(0, |k| cells[k]);
+        let (col, row) = (i / GIT_ROWS, i % GIT_ROWS);
+        let cell = RectF { x: left + col as f32 * pitch, y: top + row as f32 * pitch, w: GIT_CELL, h: GIT_CELL };
+        r.fill_rounded_rect(cell, 1.5, git_cell_color(level))?;
+    }
+    Ok(())
+}
+
+/// Wide git tile: "6 today   37 week   🔥 23 streak" over a 3-row strip of recent days.
+fn draw_git(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    let (left, top, cols) = git_grid(rc, false);
+    draw_git_grid(r, &t.cells, left, top, cols)?;
+    // Stat line: bold numbers, medium labels; three groups spread over the grid's width.
+    let (num, lab) = (12.0, 10.0);
+    let groups: [(&str, &str, &str); 3] = [("", t.title.as_str(), " today"), ("", t.value.as_str(), " week"), ("\u{1F525}", t.sub.as_str(), " streak")];
+    let flame_w = 13.0;
+    let mut widths = [0.0f32; 3];
+    for (i, (icon, n, l)) in groups.iter().enumerate() {
+        let w_icon = if icon.is_empty() { 0.0 } else { flame_w };
+        widths[i] = w_icon + r.measure_text(n, num, TextStyle::Bold)? + r.measure_text(l, lab, TextStyle::SemiBold)?;
+    }
+    let span_l = left;
+    let span_w = cols as f32 * (GIT_CELL + GIT_GAP) - GIT_GAP;
+    let total: f32 = widths.iter().sum();
+    let gap = ((span_w - total) / 2.0).max(4.0);
+    let line = RectF { x: 0.0, y: rc.y + 3.5, w: 0.0, h: (top - rc.y - 3.5 - 1.0).max(12.0) };
+    let mut x = span_l;
+    for (i, (icon, n, l)) in groups.iter().enumerate() {
+        if !icon.is_empty() {
+            r.draw_text(icon, RectF { x: x - 1.0, w: flame_w + 2.0, ..line }, 9.5, 0xFFFF_FFFF, Align::Left)?;
+            x += flame_w;
+        }
+        let nw = r.measure_text(n, num, TextStyle::Bold)?;
+        r.draw_text_styled(n, RectF { x, w: nw + 1.0, ..line }, num, TEXT, Align::Left, TextStyle::Bold)?;
+        let lw = widths[i] - nw - if icon.is_empty() { 0.0 } else { flame_w };
+        let right = rc.x + rc.w - 4.0;
+        r.draw_text_styled(l, RectF { x: x + nw, w: (lw + 1.0).min((right - x - nw).max(0.0)), ..line }, lab, GIT_LABEL, Align::Left, TextStyle::SemiBold)?;
+        x += nw + lw + gap;
+    }
+    Ok(())
+}
+
+/// Labels next to the bold numbers: white at ~70% so they read as secondary but stay bold-ish.
+const GIT_LABEL: u32 = 0xFFFF_FFB8;
+
+/// Square git tile on a left/right dock (42x42): today's count on top, last days below.
+fn draw_git_compact(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
+    card_frame(r, rc, hovered)?;
+    let (left, top, cols) = git_grid(rc, true);
+    draw_git_grid(r, &t.cells, left, top, cols)?;
+    let line = RectF { x: rc.x, y: rc.y + 3.5, w: rc.w, h: (top - rc.y - 4.5).max(11.0) };
+    // "6 today" centred when it fits the 42 DIP square, else just the bold number.
+    let (num, lab) = (11.0, 8.0);
+    let nw = r.measure_text(&t.title, num, TextStyle::Bold)?;
+    let lw = r.measure_text(" today", lab, TextStyle::SemiBold)?;
+    if nw + lw <= rc.w - 6.0 {
+        let x = rc.x + (rc.w - nw - lw) / 2.0;
+        r.draw_text_styled(&t.title, RectF { x, w: nw + 1.0, ..line }, num, TEXT, Align::Left, TextStyle::Bold)?;
+        r.draw_text_styled(" today", RectF { x: x + nw, w: lw + 1.0, ..line }, lab, GIT_LABEL, Align::Left, TextStyle::SemiBold)
+    } else {
+        r.draw_text_styled(&t.title, line, num, TEXT, Align::Center, TextStyle::Bold)
+    }
+}
 
 fn draw_media(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) -> Result<()> {
     card_frame(r, rc, hovered)?;
@@ -1010,6 +1085,32 @@ mod tests {
                 }
                 let got = across(rc);
                 assert!((got.0 - want.0).abs() < 1e-4 && (got.1 - want.1).abs() < 1e-4, "{edge:?} {id} {rc:?} vs shelf {shelf:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn dock_layout_git_grid_fits_inside_the_tile() {
+        for (rc, compact) in [
+            (RectF { x: 10.0, y: 5.0, w: GIT_W, h: TILE_H }, false),
+            (RectF { x: 5.0, y: 300.0, w: TILE_H, h: TILE_H }, true),
+        ] {
+            let (left, top, cols) = git_grid(rc, compact);
+            let pitch = GIT_CELL + GIT_GAP;
+            let (w, h) = (cols as f32 * pitch - GIT_GAP, GIT_ROWS as f32 * pitch - GIT_GAP);
+            // Same 42 DIP height as every section; the grid stays clear of the tile edges and
+            // leaves at least 12 DIP above it for the stat line.
+            assert_eq!(rc.h, TILE_H);
+            assert!(left >= rc.x + 6.0 && left + w <= rc.x + rc.w - 6.0, "{rc:?} {left} {w}");
+            assert!(top >= rc.y + 15.0 && top + h <= rc.y + rc.h - 3.0, "{rc:?} {top} {h}");
+            // Bottom corner cells stay inside the 12 DIP rounded corners.
+            let (cx, cy) = (rc.x + 12.0, rc.y + rc.h - 12.0);
+            let (dx, dy) = (cx - left, top + h - cy);
+            assert!(dx <= 0.0 || dy <= 0.0 || (dx * dx + dy * dy).sqrt() <= 12.0 - 1.0, "{rc:?}");
+            if compact {
+                assert!(cols >= 4);
+            } else {
+                assert!(cols >= 20, "wide tile shows at least ~2 months: {cols}");
             }
         }
     }

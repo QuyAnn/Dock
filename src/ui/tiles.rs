@@ -152,45 +152,44 @@ mod widget_tests {
     }
 }
 
-/// Git card: today / week / streak numbers and a 16-week mini heatmap (3 rows, Fri-Sun).
+/// Git card: today / week / streak numbers over a strip of recent days.
+/// `title`, `value`, `sub` carry the today, week and streak counts; `cells` holds one level
+/// (0..=4) per day, oldest first, ending with today (the tile draws as many as fit).
 pub fn git_tile(d: &DataState) -> TileView {
     match &d.git {
         None => tile("GIT", "–".to_owned(), None),
         Some(g) if g.error.is_some() => {
-            // Hint belongs in Settings / Git popup; tile stays a quiet dash + empty grid.
+            // Hint belongs in Settings / Git popup; tile stays quiet dashes + an empty grid.
             TileView {
                 style: Style::Git,
-                cells: heat_levels(&g.heatmap, 10, 7),
-                ..TileView::card("GIT", "—".to_owned())
+                sub: "–".to_owned(),
+                cells: day_levels(&g.heatmap),
+                ..TileView::card("–", "–".to_owned())
             }
         }
         Some(g) => TileView {
             style: Style::Git,
-            cells: heat_levels(&g.heatmap, 10, 7),
-            ..TileView::card(format!("{} today", g.today), format!("{} week · {} streak", g.week, g.streak))
+            sub: g.streak.to_string(),
+            cells: day_levels(&g.heatmap),
+            ..TileView::card(g.today.to_string(), g.week.to_string())
         },
     }
 }
 
-/// Heatmap levels 0..=4, column-major, same bucketing as `Heatmap` in GitTile.tsx.
-/// `days` is oldest first and ends with today. Future days are level 0.
-fn heat_levels(days: &[crate::model::GitDay], weeks: usize, rows: usize) -> Vec<u8> {
-    let today_dow = Local::now().weekday().num_days_from_monday() as i64;
-    let level = |n: u32| -> u8 { match n { 0 => 0, 1 => 1, 2..=3 => 2, 4..=6 => 3, _ => 4 } };
-    let mut out = Vec::with_capacity(weeks * rows);
-    for col in 0..weeks {
-        let w = (weeks - 1 - col) as i64; // column 0 is the oldest week
-        for row in (7 - rows)..7 {
-            let offset = w * 7 + (today_dow - row as i64);
-            let lvl = if offset < 0 {
-                0
-            } else {
-                days.len().checked_sub(1 + offset as usize).map_or(0, |i| level(days[i].commits))
-            };
-            out.push(lvl);
-        }
+/// Commit count -> heat level 0..=4 (same bucketing as `Heatmap` in GitTile.tsx).
+pub fn heat_level(n: u32) -> u8 {
+    match n {
+        0 => 0,
+        1 => 1,
+        2..=3 => 2,
+        4..=6 => 3,
+        _ => 4,
     }
-    out
+}
+
+/// One level per day, oldest first, ending with today.
+pub fn day_levels(days: &[crate::model::GitDay]) -> Vec<u8> {
+    days.iter().map(|d| heat_level(d.commits)).collect()
 }
 
 /// First provider's 5-hour session usage. Without data, the status text is shown instead.
