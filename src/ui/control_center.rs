@@ -1161,13 +1161,22 @@ fn draw_minus(r: &mut Renderer, rc: RectF) -> Result<()> {
 /// Add-gallery chip: glyph, name and a blue "+".
 fn draw_chip(r: &mut Renderer, m: Module, chip: RectF) -> Result<()> {
     draw_module(r, chip, chip.h / 2.0)?;
-    let icon = RectF { x: chip.x + 8.0, y: chip.y, w: 26.0, h: chip.h };
-    draw_glyph(r, icon, m.glyph(), 18.0, text())?;
-    let label = RectF { x: chip.x + 36.0, y: chip.y, w: chip.w - 36.0 - 30.0, h: chip.h };
-    r.draw_text_styled(m.label(), label, 12.0, text(), Align::Left, TextStyle::SemiBold)?;
-    let plus = RectF { x: chip.x + chip.w - 28.0, y: chip.y + (chip.h - 20.0) / 2.0, w: 20.0, h: 20.0 };
-    r.fill_rounded_rect(plus, 10.0, ACCENT)?;
-    let (cx, cy) = (plus.x + 10.0, plus.y + 10.0);
+    let icon = RectF { x: chip.x + 6.0, y: chip.y, w: 24.0, h: chip.h };
+    draw_glyph(r, icon, m.glyph(), 17.0, text())?;
+    // Long names wrap onto a second line instead of being cut.
+    let (x, w) = (chip.x + 31.0, chip.w - 31.0 - 28.0);
+    let (pt, line) = (11.5, 13.5);
+    match wrap_two(m.label(), w, pt) {
+        (one, None) => r.draw_text_styled(&one, RectF { x, y: chip.y, w, h: chip.h }, pt, text(), Align::Left, TextStyle::SemiBold)?,
+        (one, Some(two)) => {
+            let y = chip.y + (chip.h - 2.0 * line) / 2.0;
+            r.draw_text_styled(&one, RectF { x, y, w, h: line }, pt, text(), Align::Left, TextStyle::SemiBold)?;
+            r.draw_text_styled(&two, RectF { x, y: y + line, w, h: line }, pt, text(), Align::Left, TextStyle::SemiBold)?;
+        }
+    }
+    let plus = RectF { x: chip.x + chip.w - 25.0, y: chip.y + (chip.h - 19.0) / 2.0, w: 19.0, h: 19.0 };
+    r.fill_rounded_rect(plus, 9.5, ACCENT)?;
+    let (cx, cy) = (plus.x + 9.5, plus.y + 9.5);
     r.fill_rounded_rect(RectF { x: cx - 5.0, y: cy - 1.0, w: 10.0, h: 2.0 }, 1.0, WHITE)?;
     r.fill_rounded_rect(RectF { x: cx - 1.0, y: cy - 5.0, w: 2.0, h: 10.0 }, 1.0, WHITE)
 }
