@@ -522,9 +522,10 @@ fn render_piece(bg: &LiquidBitmap, px: i32, py: i32, pw: i32, ph: i32, radius: f
                     let hb = heavy_lum(sx, sy);
                     let lb = ((hb - 70.0) / 165.0).clamp(0.0, 1.0);
                     let (g, a0, ka, cap) = match layer {
-                        Layer::Control => (60.0 - 22.0 * lb, 0.30, 0.40, 140.0),
+                        // Dark appearance keeps a dark-mode depth over white pages.
+                        Layer::Control => (60.0 - 22.0 * lb, 0.30, 0.44, 118.0),
                         Layer::ControlLight => (112.0 - 46.0 * lb, 0.20, 0.40, 140.0),
-                        Layer::CcPanel => (54.0 - 18.0 * lb, 0.16, 0.40, 160.0),
+                        Layer::CcPanel => (54.0 - 18.0 * lb, 0.16, 0.44, 134.0),
                         _ => (118.0 - 50.0 * lb, 0.06, 0.42, 170.0),
                     };
                     let a = a0 + ka * lb;
