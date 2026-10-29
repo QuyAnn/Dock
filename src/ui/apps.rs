@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use windows::core::Result;
 
+use super::anim::{self, attn_bounce, ease_out_cubic, magnify_target, nearly_equal, running, FRAME_DT};
 use super::dock::{hit_test, RectF};
 use super::renderer::{Align, Renderer, TextStyle};
 use super::squircle::{rounded_rect_alpha, shadow_pad, soft_shadow, squircle_mask, ICON_N};
@@ -59,6 +60,11 @@ thread_local! {
 /// its process image path). The dock repaints after this.
 pub fn set_foreground(root: isize, exe: String) {
     FOREGROUND.with(|f| *f.borrow_mut() = (root, exe));
+    ACTIVE_SINCE.with(|c| {
+        if c.get().map(|(h, _)| h) != Some(root) {
+            c.set(Some((root, Instant::now())));
+        }
+    });
 }
 
 /// `set_foreground` with the grow-in already finished (offscreen renders).
@@ -112,16 +118,17 @@ fn active_bar(edge: crate::win::edge::AbEdge, s: RectF, len: f32) -> RectF {
 }
 
 /// The pill: soft dark shadow ring, light outline, then solid system blue, all fully rounded.
-fn draw_active_pill(r: &mut Renderer, bar: RectF) -> Result<()> {
+fn draw_active_pill(r: &mut Renderer, bar: RectF, opacity: f32) -> Result<()> {
+    let o = opacity.clamp(0.0, 1.0);
     let grow = |rc: RectF, d: f32| RectF { x: rc.x - d, y: rc.y - d, w: rc.w + 2.0 * d, h: rc.h + 2.0 * d };
     let radius = |rc: RectF| rc.w.min(rc.h) / 2.0;
     let shadow = grow(bar, ACTIVE_OUTLINE + ACTIVE_SHADOW);
-    r.fill_rounded_rect(shadow, radius(shadow), ACTIVE_SHADOW_RGBA)?;
+    r.fill_rounded_rect(shadow, radius(shadow), with_alpha(ACTIVE_SHADOW_RGBA, o))?;
     let soft = grow(bar, ACTIVE_OUTLINE + ACTIVE_SHADOW * 0.5);
-    r.fill_rounded_rect(soft, radius(soft), ACTIVE_SHADOW_RGBA)?;
+    r.fill_rounded_rect(soft, radius(soft), with_alpha(ACTIVE_SHADOW_RGBA, o))?;
     let outline = grow(bar, ACTIVE_OUTLINE);
-    r.fill_rounded_rect(outline, radius(outline), ACTIVE_OUTLINE_RGBA)?;
-    r.fill_rounded_rect(bar, radius(bar), ACTIVE_RGBA)
+    r.fill_rounded_rect(outline, radius(outline), with_alpha(ACTIVE_OUTLINE_RGBA, o))?;
+    r.fill_rounded_rect(bar, radius(bar), with_alpha(ACTIVE_RGBA, o))
 }
 
 thread_local! {
@@ -162,8 +169,10 @@ const BADGE_RED: u32 = 0xFF3B_30FF; // #ff3b30
 const BADGE_SHADOW: u32 = 0x0000_0066; // box-shadow 0 1px 2px rgba(0,0,0,.4)
 const BADGE_H: f32 = 15.0;
 const BADGE_FONT: f32 = 9.5;
-const ATTN_PERIOD: f32 = 1.4; // animation: attn 1.4s ease-in-out infinite
+const ATTN_BOUNCE_SECS: f32 = 1.4;
 const MAG_RANGE: f32 = 40.0; // magnify falloff distance, px
+const MAG_TAU: f32 = 0.07;
+const POP_IN_SECS: f32 = 0.35;
 // Hover only lifts slightly (scales around the bottom centre, ~2 DIP taller at most) so the
 // icon never leaves the 48-DIP bar and nothing else moves.
 const MAG_MAX: f32 = 0.05;
@@ -171,12 +180,161 @@ const MAG_MAX: f32 = 0.05;
 thread_local! {
     /// Pointer x in dock-local DIPs (same space as the tile rects), None when not over the dock.
     static POINTER: Cell<Option<f32>> = const { Cell::new(None) };
+    static MAG: std::cell::RefCell<MagState> = const { std::cell::RefCell::new(MagState::new()) };
+    static POP_SINCE: std::cell::RefCell<HashMap<isize, Instant>> = const { std::cell::RefCell::new(HashMap::new()) };
+    static ATTN_SINCE: std::cell::RefCell<HashMap<isize, Instant>> = const { std::cell::RefCell::new(HashMap::new()) };
+    static SEEN_HWNDS: std::cell::RefCell<HashSet<isize>> = const { std::cell::RefCell::new(HashSet::new()) };
+}
+
+struct MagState {
+    centers: Vec<f32>,
+    scales: Vec<f32>,
+}
+
+impl MagState {
+    const fn new() -> Self {
+        Self { centers: Vec::new(), scales: Vec::new() }
+    }
+
+    fn resize(&mut self, n: usize) {
+        if self.scales.len() != n {
+            self.scales.resize(n, 1.0);
+        }
+        if self.centers.len() != n {
+            self.centers.resize(n, 0.0);
+        }
+    }
 }
 
 /// Sets the pointer x for magnification. Call with None on mouse leave.
-/// Magnification only takes effect on the next draw, so the caller must repaint.
 pub fn set_pointer(x: Option<f32>) {
     POINTER.with(|p| p.set(x));
+}
+
+/// Last layout of app slot centres along the dock axis (updated each paint).
+pub fn note_mag_centers(centers: &[f32]) {
+    MAG.with(|m| {
+        let mut s = m.borrow_mut();
+        s.resize(centers.len());
+        s.centers.copy_from_slice(centers);
+    });
+}
+
+/// Advances smoothed magnification toward the current pointer (call ~60 Hz while animating).
+pub fn advance_anim(dt: f32) -> bool {
+    let ptr = POINTER.with(Cell::get);
+    MAG.with(|m| {
+        let mut s = m.borrow_mut();
+        if s.centers.is_empty() {
+            return false;
+        }
+        let mut moving = false;
+        for (i, cx) in s.centers.iter().enumerate() {
+            let target = magnify_target(*cx, ptr, MAG_RANGE, MAG_MAX);
+            let next = anim::approach(s.scales[i], target, dt, MAG_TAU);
+            if !nearly_equal(next, target) {
+                moving = true;
+            }
+            s.scales[i] = next;
+        }
+        moving
+    })
+}
+
+fn icon_scale(i: usize, cx: f32) -> f32 {
+    MAG.with(|m| {
+        let s = m.borrow();
+        if i < s.scales.len() && !s.centers.is_empty() {
+            s.scales[i]
+        } else {
+            magnify_target(cx, POINTER.with(Cell::get), MAG_RANGE, MAG_MAX)
+        }
+    })
+}
+
+fn pop_extra(w: &WindowEntry) -> f32 {
+    if w.hwnd == 0 {
+        return 0.0;
+    }
+    POP_SINCE.with(|m| {
+        m.borrow()
+            .get(&w.hwnd)
+            .map(|t| {
+                let e = t.elapsed().as_secs_f32();
+                if e >= POP_IN_SECS {
+                    0.0
+                } else {
+                    0.15 * (1.0 - ease_out_cubic(e / POP_IN_SECS))
+                }
+            })
+            .unwrap_or(0.0)
+    })
+}
+
+fn attn_extra(w: &WindowEntry) -> f32 {
+    if !w.attention || w.hwnd == 0 {
+        return 0.0;
+    }
+    ATTN_SINCE.with(|m| {
+        m.borrow()
+            .get(&w.hwnd)
+            .map(|t| attn_bounce(t.elapsed().as_secs_f32(), ATTN_BOUNCE_SECS))
+            .unwrap_or(0.0)
+    })
+}
+
+fn track_new_windows(windows: &[WindowEntry]) {
+    let mut seen = SEEN_HWNDS.borrow_mut();
+    let mut pop = POP_SINCE.borrow_mut();
+    for w in windows {
+        if w.hwnd == 0 {
+            continue;
+        }
+        if !seen.contains(&w.hwnd) {
+            pop.insert(w.hwnd, Instant::now());
+            seen.insert(w.hwnd);
+        }
+    }
+    seen.retain(|h| windows.iter().any(|w| w.hwnd == *h));
+    pop.retain(|h, _| seen.contains(h));
+    ATTN_SINCE.borrow_mut().retain(|h, _| seen.contains(h));
+}
+
+/// True while any apps-tile animation still needs ~60 Hz repaints.
+pub fn dock_anim_running() -> bool {
+    if active_animating() {
+        return true;
+    }
+    if pop_running() || attn_running() {
+        return true;
+    }
+    mag_animating()
+}
+
+fn pop_running() -> bool {
+    POP_SINCE.with(|m| m.borrow().values().any(|t| running(t.elapsed().as_secs_f32(), POP_IN_SECS)))
+}
+
+fn attn_running() -> bool {
+    ATTN_SINCE.with(|m| m.borrow().values().any(|t| running(t.elapsed().as_secs_f32(), ATTN_BOUNCE_SECS)))
+}
+
+fn mag_animating() -> bool {
+    let ptr = POINTER.with(Cell::get);
+    MAG.with(|m| {
+        let s = m.borrow();
+        s.centers.iter().enumerate().any(|(i, cx)| {
+            let target = magnify_target(*cx, ptr, MAG_RANGE, MAG_MAX);
+            !nearly_equal(s.scales.get(i).copied().unwrap_or(1.0), target)
+        })
+    })
+}
+
+/// Steps magnification for offscreen renders (fixed dt).
+pub fn settle_mag_frames(frames: u32) {
+    for _ in 0..frames {
+        let _ = advance_anim(FRAME_DT);
+    }
 }
 
 /// Icon ready to draw: squircle-composed RGBA plus its drop shadow.
@@ -226,8 +384,13 @@ impl AppsState {
         fresh.sort_by_key(|(seen, w)| (previous.get(&w.hwnd).copied().unwrap_or(usize::MAX), *seen));
         self.windows = fresh.into_iter().map(|(_, w)| w).collect();
         for w in &mut self.windows {
+            let was = w.attention;
             w.attention = attention.contains(w.hwnd);
+            if w.attention && !was && w.hwnd != 0 {
+                ATTN_SINCE.borrow_mut().insert(w.hwnd, Instant::now());
+            }
         }
+        track_new_windows(&self.windows);
         let launchers = pinned_launchers(&self.pins, &self.windows);
         self.windows.extend(launchers);
         for w in &self.windows {
@@ -267,9 +430,14 @@ fn pinned_launchers(pins: &[(String, String)], open: &[WindowEntry]) -> Vec<Wind
 /// Draws one slot per window that fits in `rect`, centered. Extra windows are clipped.
 /// Reads the pointer set by `set_pointer` for magnification.
 pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()> {
-    let pointer = POINTER.with(Cell::get);
-    let t = now_secs();
     let edge = crate::win::edge::current();
+    let slot_rects = slots_on(edge.vertical(), rect, state.windows.len());
+    let centers: Vec<f32> = slot_rects
+        .iter()
+        .map(|s| if edge.vertical() { s.y + SLOT / 2.0 } else { s.x + SLOT / 2.0 })
+        .collect();
+    note_mag_centers(&centers);
+    let t = now_secs();
     // Keyed by the foreground window itself (not by slot), so docks on other monitors, which
     // may not list it, never restart each other's grow-in.
     let (active, fg_root) = FOREGROUND.with(|f| {
@@ -277,14 +445,17 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
         (active_index(&state.windows, f.0, &f.1), f.0)
     });
     let grow = ACTIVE_SINCE.with(|c| match c.get() {
-        Some((h, t)) if h == fg_root => (t.elapsed().as_secs_f32() / ACTIVE_ANIM_SECS).min(1.0),
-        _ => {
-            c.set(Some((fg_root, Instant::now())));
-            0.0
+        Some((h, started)) if h == fg_root => {
+            ease_out_cubic((started.elapsed().as_secs_f32() / ACTIVE_ANIM_SECS).min(1.0))
         }
+        _ => 0.0,
     });
-    for (i, (w, s)) in state.windows.iter().zip(slots_on(edge.vertical(), rect, state.windows.len())).enumerate() {
-        let (ico, dot) = icon_geometry(edge, s, pointer);
+    for (i, (w, s)) in state.windows.iter().zip(slot_rects.iter()).enumerate() {
+        let (mut ico, dot) = icon_geometry(edge, *s, i);
+        let extra = pop_extra(w) + attn_extra(w);
+        if extra != 0.0 {
+            ico = scale_icon_about_anchor(edge, ico, 1.0 + extra);
+        }
         let key = if w.aumid.is_empty() { &w.exe } else { &w.aumid };
         match state.icons.get(key) {
             Some(icon) => draw_icon(r, icon, ico)?,
@@ -294,13 +465,13 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
             continue; // pinned launcher: no badge, no running dot
         }
         if let Some(badge) = badge_of(w) {
-            draw_badge(r, ico, badge, t)?;
+            draw_badge(r, ico, badge, t, w)?;
         }
         if Some(i) == active {
             // The app in front: a short blue pill instead of the white dot (eased grow-in).
-            let k = 1.0 - (1.0 - grow).powi(3);
-            let bar = active_bar(edge, s, DOT + (ACTIVE_LEN - DOT) * k);
-            draw_active_pill(r, bar)?;
+            let k = grow;
+            let bar = active_bar(edge, *s, DOT + (ACTIVE_LEN - DOT) * k);
+            draw_active_pill(r, bar, k)?;
             log_active(state, i, w);
             continue;
         }
@@ -310,15 +481,41 @@ pub fn draw_apps(r: &mut Renderer, rect: RectF, state: &AppsState) -> Result<()>
     Ok(())
 }
 
+/// Scales `ico` about its screen-edge anchor without shifting the anchored edge.
+fn scale_icon_about_anchor(edge: crate::win::edge::AbEdge, ico: RectF, factor: f32) -> RectF {
+    use crate::win::edge::AbEdge;
+    if nearly_equal(factor, 1.0) {
+        return ico;
+    }
+    match edge {
+        AbEdge::Bottom => {
+            let bottom = ico.y + ico.h;
+            let h = ico.h * factor;
+            RectF { x: ico.x + (ico.w - ico.w * factor) / 2.0, y: bottom - h, w: ico.w * factor, h }
+        }
+        AbEdge::Top => RectF { x: ico.x + (ico.w - ico.w * factor) / 2.0, y: ico.y, w: ico.w * factor, h: ico.h * factor },
+        AbEdge::Left => {
+            let left = ico.x;
+            let w = ico.w * factor;
+            RectF { x: left, y: ico.y + (ico.h - ico.h * factor) / 2.0, w, h: ico.h * factor }
+        }
+        AbEdge::Right => {
+            let right = ico.x + ico.w;
+            let w = ico.w * factor;
+            RectF { x: right - w, y: ico.y + (ico.h - ico.h * factor) / 2.0, w, h: ico.h * factor }
+        }
+    }
+}
+
 /// Icon rect (magnified for `pointer`, the pointer's position along the dock) and running-dot
 /// rect for slot `s`. The icon's screen-edge side never moves; it grows away from the edge.
 /// Bottom is the original geometry.
-fn icon_geometry(edge: crate::win::edge::AbEdge, s: RectF, pointer: Option<f32>) -> (RectF, RectF) {
+fn icon_geometry(edge: crate::win::edge::AbEdge, s: RectF, index: usize) -> (RectF, RectF) {
     use crate::win::edge::AbEdge;
     match edge {
         AbEdge::Bottom | AbEdge::Top => {
             let cx = s.x + SLOT / 2.0;
-            let size = ICON * magnify(cx, pointer);
+            let size = ICON * icon_scale(index, cx);
             if edge == AbEdge::Bottom {
                 // Scales around the bottom centre; the base position never moves.
                 let base_bottom = s.y + ICON_TOP + ICON;
@@ -332,7 +529,7 @@ fn icon_geometry(edge: crate::win::edge::AbEdge, s: RectF, pointer: Option<f32>)
         }
         AbEdge::Left | AbEdge::Right => {
             let cy = s.y + SLOT / 2.0;
-            let size = ICON * magnify(cy, pointer);
+            let size = ICON * icon_scale(index, cy);
             if edge == AbEdge::Left {
                 let base_left = s.x + s.w - ICON_TOP - ICON;
                 let ico = RectF { x: base_left, y: cy - size / 2.0, w: size, h: size };
@@ -350,7 +547,8 @@ fn icon_geometry(edge: crate::win::edge::AbEdge, s: RectF, pointer: Option<f32>)
 /// like one when hovered.
 fn button_plate(rc: RectF, hovered: bool) -> RectF {
     use crate::win::edge::AbEdge;
-    let size = ICON * if hovered { 1.0 + MAG_MAX } else { 1.0 };
+    let lift = if hovered { anim::hover_lift() } else { 0.0 };
+    let size = ICON * (1.0 + MAG_MAX * lift);
     let (cx, cy) = (rc.x + rc.w / 2.0, rc.y + rc.h / 2.0);
     match crate::win::edge::current() {
         AbEdge::Bottom => {
@@ -373,7 +571,7 @@ pub fn draw_start_icon(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()>
     draw_glass(r, plate, BUTTON_RADIUS, Layer::Plate, hovered)?;
     // Blue tint, deeper at the bottom, then the rims again so they stay crisp on top of it.
     r.fill_rounded_rect_gradient(plate, BUTTON_RADIUS, 0x4DA8_FFC4, 0x0A62_E6D2)?;
-    draw_highlights(r, plate, BUTTON_RADIUS, if hovered { 1.35 } else { 1.0 })?;
+    draw_highlights(r, plate, BUTTON_RADIUS, 1.0 + 0.35 * if hovered { anim::hover_lift() } else { 0.0 })?;
     // Windows logo: four panes with a thin gap, centred.
     let logo = plate.w * 0.52;
     let gap = logo * 0.12;
@@ -501,15 +699,9 @@ fn slots_on(vertical: bool, rect: RectF, n: usize) -> Vec<RectF> {
         .collect()
 }
 
-/// Scale of the icon at horizontal centre `cx` for a pointer at `pointer`: 1 + 0.3 * (1 - d/64)^2.
+/// Scale of the icon at horizontal centre `cx` for a pointer at `pointer`: 1 + 0.05 * (1 - d/64)^2.
 fn magnify(cx: f32, pointer: Option<f32>) -> f32 {
-    match pointer {
-        None => 1.0,
-        Some(x) => {
-            let falloff = (1.0 - (cx - x).abs() / MAG_RANGE).max(0.0);
-            1.0 + MAG_MAX * falloff * falloff
-        }
-    }
+    magnify_target(cx, pointer, MAG_RANGE, MAG_MAX)
 }
 
 /// Full-bleed squircle icon with its soft shadow; no plate behind it.
@@ -588,7 +780,7 @@ fn badge_of(w: &WindowEntry) -> Option<Badge> {
 
 /// Badge geometry is relative to .ico (top -3 px, right -5 px for counts; top -1, right -2 for dots).
 /// It scales with the icon, so every offset and size is multiplied by `k`.
-fn draw_badge(r: &mut Renderer, ico: RectF, badge: Badge, t: f32) -> Result<()> {
+fn draw_badge(r: &mut Renderer, ico: RectF, badge: Badge, t: f32, w: &WindowEntry) -> Result<()> {
     let k = ico.w / ICON;
     let right = ico.x + ico.w;
     match badge {
@@ -602,8 +794,12 @@ fn draw_badge(r: &mut Renderer, ico: RectF, badge: Badge, t: f32) -> Result<()> 
             r.draw_text_styled(&text, rect, BADGE_FONT * k, WHITE, Align::Center, TextStyle::Bold)
         }
         Badge::Dot => {
-            // .badge.dot animation: attn 1.4s ease-in-out infinite (scale 1 -> .6 -> 1, opacity 1 -> .5 -> 1).
-            let (scale, opacity) = attn(t);
+            let bounce = attn_extra(w);
+            let (scale, opacity) = if bounce.abs() > 1e-4 {
+                (1.0 + bounce * 3.0, 1.0)
+            } else {
+                (1.0, 0.85)
+            };
             let base = 9.0 * k;
             let cx = right + 2.0 * k - base / 2.0;
             let cy = ico.y - 1.0 * k + base / 2.0;
@@ -648,8 +844,9 @@ fn initial(w: &WindowEntry) -> String {
 }
 
 /// (scale, opacity) of the attention dot at time `t`. Keyframes: 0/100% = 1, 50% = .6 scale, .5 opacity.
+#[allow(dead_code)]
 fn attn(t: f32) -> (f32, f32) {
-    let p = (t % ATTN_PERIOD) / ATTN_PERIOD;
+    let p = (t % ATTN_BOUNCE_SECS) / ATTN_BOUNCE_SECS;
     // Triangle 0..1..0 over one period, eased per half like ease-in-out.
     let tri = 1.0 - (2.0 * p - 1.0).abs();
     let e = 0.5 - 0.5 * (PI * tri).cos();
@@ -801,12 +998,16 @@ mod tests {
         use crate::win::edge::AbEdge;
         // Bottom keeps the original geometry exactly.
         let s = RectF { x: 100.0, y: 3.0, w: SLOT, h: CLUSTER_H };
-        let (ico, dot) = icon_geometry(AbEdge::Bottom, s, None);
+        let (ico, dot) = icon_geometry(AbEdge::Bottom, s, 0);
         assert_eq!(ico, RectF { x: 100.0, y: 3.0 + ICON_TOP, w: ICON, h: ICON });
         assert_eq!(dot.y, 3.0 + ICON_TOP + ICON + DOT_GAP);
         // Top: dot above the icon, magnified icon keeps its top line.
         let s = RectF { x: 100.0, y: 7.0, w: SLOT, h: CLUSTER_H };
-        let (ico, dot) = icon_geometry(AbEdge::Top, s, Some(117.0));
+        let cx = s.x + SLOT / 2.0;
+        set_pointer(Some(cx));
+        note_mag_centers(&[cx]);
+        settle_mag_frames(40);
+        let (ico, dot) = icon_geometry(AbEdge::Top, s, 0);
         assert_eq!(ico.y, 7.0 + ICON_TOP);
         assert!(ico.w > ICON && dot.y + dot.h <= ico.y);
         // Left/right: slots stack vertically; the dot sits on the screen side.
@@ -814,10 +1015,10 @@ mod tests {
         let v = slots_on(true, band, 3);
         assert_eq!(v.len(), 3);
         assert!((v[1].y - v[0].y - PITCH).abs() < 1e-4 && v[0].y == 300.0);
-        let (ico, dot) = icon_geometry(AbEdge::Left, v[0], Some(v[0].y + SLOT / 2.0));
+        let (ico, dot) = icon_geometry(AbEdge::Left, v[0], 0);
         assert!(dot.x + dot.w <= ico.x && (ico.x - (7.0 + ICON_TOP)).abs() < 1e-4);
         let band = RectF { x: 3.0, ..band };
-        let (ico, dot) = icon_geometry(AbEdge::Right, slots_on(true, band, 3)[2], None);
+        let (ico, dot) = icon_geometry(AbEdge::Right, slots_on(true, band, 3)[2], 2);
         assert!(dot.x >= ico.x + ico.w && (ico.x + ico.w - (3.0 + ICON_TOP + ICON)).abs() < 1e-4);
     }
 
@@ -832,7 +1033,7 @@ mod tests {
         let halo = ACTIVE_OUTLINE + ACTIVE_SHADOW;
         // Bottom: screen edge at DOCK_H, below the icon.
         let s = RectF { x: 100.0, y: near, w: SLOT, h: CLUSTER_H };
-        let (ico, _) = icon_geometry(AbEdge::Bottom, s, None);
+        let (ico, _) = icon_geometry(AbEdge::Bottom, s, 0);
         let bar = active_bar(AbEdge::Bottom, s, ACTIVE_LEN);
         assert_eq!((bar.w, bar.h), (ACTIVE_LEN, ACTIVE_THICK));
         assert!((bar.x + bar.w / 2.0 - (ico.x + ico.w / 2.0)).abs() < 1e-4);
@@ -840,20 +1041,46 @@ mod tests {
         assert!(bar.y + bar.h + halo <= DOCK_H - 1.0, "inside the strip: {bar:?}");
         // Top: screen edge at 0, above the icon, not clipped by the screen edge.
         let s = RectF { x: 100.0, y: far, w: SLOT, h: CLUSTER_H };
-        let (ico, _) = icon_geometry(AbEdge::Top, s, None);
+        let (ico, _) = icon_geometry(AbEdge::Top, s, 0);
         let bar = active_bar(AbEdge::Top, s, ACTIVE_LEN);
         assert!(ico.y - (bar.y + bar.h) >= 3.0 && bar.y - halo >= 1.0, "top pill clipped: {bar:?}");
         // Left: screen edge at x 0; right: screen edge at x DOCK_H. Vertical pill, centred.
         let v = RectF { x: far, y: 300.0, w: CLUSTER_H, h: SLOT };
-        let (ico, _) = icon_geometry(AbEdge::Left, v, None);
+        let (ico, _) = icon_geometry(AbEdge::Left, v, 0);
         let bar = active_bar(AbEdge::Left, v, ACTIVE_LEN);
         assert_eq!((bar.w, bar.h), (ACTIVE_THICK, ACTIVE_LEN));
         assert!(ico.x - (bar.x + bar.w) >= 3.0 && bar.x - halo >= 1.0);
         assert!((bar.y + bar.h / 2.0 - (ico.y + ico.h / 2.0)).abs() < 1e-4);
         let v = RectF { x: near, ..v };
-        let (ico, _) = icon_geometry(AbEdge::Right, v, None);
+        let (ico, _) = icon_geometry(AbEdge::Right, v, 0);
         let bar = active_bar(AbEdge::Right, v, ACTIVE_LEN);
         assert!(bar.x - (ico.x + ico.w) >= 3.0 && bar.x + bar.w + halo <= DOCK_H - 1.0);
+    }
+
+    #[test]
+    fn anim_mag_settles_without_pointer() {
+        set_pointer(None);
+        note_mag_centers(&[100.0, 139.0]);
+        MAG.with(|m| {
+            m.borrow_mut().scales = vec![1.05, 1.02];
+        });
+        for _ in 0..120 {
+            advance_anim(FRAME_DT);
+        }
+        assert!(!mag_animating());
+        MAG.with(|m| {
+            for s in &m.borrow().scales {
+                assert!(nearly_equal(*s, 1.0), "scale {s}");
+            }
+        });
+    }
+
+    #[test]
+    fn anim_timer_idle_when_resting() {
+        set_pointer(None);
+        note_mag_centers(&[50.0]);
+        settle_mag_frames(90);
+        assert!(!dock_anim_running());
     }
 
     #[test]

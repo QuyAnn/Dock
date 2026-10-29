@@ -6,6 +6,7 @@ pub mod popup_content; // popup body drawing per tile kind
 pub mod glass; // dock glass: acrylic tint and tile fill/rim
 pub mod gallery; // widget gallery sheet
 pub mod calendar; // clock popup: month calendar + world clocks
+pub mod anim; // easing, interpolation, shared hover lift for dock tiles
 pub mod apps; // apps tile: window icons, running dots, attention badge, hit testing
 pub mod appmenu; // right-click context menu for centre app icons (NOACTIVATE)
 pub mod thumbnails; // DWM live peeks above dock on app-icon hover

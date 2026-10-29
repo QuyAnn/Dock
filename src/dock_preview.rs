@@ -129,11 +129,24 @@ pub fn render(out: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
     };
 
     let mut tiles: Vec<(&'static str, RectF)> = Vec::new();
+    let mag_mid = std::env::var("SMARTDOCK_DOCK_MAG").is_ok_and(|v| v.trim() == "1");
+    let active_mid = std::env::var("SMARTDOCK_DOCK_ACTIVE_ANIM").is_ok_and(|v| v.trim() == "1");
+    if active_mid {
+        if let Some(w) = apps.windows.get(1) {
+            crate::ui::apps::set_foreground(w.hwnd, w.exe.clone());
+            crate::ui::apps::settle_mag_frames(5);
+            note("active pill grow-in mid-frame");
+        }
+    }
     // SMARTDOCK_DOCK_SCALE=<factor>: only the dock strip, at that display scale (1, 1.5, ...).
     if let Some(scale) = std::env::var("SMARTDOCK_DOCK_SCALE").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
         let (pw, ph) = ((dw as f32 * scale).round() as u32, (dh as f32 * scale).round() as u32);
         note(&format!("strip only at scale {scale}: {pw}x{ph}"));
         Renderer::render_png(out, pw, ph, (96.0 * scale).round() as u32, |r| {
+            if mag_mid {
+                crate::draw_surface(r, length, None, &mut tiles, &apps, &stats, &data, &control, 0.0, &settings, Some(&backdrop))?;
+                seed_mag_mid_hover(&apps, &tiles, &note);
+            }
             crate::draw_surface(r, length, None, &mut tiles, &apps, &stats, &data, &control, 0.0, &settings, Some(&backdrop))
         })?;
         for (id, r) in &tiles {
@@ -143,6 +156,10 @@ pub fn render(out: &Path, wallpaper_path: &Path, dark: bool) -> Result<()> {
     }
     let dock_tmp = out.with_extension("dock.png");
     Renderer::render_png(&dock_tmp, dw as u32, dh as u32, 96, |r| {
+        if mag_mid {
+            crate::draw_surface(r, length, None, &mut tiles, &apps, &stats, &data, &control, 0.0, &settings, Some(&backdrop))?;
+            seed_mag_mid_hover(&apps, &tiles, &note);
+        }
         crate::draw_surface(r, length, None, &mut tiles, &apps, &stats, &data, &control, 0.0, &settings, Some(&backdrop))
     })?;
     let (tw, th, dock_px) = wallpaper::thumbnail(&dock_tmp, dw.max(dh) as u32)?;
@@ -259,6 +276,29 @@ fn sample_git() -> crate::data::git::GitSummary {
         .collect();
     let (today, week, streak) = crate::data::git::git_stats(&heatmap);
     crate::data::git::GitSummary { today, week, streak, heatmap, error: None }
+}
+
+fn seed_mag_mid_hover(apps: &AppsState, tiles: &[(&str, RectF)], note: &dyn Fn(&str)) {
+    use crate::ui::apps::{self, note_mag_centers, set_pointer, settle_mag_frames, ICON};
+    let Some((_, rect)) = tiles.iter().find(|(id, _)| *id == "apps") else { return };
+    let centers: Vec<f32> = (0..apps.windows.len())
+        .filter_map(|i| apps::slot_rect(*rect, apps, i))
+        .map(|s| {
+            if edge::current().vertical() {
+                s.y + ICON / 2.0
+            } else {
+                s.x + ICON / 2.0
+            }
+        })
+        .collect();
+    if centers.is_empty() {
+        return;
+    }
+    let mid = centers.len() / 2;
+    note_mag_centers(&centers);
+    set_pointer(Some(centers[mid]));
+    settle_mag_frames(10);
+    note(&format!("magnification mid-hover on slot {mid}"));
 }
 
 /// Nearest-neighbour cover crop of the wallpaper to the simulated screen.

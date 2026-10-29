@@ -18,6 +18,7 @@ on:
       - "src/ui/gallery.rs"
       - "src/ui/thumbnails.rs"
       - "src/ui/dock.rs"
+      - "src/ui/anim.rs"
       - "src/ui/apps.rs"
       - "src/dock_preview.rs"
       - "render-inputs/**"
@@ -377,6 +378,49 @@ jobs:
           Remove-Item Env:SMARTDOCK_DOCK_EDGE
           Remove-Item Env:SMARTDOCK_DOCK_POPUP
           Remove-Item Env:SMARTDOCK_DOCK_ACTIVE
+          # Mid-hover magnification and active-pill grow-in (strip renders for review).
+          $env:SMARTDOCK_DOCK_MAG = "1"
+          $env:SMARTDOCK_DOCK_SCALE = "1"
+          foreach ($edge in @("bottom", "right")) {
+            $env:SMARTDOCK_DOCK_EDGE = $edge
+            $outPath = [System.IO.Path]::GetFullPath("render-output\dock_mag_mid_${edge}.png")
+            $wallpaperPath = (Resolve-Path "render-inputs\blue_desk.jpg").Path
+            Write-Host "Rendering $outPath (edge $edge, mag mid-hover)"
+            $process = Start-Process -FilePath $exe `
+              -ArgumentList @("--render-dock", "`"$outPath`"", "`"$wallpaperPath`"", "light") `
+              -RedirectStandardError ([System.IO.Path]::ChangeExtension($outPath, ".stderr.log")) `
+              -RedirectStandardOutput ([System.IO.Path]::ChangeExtension($outPath, ".stdout.log")) `
+              -NoNewWindow -PassThru
+            if (-not $process.WaitForExit(60000)) { $process.Kill($true); $failures += "timed out: dock mag $edge" }
+            else {
+              $process.WaitForExit()
+              Show-Logs $outPath
+              if ($process.ExitCode -ne 0) { $failures += "exit $($process.ExitCode) : dock mag $edge" }
+            }
+          }
+          Remove-Item Env:SMARTDOCK_DOCK_MAG
+          Remove-Item Env:SMARTDOCK_DOCK_SCALE
+          $env:SMARTDOCK_DOCK_ACTIVE_ANIM = "1"
+          $env:SMARTDOCK_DOCK_SCALE = "1"
+          foreach ($edge in @("bottom", "left")) {
+            $env:SMARTDOCK_DOCK_EDGE = $edge
+            $outPath = [System.IO.Path]::GetFullPath("render-output\dock_active_anim_${edge}.png")
+            $wallpaperPath = (Resolve-Path "render-inputs\wp_white.jpg").Path
+            Write-Host "Rendering $outPath (edge $edge, active pill mid grow-in)"
+            $process = Start-Process -FilePath $exe `
+              -ArgumentList @("--render-dock", "`"$outPath`"", "`"$wallpaperPath`"", "light") `
+              -RedirectStandardError ([System.IO.Path]::ChangeExtension($outPath, ".stderr.log")) `
+              -RedirectStandardOutput ([System.IO.Path]::ChangeExtension($outPath, ".stdout.log")) `
+              -NoNewWindow -PassThru
+            if (-not $process.WaitForExit(60000)) { $process.Kill($true); $failures += "timed out: dock active anim $edge" }
+            else {
+              $process.WaitForExit()
+              Show-Logs $outPath
+              if ($process.ExitCode -ne 0) { $failures += "exit $($process.ExitCode) : dock active anim $edge" }
+            }
+          }
+          Remove-Item Env:SMARTDOCK_DOCK_ACTIVE_ANIM
+          Remove-Item Env:SMARTDOCK_DOCK_SCALE
           # Git tile with sample data: dock strip only at 100% and 150%, dark and light backdrops,
           # bottom and right (vertical) docks.
           $env:SMARTDOCK_DOCK_GIT = "1"

@@ -112,7 +112,7 @@ const TIMER_GUARD: usize = 2; // 500 ms: keep the Windows taskbar hidden
 const TIMER_EXPLORER: usize = 0x5E5E; // one-shot: Explorer restarted, re-attach after it settles
 const TIMER_VISUALIZER: usize = 3; // ~30 fps, enabled only while media is playing
 const TIMER_STOPWATCH: usize = 4; // tenths of a second, only while its widget/popup is visible
-const TIMER_ACTIVE: usize = 5; // ~60 fps for 0.18 s after the app in front changes, then killed
+const TIMER_ANIM: usize = 5; // ~60 fps while dock animations run, then killed
 
 /// The primary dock window, for the foreground hook's repaint request.
 static DOCK_MAIN: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -126,10 +126,10 @@ fn on_foreground_change(hwnd: isize) {
     ui::apps::set_foreground(root, exe);
     let main = DOCK_MAIN.load(std::sync::atomic::Ordering::Relaxed);
     if main != 0 {
-        // SAFETY: our own window; both calls only queue work for the message loop.
+        // SAFETY: hwnd is live; timers drive refresh and the taskbar guard.
         unsafe {
             let _ = InvalidateRect(HWND(main as _), None, false);
-            SetTimer(HWND(main as _), TIMER_ACTIVE, 16, None);
+            SetTimer(HWND(main as _), TIMER_ANIM, 16, None);
         }
     }
 }
@@ -1562,6 +1562,40 @@ fn repaint_docks(only: Option<HWND>) {
     });
 }
 
+/// True while magnification, active pill, hover lift, or icon entrance still needs frames.
+fn dock_anim_running() -> bool {
+    ui::apps::dock_anim_running() || ui::anim::hover_animating()
+}
+
+fn primary_hwnd() -> Option<HWND> {
+    APP.with(|a| a.try_borrow().ok().and_then(|s| s.as_ref().map(|app| app.hwnd)))
+}
+
+fn sync_dock_anim_timer(keep_alive: bool) {
+    let Some(hwnd) = primary_hwnd() else { return };
+    if keep_alive || dock_anim_running() {
+        // SAFETY: our own primary dock window.
+        unsafe {
+            SetTimer(hwnd, TIMER_ANIM, 16, None);
+        }
+    }
+}
+
+fn tick_dock_anim(hwnd: HWND) {
+    let dt = ui::anim::FRAME_DT;
+    let hover = ui::anim::tick_hover(dt);
+    let mag = ui::apps::advance_anim(dt);
+    if hover || mag || dock_anim_running() {
+        repaint();
+    }
+    if !dock_anim_running() {
+        // SAFETY: our own primary dock window.
+        unsafe {
+            let _ = KillTimer(hwnd, TIMER_ANIM);
+        }
+    }
+}
+
 /// Updates the hovered tile from a pointer position. Returns true when the hovered tile changed.
 fn set_hover_on(hwnd: HWND, hover_at: Option<(f32, f32)>) -> bool {
     APP.with(|a| {
@@ -1572,6 +1606,8 @@ fn set_hover_on(hwnd: HWND, hover_at: Option<(f32, f32)>) -> bool {
             let next = hover_at.and_then(|(x, y)| dock::hit_test(x, y, &rects));
             let changed = next != app.hover;
             app.hover = next;
+            let any = app.hover.is_some() || app.secondaries.iter().any(|s| s.hover.is_some());
+            ui::anim::set_hover_target(any);
             return changed;
         }
         if let Some(sec) = app.secondaries.iter_mut().find(|s| s.hwnd == hwnd) {
@@ -1579,6 +1615,8 @@ fn set_hover_on(hwnd: HWND, hover_at: Option<(f32, f32)>) -> bool {
             let next = hover_at.and_then(|(x, y)| dock::hit_test(x, y, &rects));
             let changed = next != sec.hover;
             sec.hover = next;
+            let any = app.hover.is_some() || app.secondaries.iter().any(|s| s.hover.is_some());
+            ui::anim::set_hover_target(any);
             return changed;
         }
         false
@@ -3556,6 +3594,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                         }
                     }
                     refresh_open_popup();
+                    sync_dock_anim_timer(true);
                     repaint();
                 }
                 TIMER_EXPLORER => {
@@ -3575,12 +3614,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     guard_work_area(hwnd);
                 }
                 TIMER_VISUALIZER => repaint(),
-                TIMER_ACTIVE => {
-                    repaint();
-                    if !ui::apps::active_animating() {
-                        let _ = KillTimer(hwnd, TIMER_ACTIVE);
-                    }
-                }
+                TIMER_ANIM => tick_dock_anim(hwnd),
                 TIMER_STOPWATCH => {
                     let (_,running,_) = data::productivity::watch_summary();
                     if running {
@@ -3729,9 +3763,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let near = near_apps(hwnd, along(x, y));
             let was_near = NEAR_APPS.with(|c| c.replace(near));
             update_app_thumbnails(hwnd, x, y);
-            if hover_changed || near || was_near {
+            if hover_changed || (!near && was_near) || (!was_near && near) {
                 repaint_docks(Some(hwnd));
             }
+            sync_dock_anim_timer(near || was_near || hover_changed);
             LRESULT(0)
         }
         WM_NCHITTEST => {
@@ -3761,6 +3796,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             thumbnails::cancel_pending(hwnd);
             // Keep peeks if the pointer moved onto the peek host; poll handles leave.
             repaint();
+            sync_dock_anim_timer(true);
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {

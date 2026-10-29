@@ -524,7 +524,8 @@ fn draw_tile_vertical(r: &mut Renderer, t: &TileView, rc: RectF, hovered: bool) 
 /// Card background shared by every boxed tile: a Liquid Glass piece sampled from the bar's
 /// backdrop at the tile's own position. Hover glows brighter; geometry never changes.
 fn card_frame(r: &mut Renderer, rc: RectF, hovered: bool) -> Result<()> {
-    super::glass::draw_glass(r, rc, super::glass::GLASS_RADIUS, super::glass::Layer::Tile, hovered)
+    let lift = if hovered { super::anim::hover_lift() } else { 0.0 };
+    super::glass::draw_glass(r, rc, super::glass::GLASS_RADIUS, super::glass::Layer::Tile, hovered || lift > 0.01)
 }
 
 fn draw_bare(r: &mut Renderer, t: &TileView, rc: RectF) -> Result<()> {
