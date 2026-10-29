@@ -4,6 +4,9 @@
 use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::sync::Once;
+use std::time::Instant;
+
+use super::anim::{self, SurfaceFrame, SURFACE_SECS};
 
 use windows::core::{w, Result};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -76,6 +79,67 @@ thread_local! {
     static WHEEL: Cell<Option<fn(f32, f32, f32)>> = const { Cell::new(None) };
     static CENTERED: Cell<bool> = const { Cell::new(false) };
     static HIGH: Cell<u16> = const { Cell::new(0) };
+    static VIS: Cell<Option<VisAnim>> = const { Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+enum VisAnim {
+    In(Instant),
+    Out(Instant),
+}
+
+/// Current open/close presentation (opacity, scale, slide).
+pub fn presentation() -> SurfaceFrame {
+    VIS.with(|v| match v.get() {
+        Some(VisAnim::In(t)) => anim::surface_in(t.elapsed().as_secs_f32()),
+        Some(VisAnim::Out(t)) => anim::surface_out(t.elapsed().as_secs_f32()),
+        None => SurfaceFrame::REST,
+    })
+}
+
+pub fn vis_animating() -> bool {
+    VIS.with(|v| match v.get() {
+        Some(VisAnim::In(t)) => anim::surface_in_running(t.elapsed().as_secs_f32()),
+        Some(VisAnim::Out(t)) => anim::surface_out_running(t.elapsed().as_secs_f32()),
+        None => false,
+    })
+}
+
+/// Applies layered alpha and finishes a close animation. Returns true while frames are still needed.
+pub fn tick_vis() -> bool {
+    let Some(hwnd) = POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|pw| pw.hwnd))) else {
+        VIS.with(|v| v.set(None));
+        return false;
+    };
+    if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd) }.as_bool() {
+        VIS.with(|v| v.set(None));
+        return false;
+    }
+    let frame = presentation();
+    let alpha = (frame.opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+    super::renderer::set_window_alpha(hwnd, alpha);
+    if alpha == 255 {
+        super::renderer::clear_window_layered(hwnd);
+    }
+    invalidate();
+    if let Some(VisAnim::Out(t)) = VIS.with(Cell::get) {
+        if t.elapsed().as_secs_f32() >= SURFACE_SECS {
+            VIS.with(|v| v.set(None));
+            hide_immediate();
+            return false;
+        }
+    }
+    if let Some(VisAnim::In(t)) = VIS.with(Cell::get) {
+        if t.elapsed().as_secs_f32() >= SURFACE_SECS {
+            VIS.with(|v| v.set(None));
+        }
+    }
+    vis_animating()
+}
+
+fn begin_vis_in() {
+    VIS.with(|v| v.set(Some(VisAnim::In(Instant::now()))));
+    super::arm_frame_timer();
 }
 
 /// Phase of a captured drag inside the popup (sliders).
@@ -270,6 +334,7 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
                 let _ = windows::Win32::Graphics::Dwm::DwmFlush();
             }
         }
+        VIS.with(|v| v.set(None));
         pw.renderer.release();
         if let Some(bg) = pw.backdrop.take() { super::glass::release_backdrop(&bg); }
         pw.backdrop = super::glass::popup_backdrop_for(rect, monitor, dpi, true);
@@ -290,6 +355,9 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
             let _ = ShowWindow(pw.hwnd, SW_SHOWNOACTIVATE);
             SetTimer(pw.hwnd, TIMER_ID, POLL_MS, None);
         }
+        begin_vis_in();
+        super::renderer::set_window_alpha(pw.hwnd, 0);
+        let _ = InvalidateRect(pw.hwnd, None, false);
         true
     });
     if reused {
@@ -331,6 +399,9 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         SetTimer(hwnd, TIMER_ID, POLL_MS, None);
     }
+    begin_vis_in();
+    super::renderer::set_window_alpha(hwnd, 0);
+    let _ = unsafe { InvalidateRect(hwnd, None, false) };
     Ok(())
 }
 
@@ -433,6 +504,21 @@ pub fn invalidate() {
 
 /// Keep the HWND for reuse; release its surface, GPU bitmaps and CPU backdrop on hide.
 pub fn hide() {
+    if vis_animating() {
+        if VIS.with(|v| matches!(v.get(), Some(VisAnim::Out(_)))) {
+            return;
+        }
+    }
+    if POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref()).is_some()) {
+        VIS.with(|v| v.set(Some(VisAnim::Out(Instant::now()))));
+        super::arm_frame_timer();
+        invalidate();
+        return;
+    }
+    hide_immediate();
+}
+
+fn hide_immediate() {
     if DRAGGING.with(Cell::get) {
         // SAFETY: drops our own capture; WM_CAPTURECHANGED finishes the drag.
         unsafe {
@@ -445,10 +531,12 @@ pub fn hide() {
                 let _ = KillTimer(pw.hwnd, TIMER_ID);
                 let _ = ShowWindow(pw.hwnd, SW_HIDE);
             }
+            super::renderer::clear_window_layered(pw.hwnd);
             pw.renderer.release();
             if let Some(bg) = pw.backdrop.take() { super::glass::release_backdrop(&bg); }
         }
     });
+    VIS.with(|v| v.set(None));
     if let Some(f) = ON_HIDE.with(Cell::get) {
         f();
     }
@@ -637,8 +725,11 @@ fn paint() {
             if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(pw.hwnd) }.as_bool() { return; }
             let (w, h) = pw.renderer.size();
             let rect = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
+            let frame = presentation();
+            let slide_y = (1.0 - frame.slide) * 8.0;
             let backdrop = pw.backdrop.clone();
             let res = pw.renderer.begin().and_then(|_| {
+                pw.renderer.set_present_transform(w / 2.0, h / 2.0, frame.scale, slide_y)?;
                 // Apple-style continuous-looking corners: the window is fully transparent and the
                 // panel is drawn (anti-aliased) with its own radius.
                 let radius = if super::glass::panel_light() { 24.0 } else { 18.0 };
@@ -660,6 +751,7 @@ fn paint() {
                 };
                 super::glass::set_backdrop(None, w, h);
                 res?;
+                pw.renderer.reset_transform()?;
                 pw.renderer.end()
             });
             if let Err(e) = res {
@@ -739,6 +831,9 @@ mod memory_tests {
             floating_modules: false,
         }));
         hide();
+        while vis_animating() {
+            tick_vis();
+        }
         paint();
         POPUP.with(|p| {
             let p = p.borrow();

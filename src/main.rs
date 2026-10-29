@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Local};
 use windows::core::{w, PCWSTR};
@@ -45,7 +45,7 @@ use ui::liquid::{self, LiquidBitmap};
 use ui::popup;
 use ui::trayview;
 use ui::popup_content::{self, MediaAction as PopupMedia, PopupKind};
-use ui::renderer::Renderer;
+use ui::renderer::{self, Renderer};
 use ui::svgpath;
 use ui::thumbnails;
 use ui::tiles::{self, DataState};
@@ -734,6 +734,7 @@ fn build_secondary_docks(
                 SWP_NOACTIVATE | SWP_HIDEWINDOW,
             );
         }
+        note_dock_rest(hwnd, rect.left, rect.top);
         ui::renderer::apply_dock_no_chrome(hwnd);
         let renderer = Renderer::new(hwnd, pixel_w, window_h, dpi_value);
         log(&format!(
@@ -967,6 +968,7 @@ fn run() -> windows::core::Result<()> {
         SetTimer(hwnd, TIMER_GUARD, 500, None);
         let _ = RegisterHotKey(hwnd, HOTKEY_TOGGLE, MOD_CONTROL | MOD_ALT, b'D' as u32);
     }
+    ui::set_frame_timer_hook(Some(|| sync_dock_anim_timer(true)));
     repaint();
 
     log("message loop");
@@ -1562,9 +1564,151 @@ fn repaint_docks(only: Option<HWND>) {
     });
 }
 
-/// True while magnification, active pill, hover lift, or icon entrance still needs frames.
+/// True while magnification, active pill, hover lift, popup/dock surface, or icon entrance still needs frames.
 fn dock_anim_running() -> bool {
-    ui::apps::dock_anim_running() || ui::anim::hover_animating()
+    ui::apps::dock_anim_running()
+        || ui::anim::hover_animating()
+        || popup::vis_animating()
+        || dock_surface_animating()
+}
+
+#[derive(Clone, Copy)]
+enum DockSurfacePhase {
+    Show(Instant),
+    Hide(Instant),
+}
+
+thread_local! {
+    static DOCK_REST: RefCell<HashMap<isize, (i32, i32)>> = const { RefCell::new(HashMap::new()) };
+    static DOCK_SURFACE: RefCell<HashMap<isize, DockSurfacePhase>> = const { RefCell::new(HashMap::new()) };
+}
+
+fn note_dock_rest(hwnd: HWND, x: i32, y: i32) {
+    DOCK_REST.with(|m| {
+        m.borrow_mut().insert(hwnd.0 as isize, (x, y));
+    });
+}
+
+fn dock_surface_animating() -> bool {
+    DOCK_SURFACE.with(|m| !m.borrow().is_empty())
+}
+
+fn clear_dock_surface_all() {
+    DOCK_SURFACE.with(|m| m.borrow_mut().clear());
+}
+
+fn request_dock_show(hwnd: HWND) {
+    // SAFETY: our own dock window.
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    renderer::set_window_alpha(hwnd, 0);
+    DOCK_SURFACE.with(|m| {
+        m.borrow_mut().insert(hwnd.0 as isize, DockSurfacePhase::Show(Instant::now()));
+    });
+    sync_dock_anim_timer(true);
+}
+
+fn request_dock_hide(hwnd: HWND) {
+    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return;
+    }
+    DOCK_SURFACE.with(|m| {
+        m.borrow_mut().insert(hwnd.0 as isize, DockSurfacePhase::Hide(Instant::now()));
+    });
+    sync_dock_anim_timer(true);
+}
+
+fn dock_hide_immediate(hwnd: HWND) {
+    DOCK_SURFACE.with(|m| {
+        m.borrow_mut().remove(&(hwnd.0 as isize));
+    });
+    renderer::clear_window_layered(hwnd);
+    // SAFETY: our own dock window.
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+fn tick_dock_surface() {
+    let edge = dock_edge();
+    let keys: Vec<isize> = DOCK_SURFACE.with(|m| m.borrow().keys().copied().collect());
+    for key in keys {
+        let hwnd = HWND(key as _);
+        let phase = DOCK_SURFACE.with(|m| m.borrow().get(&key).copied());
+        let Some(phase) = phase else { continue };
+        let rest = DOCK_REST.with(|m| m.borrow().get(&key).copied()).unwrap_or((0, 0));
+        let elapsed = match phase {
+            DockSurfacePhase::Show(t) | DockSurfacePhase::Hide(t) => t.elapsed().as_secs_f32(),
+        };
+        let frame = match phase {
+            DockSurfacePhase::Show(_) => ui::anim::surface_in(elapsed),
+            DockSurfacePhase::Hide(_) => ui::anim::surface_out(elapsed),
+        };
+        let (dx, dy) = ui::anim::dock_slide_offset(edge, frame.slide);
+        let dpi_value = dpi::window_dpi(hwnd);
+        let ox = dpi::dip_to_px(dx, dpi_value);
+        let oy = dpi::dip_to_px(dy, dpi_value);
+        // SAFETY: our own dock window; position only.
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                rest.0 + ox,
+                rest.1 + oy,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+        let alpha = (frame.opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+        renderer::set_window_alpha(hwnd, alpha);
+        let done = match phase {
+            DockSurfacePhase::Show(_) => !ui::anim::surface_in_running(elapsed),
+            DockSurfacePhase::Hide(_) => !ui::anim::surface_out_running(elapsed),
+        };
+        if done {
+            match phase {
+                DockSurfacePhase::Show(_) => {
+                    // SAFETY: snap back to the AppBar rest position.
+                    unsafe {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            rest.0,
+                            rest.1,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
+                    }
+                    renderer::clear_window_layered(hwnd);
+                    DOCK_SURFACE.with(|m| {
+                        m.borrow_mut().remove(&key);
+                    });
+                }
+                DockSurfacePhase::Hide(_) => dock_hide_immediate(hwnd),
+            }
+        }
+    }
+}
+
+fn apply_dock_visibility(app: &App) {
+    if app.docks_released {
+        return;
+    }
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+    for hwnd in std::iter::once(app.hwnd).chain(app.secondaries.iter().map(|s| s.hwnd)) {
+        // SAFETY: our own dock windows.
+        let on = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST).0 as isize };
+        let want = app.dock_visible && !app.fs_hidden.contains(&on);
+        let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+        if want && !visible {
+            request_dock_show(hwnd);
+        } else if !want && visible {
+            request_dock_hide(hwnd);
+        }
+    }
 }
 
 fn primary_hwnd() -> Option<HWND> {
@@ -1585,6 +1729,8 @@ fn tick_dock_anim(hwnd: HWND) {
     let dt = ui::anim::FRAME_DT;
     let hover = ui::anim::tick_hover(dt);
     let mag = ui::apps::advance_anim(dt);
+    tick_dock_surface();
+    let _popup = popup::tick_vis();
     if hover || mag || dock_anim_running() {
         repaint();
     }
@@ -3174,6 +3320,7 @@ fn attach_primary(app: &mut App) -> Option<RECT> {
     unsafe {
         let _ = SetWindowPos(app.hwnd, HWND_TOPMOST, rect.left, rect.top, pixel_w, window_h, SWP_NOACTIVATE);
     }
+    note_dock_rest(app.hwnd, rect.left, rect.top);
     app.origin = (rect.left as f32, rect.top as f32);
     app.dpi = dpi_value;
     app.width = dock_length_dip(edge, rect, dpi_value);
@@ -3194,6 +3341,7 @@ fn attach_secondary(sec: &SecondaryDock) {
     unsafe {
         let _ = SetWindowPos(sec.hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     }
+    note_dock_rest(sec.hwnd, x, y);
 }
 
 /// Puts the docks away (`released`: windows hidden, AppBars removed) or brings them back.
@@ -3204,11 +3352,12 @@ fn set_docks_released(app: &mut App, released: bool) {
     app.docks_released = released;
     appbar::set_dock_released(released);
     if released {
+        clear_dock_surface_all();
         // SAFETY: our own dock windows.
         unsafe {
-            let _ = ShowWindow(app.hwnd, SW_HIDE);
-            for sec in &app.secondaries {
-                let _ = ShowWindow(sec.hwnd, SW_HIDE);
+            for hwnd in std::iter::once(app.hwnd).chain(app.secondaries.iter().map(|s| s.hwnd)) {
+                renderer::clear_window_layered(hwnd);
+                let _ = ShowWindow(hwnd, SW_HIDE);
             }
         }
         appbar::unregister_appbar(app.hwnd);
@@ -3227,13 +3376,7 @@ fn set_docks_released(app: &mut App, released: bool) {
     if app.dock_visible {
         let hidden = app.shared.settings.lock().unwrap().taskbar_mode == "hidden";
         appbar::hide_taskbar(hidden);
-        // SAFETY: our own dock windows.
-        unsafe {
-            let _ = ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
-            for sec in &app.secondaries {
-                let _ = ShowWindow(sec.hwnd, SW_SHOWNOACTIVATE);
-            }
-        }
+        apply_dock_visibility(app);
     }
     LAST_RESTORE.with(|c| c.set(Some(std::time::Instant::now())));
     if app.topology_stale {
@@ -3247,21 +3390,11 @@ fn set_docks_released(app: &mut App, released: bool) {
     log("docks restored: AppBars registered, shown");
 }
 
-/// Hides the dock on the monitor a fullscreen window covers and shows the others.
 fn apply_fullscreen_hiding(app: &App) {
     if app.docks_released {
         return;
     }
-    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
-    for hwnd in std::iter::once(app.hwnd).chain(app.secondaries.iter().map(|s| s.hwnd)) {
-        // SAFETY: our own dock windows.
-        unsafe {
-            let on = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST).0 as isize;
-            let hide = app.fs_hidden.contains(&on) || !app.dock_visible;
-            log(&format!("fullscreen: dock {:?} on monitor {on:#x} hide={hide} (fullscreen monitors {:x?})", hwnd.0, app.fs_hidden));
-            let _ = ShowWindow(hwnd, if hide { SW_HIDE } else { SW_SHOWNOACTIVATE });
-        }
-    }
+    apply_dock_visibility(app);
 }
 
 /// Runs every tick (500 ms). Tracks this PC being remoted into and a fullscreen RDP client in
@@ -3637,18 +3770,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     if app.dock_visible {
                         let hidden = app.shared.settings.lock().unwrap().taskbar_mode == "hidden";
                         appbar::hide_taskbar(hidden);
-                        // While released, the docks stay hidden; they show when the release ends.
                         if !app.docks_released {
-                            let _ = ShowWindow(app.hwnd, SW_SHOWNOACTIVATE);
-                            for sec in &app.secondaries {
-                                let _ = ShowWindow(sec.hwnd, SW_SHOWNOACTIVATE);
-                            }
+                            apply_dock_visibility(app);
                         }
                     } else {
-                        let _ = ShowWindow(app.hwnd, SW_HIDE);
-                        for sec in &app.secondaries {
-                            let _ = ShowWindow(sec.hwnd, SW_HIDE);
-                        }
+                        apply_dock_visibility(app);
                         appbar::restore_taskbar();
                     }
                 }

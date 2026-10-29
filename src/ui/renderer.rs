@@ -464,6 +464,33 @@ impl Renderer {
         Ok(())
     }
 
+    /// Scale around (`cx`, `cy`) for open/close presentation. Call `reset_transform` after the frame.
+    pub fn set_present_transform(&mut self, cx: f32, cy: f32, scale: f32, slide_y: f32) -> Result<()> {
+        use windows::Win32::Graphics::Direct2D::Common::D2D1_MATRIX_3X2_F;
+        let (rt, _) = self.parts()?;
+        let s = scale.max(0.01);
+        let m = D2D1_MATRIX_3X2_F {
+            m11: s,
+            m12: 0.0,
+            m21: 0.0,
+            m22: s,
+            m31: cx * (1.0 - s),
+            m32: cy * (1.0 - s) + slide_y,
+        };
+        // SAFETY: `m` lives for the call.
+        unsafe { rt.SetTransform(&m) };
+        Ok(())
+    }
+
+    pub fn reset_transform(&mut self) -> Result<()> {
+        use windows::Win32::Graphics::Direct2D::Common::D2D1_MATRIX_3X2_F;
+        let (rt, _) = self.parts()?;
+        let m = D2D1_MATRIX_3X2_F { m11: 1.0, m22: 1.0, ..Default::default() };
+        // SAFETY: identity matrix for the call.
+        unsafe { rt.SetTransform(&m) };
+        Ok(())
+    }
+
     pub fn fill_rect(&mut self, rect: RectF, rgba: u32) -> Result<()> {
         let (rt, brush) = self.parts()?;
         Self::set_fill_color(brush, rgba);
@@ -864,6 +891,34 @@ pub fn apply_dock_no_chrome(hwnd: HWND) {
 
 pub fn dwm_transparent() -> bool {
     DWM_TRANSPARENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whole-window alpha via `WS_EX_LAYERED` / `LWA_ALPHA` (UI thread only).
+pub fn set_window_alpha(hwnd: HWND, alpha: u8) {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA, WS_EX_LAYERED,
+    };
+    // SAFETY: our own HWND; style and alpha are standard layered-window calls.
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ex & WS_EX_LAYERED.0 as isize == 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as isize);
+        }
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+    }
+}
+
+/// Removes layered style once the window is fully opaque again.
+pub fn clear_window_layered(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, SetWindowLongPtrW, GWL_EXSTYLE, WS_EX_LAYERED};
+    // SAFETY: our own HWND.
+    unsafe {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ex & WS_EX_LAYERED.0 as isize != 0 {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex & !(WS_EX_LAYERED.0 as isize));
+        }
+    }
 }
 
 /// Asks the Windows 11 compositor for anti-aliased rounded corners.

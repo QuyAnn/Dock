@@ -51,6 +51,53 @@ pub fn running(elapsed: f32, duration: f32) -> bool {
     elapsed < duration
 }
 
+/// Duration of popup open/close and dock show/hide surface motion.
+pub const SURFACE_SECS: f32 = 0.22;
+/// Dock slides this many DIPs along the screen-edge axis while fading.
+pub const DOCK_SLIDE_DIP: f32 = 14.0;
+
+/// Opacity, content scale, and slide progress (0 = offset, 1 = rest) for a floating surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceFrame {
+    pub opacity: f32,
+    pub scale: f32,
+    pub slide: f32,
+}
+
+impl SurfaceFrame {
+    pub const REST: Self = Self { opacity: 1.0, scale: 1.0, slide: 1.0 };
+}
+
+pub fn surface_in(elapsed: f32) -> SurfaceFrame {
+    let t = ease_out_cubic((elapsed / SURFACE_SECS).min(1.0));
+    SurfaceFrame { opacity: t, scale: 0.94 + 0.06 * t, slide: t }
+}
+
+pub fn surface_out(elapsed: f32) -> SurfaceFrame {
+    let t = ease_out_cubic((elapsed / SURFACE_SECS).min(1.0));
+    SurfaceFrame { opacity: 1.0 - t, scale: 1.0 - 0.06 * t, slide: 1.0 - t }
+}
+
+pub fn surface_in_running(elapsed: f32) -> bool {
+    running(elapsed, SURFACE_SECS)
+}
+
+pub fn surface_out_running(elapsed: f32) -> bool {
+    running(elapsed, SURFACE_SECS)
+}
+
+/// Slide offset in DIPs from the dock's rest position (positive `slide` = at rest).
+pub fn dock_slide_offset(edge: crate::win::edge::AbEdge, slide: f32) -> (f32, f32) {
+    use crate::win::edge::AbEdge;
+    let d = DOCK_SLIDE_DIP * (1.0 - slide.clamp(0.0, 1.0));
+    match edge {
+        AbEdge::Bottom => (0.0, d),
+        AbEdge::Top => (0.0, -d),
+        AbEdge::Left => (d, 0.0),
+        AbEdge::Right => (-d, 0.0),
+    }
+}
+
 /// Limited attention bounce (scale offset), zero after `duration`.
 pub fn attn_bounce(elapsed: f32, duration: f32) -> f32 {
     if elapsed >= duration {
@@ -170,6 +217,33 @@ mod tests {
     fn anim_running_window() {
         assert!(running(0.1, 0.18));
         assert!(!running(0.2, 0.18));
+    }
+
+    #[test]
+    fn anim_popup_open_progress_endpoints() {
+        let start = surface_in(0.0);
+        assert!(start.opacity < 0.05);
+        assert!(start.scale < 0.95);
+        let end = surface_in(SURFACE_SECS);
+        assert!(nearly_equal(end.opacity, 1.0));
+        assert!(nearly_equal(end.scale, 1.0));
+        assert!(nearly_equal(end.slide, 1.0));
+    }
+
+    #[test]
+    fn anim_popup_close_progress_fades_out() {
+        let end = surface_out(SURFACE_SECS);
+        assert!(nearly_equal(end.opacity, 0.0));
+        assert!(nearly_equal(end.slide, 0.0));
+    }
+
+    #[test]
+    fn anim_dock_slide_zero_at_rest() {
+        use crate::win::edge::AbEdge;
+        for edge in [AbEdge::Bottom, AbEdge::Top, AbEdge::Left, AbEdge::Right] {
+            let (x, y) = dock_slide_offset(edge, 1.0);
+            assert!(nearly_equal(x, 0.0) && nearly_equal(y, 0.0));
+        }
     }
 
     #[test]

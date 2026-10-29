@@ -1,4 +1,21 @@
 //! Direct2D/DirectComposition rendering. Owns no Win32 state logic.
+use std::cell::Cell;
+
+thread_local! {
+    static FRAME_TIMER: Cell<Option<fn()>> = const { Cell::new(None) };
+}
+
+/// Main registers this so popup/dock surface code can arm the shared ~60 Hz UI timer.
+pub fn set_frame_timer_hook(f: Option<fn()>) {
+    FRAME_TIMER.with(|c| c.set(f));
+}
+
+pub fn arm_frame_timer() {
+    if let Some(f) = FRAME_TIMER.with(Cell::get) {
+        f();
+    }
+}
+
 pub mod renderer; // D2D device, acrylic/blur, rounded rect, text (DirectWrite)
 pub mod dock;     // dock layout: tiles, pill/full width, hit testing
 pub mod popup;    // popup window per tile, created on open, destroyed on close

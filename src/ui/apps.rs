@@ -180,7 +180,7 @@ const MAG_MAX: f32 = 0.05;
 thread_local! {
     /// Pointer x in dock-local DIPs (same space as the tile rects), None when not over the dock.
     static POINTER: Cell<Option<f32>> = const { Cell::new(None) };
-    static MAG: std::cell::RefCell<MagState> = const { std::cell::RefCell::new(MagState::new()) };
+    static MAG: std::cell::RefCell<MagState> = std::cell::RefCell::new(MagState { centers: Vec::new(), scales: Vec::new() });
     static POP_SINCE: std::cell::RefCell<HashMap<isize, Instant>> = const { std::cell::RefCell::new(HashMap::new()) };
     static ATTN_SINCE: std::cell::RefCell<HashMap<isize, Instant>> = const { std::cell::RefCell::new(HashMap::new()) };
     static SEEN_HWNDS: std::cell::RefCell<HashSet<isize>> = const { std::cell::RefCell::new(HashSet::new()) };
@@ -191,11 +191,13 @@ struct MagState {
     scales: Vec<f32>,
 }
 
-impl MagState {
-    const fn new() -> Self {
+impl Default for MagState {
+    fn default() -> Self {
         Self { centers: Vec::new(), scales: Vec::new() }
     }
+}
 
+impl MagState {
     fn resize(&mut self, n: usize) {
         if self.scales.len() != n {
             self.scales.resize(n, 1.0);
@@ -228,9 +230,11 @@ pub fn advance_anim(dt: f32) -> bool {
         if s.centers.is_empty() {
             return false;
         }
+        let n = s.centers.len();
         let mut moving = false;
-        for (i, cx) in s.centers.iter().enumerate() {
-            let target = magnify_target(*cx, ptr, MAG_RANGE, MAG_MAX);
+        for i in 0..n {
+            let cx = s.centers[i];
+            let target = magnify_target(cx, ptr, MAG_RANGE, MAG_MAX);
             let next = anim::approach(s.scales[i], target, dt, MAG_TAU);
             if !nearly_equal(next, target) {
                 moving = true;
@@ -284,20 +288,26 @@ fn attn_extra(w: &WindowEntry) -> f32 {
 }
 
 fn track_new_windows(windows: &[WindowEntry]) {
-    let mut seen = SEEN_HWNDS.borrow_mut();
-    let mut pop = POP_SINCE.borrow_mut();
-    for w in windows {
-        if w.hwnd == 0 {
-            continue;
-        }
-        if !seen.contains(&w.hwnd) {
-            pop.insert(w.hwnd, Instant::now());
-            seen.insert(w.hwnd);
-        }
-    }
-    seen.retain(|h| windows.iter().any(|w| w.hwnd == *h));
-    pop.retain(|h, _| seen.contains(h));
-    ATTN_SINCE.borrow_mut().retain(|h, _| seen.contains(h));
+    SEEN_HWNDS.with(|seen_cell| {
+        POP_SINCE.with(|pop_cell| {
+            ATTN_SINCE.with(|attn_cell| {
+                let mut seen = seen_cell.borrow_mut();
+                let mut pop = pop_cell.borrow_mut();
+                for w in windows {
+                    if w.hwnd == 0 {
+                        continue;
+                    }
+                    if !seen.contains(&w.hwnd) {
+                        pop.insert(w.hwnd, Instant::now());
+                        seen.insert(w.hwnd);
+                    }
+                }
+                seen.retain(|h| windows.iter().any(|w| w.hwnd == *h));
+                pop.retain(|h, _| seen.contains(h));
+                attn_cell.borrow_mut().retain(|h, _| seen.contains(h));
+            });
+        });
+    });
 }
 
 /// True while any apps-tile animation still needs ~60 Hz repaints.
@@ -387,7 +397,7 @@ impl AppsState {
             let was = w.attention;
             w.attention = attention.contains(w.hwnd);
             if w.attention && !was && w.hwnd != 0 {
-                ATTN_SINCE.borrow_mut().insert(w.hwnd, Instant::now());
+                ATTN_SINCE.with(|m| m.borrow_mut().insert(w.hwnd, Instant::now()));
             }
         }
         track_new_windows(&self.windows);
@@ -780,7 +790,7 @@ fn badge_of(w: &WindowEntry) -> Option<Badge> {
 
 /// Badge geometry is relative to .ico (top -3 px, right -5 px for counts; top -1, right -2 for dots).
 /// It scales with the icon, so every offset and size is multiplied by `k`.
-fn draw_badge(r: &mut Renderer, ico: RectF, badge: Badge, t: f32, w: &WindowEntry) -> Result<()> {
+fn draw_badge(r: &mut Renderer, ico: RectF, badge: Badge, _t: f32, w: &WindowEntry) -> Result<()> {
     let k = ico.w / ICON;
     let right = ico.x + ico.w;
     match badge {
