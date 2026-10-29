@@ -234,7 +234,8 @@ fn set_open(which: Option<OpenPopup>) {
 /// Click resolved on the UI thread; side effects run after the APP borrow is released.
 enum Click {
     None,
-    Activate(isize),
+    /// One or more hwnds of the same app (taskbar-style group toggle).
+    Activate(Vec<isize>),
     /// Pinned app with no open window.
     Launch(String),
     Start,
@@ -735,6 +736,7 @@ fn build_secondary_docks(
             );
         }
         ui::renderer::apply_dock_no_chrome(hwnd);
+        win::filedrop::enable(hwnd);
         let renderer = Renderer::new(hwnd, pixel_w, window_h, dpi_value);
         log(&format!(
             "secondary dock on monitor ({},{}..{},{}) hwnd={:?} (hidden until painted)",
@@ -856,6 +858,8 @@ fn run() -> windows::core::Result<()> {
     }
     // No acrylic and no rounding/border: the bar is invisible, only the tiles are drawn.
     ui::renderer::apply_dock_no_chrome(hwnd);
+    // Explorer may drop files onto the Recycle Bin tile at the end of the centre cluster.
+    win::filedrop::enable(hwnd);
 
     let shell_msg = tasks::register_shell_hook(hwnd);
     SHELL_MSG.with(|m| m.set(shell_msg));
@@ -1991,14 +1995,34 @@ fn dock_click_on(hwnd: HWND, x: f32, y: f32) -> Click {
                 // Closed since the last refresh: the entry still holds a dead handle, so a pinned app
                 // relaunches (as its launcher would) and an unpinned one just waits for the refresh.
                 // SAFETY: IsWindow on a possibly stale handle just returns false.
-                Some(w) if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(w.hwnd as _)) }.as_bool() => {
+                Some(w)
+                    if !unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(w.hwnd as _))
+                    }
+                    .as_bool() =>
+                {
                     if app.apps.pins.iter().any(|(exe, _)| exe.eq_ignore_ascii_case(&w.exe)) {
                         Click::Launch(w.exe.clone())
                     } else {
                         Click::None
                     }
                 }
-                Some(w) => Click::Activate(w.hwnd),
+                Some(w) => {
+                    let hwnds: Vec<isize> = apps::group_windows(&app.apps, w)
+                        .into_iter()
+                        .map(|e| e.hwnd)
+                        .filter(|&h| h != 0)
+                        // Drop members that closed between refresh and click.
+                        .filter(|&h| unsafe {
+                            windows::Win32::UI::WindowsAndMessaging::IsWindow(HWND(h as _)).as_bool()
+                        })
+                        .collect();
+                    if hwnds.is_empty() {
+                        Click::None
+                    } else {
+                        Click::Activate(hwnds)
+                    }
+                }
                 None => Click::None,
             },
             "start" => Click::Start,
@@ -3473,6 +3497,48 @@ fn client_point(lparam: LPARAM) -> (f32, f32) {
     (dpi::px_to_dip(x, dpi_value), dpi::px_to_dip(y, dpi_value))
 }
 
+/// Explorer dropped files on a dock HWND: only the Recycle Bin tile accepts them.
+fn handle_file_drop(hwnd: HWND, wparam: usize) {
+    let (pt, paths) = win::filedrop::take_from_wparam(wparam);
+    if paths.is_empty() {
+        return;
+    }
+    let over_trash = APP.with(|a| {
+        let Ok(slot) = a.try_borrow() else { return false };
+        let Some(app) = slot.as_ref() else { return false };
+        let (tiles, dpi_value) = if app.hwnd == hwnd {
+            (&app.tiles, app.dpi)
+        } else if let Some(sec) = app.secondaries.iter().find(|s| s.hwnd == hwnd) {
+            (&sec.tiles, sec.dpi)
+        } else {
+            return false;
+        };
+        let x = dpi::px_to_dip(pt.x, dpi_value);
+        let y = dpi::px_to_dip(pt.y, dpi_value);
+        tiles.iter().any(|(id, r)| *id == "trash" && dock::hit_test(x, y, &[*r]).is_some())
+    });
+    if !over_trash {
+        log(&format!(
+            "filedrop: ignored {} path(s) (drop was not on the Recycle Bin icon)",
+            paths.len()
+        ));
+        return;
+    }
+    log(&format!("filedrop: sending {} path(s) to Recycle Bin", paths.len()));
+    let paint_hwnd = hwnd.0 as isize;
+    thread::spawn(move || {
+        match win::shellinfo::send_to_recycle_bin(&paths) {
+            Ok(n) => log(&format!("filedrop: {n} item(s) moved to Recycle Bin")),
+            Err(e) => log(&format!("filedrop: {e}")),
+        }
+        win::shellinfo::refresh();
+        // SAFETY: hwnd may be gone; InvalidateRect then just fails.
+        unsafe {
+            let _ = InvalidateRect(HWND(paint_hwnd as _), None, BOOL(0));
+        }
+    });
+}
+
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Returning TRUE from WM_NCCREATE tells Windows to continue creating the window. Letting
     // DefWindowProc answer it made CreateWindowExW fail for this window class.
@@ -3500,6 +3566,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         return LRESULT(0);
     }
     match msg {
+        m if win::filedrop::is_drop_message(m) => {
+            handle_file_drop(hwnd, wparam.0);
+            LRESULT(0)
+        }
         WM_TIMER => {
             match wparam.0 {
                 TIMER_REFRESH => {
@@ -3657,7 +3727,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let click = dock_click_on(hwnd, x, y);
             log(&format!("[{}] click at ({x},{y}) -> {}", chrono::Local::now().format("%H:%M:%S%.3f"), match &click {
                 Click::None => "none",
-                Click::Activate(_) => "activate",
+                Click::Activate(h) => if h.len() > 1 { "activate group" } else { "activate" },
                 Click::Launch(_) => "launch pinned",
                 Click::Start => "open Start",
                 Click::GrokBot => "grok bot",
@@ -3674,7 +3744,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             }
             match click {
                 Click::None => tasks::dismiss_start_if_open(),
-                Click::Activate(h) => tasks::activate_window(h),
+                Click::Activate(hwnds) => tasks::activate_app(&hwnds),
                 Click::Launch(exe) => tasks::launch_exe(&exe),
                 Click::Start => tasks::open_start_menu(),
                 Click::Search => tasks::open_search(),

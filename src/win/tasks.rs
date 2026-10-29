@@ -488,23 +488,49 @@ pub fn start_was_open_at_click() -> bool {
     CLICK_START_OPEN.load(Ordering::SeqCst)
 }
 
-/// Taskbar-style click: the app that was active at mouse-down (and not minimized) is
-/// minimized; anything else is restored + focused.
+/// Taskbar-style click for a single window.
 pub fn activate_window(hwnd: isize) {
-    let captured = CLICK_FG.swap(0, Ordering::SeqCst);
-    let fg = if captured != 0 { captured } else { effective_foreground() };
-    // SAFETY: IsIconic on a possibly stale handle just returns false.
-    let iconic = unsafe { IsIconic(HWND(hwnd as _)).as_bool() };
-    let active = fg == hwnd || owner_root(fg) == hwnd;
-    crate::log(&format!(
-        "toggle hwnd={hwnd:#x} fg_at_down={fg:#x} iconic={iconic} -> {}",
-        if active && !iconic { "minimize" } else { "focus" }
-    ));
-    if active && !iconic {
-        minimize_window(hwnd);
+    activate_app(&[hwnd]);
+}
+
+/// Taskbar-style click for a grouped app: if any member was foreground at mouse-down,
+/// minimize that member; otherwise focus the best candidate (last-used / non-minimized).
+pub fn activate_app(hwnds: &[isize]) {
+    let hwnds: Vec<isize> = hwnds.iter().copied().filter(|&h| h != 0).collect();
+    if hwnds.is_empty() {
         return;
     }
-    focus_window(hwnd);
+    let captured = CLICK_FG.swap(0, Ordering::SeqCst);
+    let fg = if captured != 0 { captured } else { effective_foreground() };
+    let fg_root = owner_root(fg);
+    // SAFETY: IsIconic on a possibly stale handle just returns false.
+    // Match the foreground window or its owner root against any group member.
+    let active_member = hwnds.iter().copied().find(|&h| {
+        let iconic = unsafe { IsIconic(HWND(h as _)).as_bool() };
+        !iconic && (fg == h || fg_root == h)
+    });
+    if let Some(h) = active_member {
+        crate::log(&format!(
+            "toggle app n={} hwnd={h:#x} fg_at_down={fg:#x} -> minimize",
+            hwnds.len()
+        ));
+        minimize_window(h);
+        return;
+    }
+    let last = last_foreign();
+    let target = hwnds
+        .iter()
+        .copied()
+        .find(|&h| h == last || owner_root(last) == h)
+        .or_else(|| {
+            hwnds.iter().copied().find(|&h| !unsafe { IsIconic(HWND(h as _)).as_bool() })
+        })
+        .unwrap_or(hwnds[0]);
+    crate::log(&format!(
+        "toggle app n={} hwnd={target:#x} fg_at_down={fg:#x} -> focus",
+        hwnds.len()
+    ));
+    focus_window(target);
 }
 
 /// Top-level owner of `hwnd` (dialogs / owned windows belong to their app window).
