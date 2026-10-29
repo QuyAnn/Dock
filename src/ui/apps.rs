@@ -169,10 +169,11 @@ const BADGE_RED: u32 = 0xFF3B_30FF; // #ff3b30
 const BADGE_SHADOW: u32 = 0x0000_0066; // box-shadow 0 1px 2px rgba(0,0,0,.4)
 const BADGE_H: f32 = 15.0;
 const BADGE_FONT: f32 = 9.5;
-const ATTN_BOUNCE_SECS: f32 = 1.4;
+const ATTN_BOUNCE_SECS: f32 = 0.45;
 const MAG_RANGE: f32 = 40.0; // magnify falloff distance, px
-const MAG_TAU: f32 = 0.07;
-const POP_IN_SECS: f32 = 0.35;
+const MAG_TAU_IN: f32 = 0.038;
+const MAG_TAU_OUT: f32 = 0.065;
+const POP_IN_SECS: f32 = 0.18;
 // Hover only lifts slightly (scales around the bottom centre, ~2 DIP taller at most) so the
 // icon never leaves the 48-DIP bar and nothing else moves.
 const MAG_MAX: f32 = 0.05;
@@ -235,7 +236,9 @@ pub fn advance_anim(dt: f32) -> bool {
         for i in 0..n {
             let cx = s.centers[i];
             let target = magnify_target(cx, ptr, MAG_RANGE, MAG_MAX);
-            let next = anim::approach(s.scales[i], target, dt, MAG_TAU);
+            let cur = s.scales[i];
+            let tau = if target > cur { MAG_TAU_IN } else { MAG_TAU_OUT };
+            let next = anim::approach(cur, target, dt, tau);
             if !nearly_equal(next, target) {
                 moving = true;
             }
@@ -268,7 +271,7 @@ fn pop_extra(w: &WindowEntry) -> f32 {
                 if e >= POP_IN_SECS {
                     0.0
                 } else {
-                    0.15 * (1.0 - ease_out_cubic(e / POP_IN_SECS))
+                    0.08 * (1.0 - ease_out_cubic(e / POP_IN_SECS))
                 }
             })
             .unwrap_or(0.0)
@@ -308,6 +311,11 @@ fn track_new_windows(windows: &[WindowEntry]) {
             });
         });
     });
+}
+
+/// True while pill, pop-in, or attention animations need every dock repainted.
+pub fn all_docks_animating() -> bool {
+    active_animating() || pop_running() || attn_running()
 }
 
 /// True while any apps-tile animation still needs ~60 Hz repaints.

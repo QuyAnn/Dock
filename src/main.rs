@@ -1564,23 +1564,17 @@ fn repaint_docks(only: Option<HWND>) {
     });
 }
 
-/// True while magnification, active pill, hover lift, popup/dock surface, or icon entrance still needs frames.
+/// True while magnification, active pill, hover lift, or popup fade still needs frames.
 fn dock_anim_running() -> bool {
     ui::apps::dock_anim_running()
         || ui::anim::hover_animating()
         || popup::vis_animating()
-        || dock_surface_animating()
-}
-
-#[derive(Clone, Copy)]
-enum DockSurfacePhase {
-    Show(Instant),
-    Hide(Instant),
 }
 
 thread_local! {
     static DOCK_REST: RefCell<HashMap<isize, (i32, i32)>> = RefCell::new(HashMap::new());
-    static DOCK_SURFACE: RefCell<HashMap<isize, DockSurfacePhase>> = RefCell::new(HashMap::new());
+    /// Dock HWND that last drove magnification (kept through settle after mouse leave).
+    static MAG_DOCK: Cell<Option<HWND>> = const { Cell::new(None) };
 }
 
 fn note_dock_rest(hwnd: HWND, x: i32, y: i32) {
@@ -1589,40 +1583,18 @@ fn note_dock_rest(hwnd: HWND, x: i32, y: i32) {
     });
 }
 
-fn dock_surface_animating() -> bool {
-    DOCK_SURFACE.with(|m| !m.borrow().is_empty())
-}
-
-fn clear_dock_surface_all() {
-    DOCK_SURFACE.with(|m| m.borrow_mut().clear());
-}
-
 fn request_dock_show(hwnd: HWND) {
+    renderer::clear_window_layered(hwnd);
     // SAFETY: our own dock window.
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
-    renderer::set_window_alpha(hwnd, 0);
-    DOCK_SURFACE.with(|m| {
-        m.borrow_mut().insert(hwnd.0 as isize, DockSurfacePhase::Show(Instant::now()));
-    });
-    sync_dock_anim_timer(true);
 }
 
 fn request_dock_hide(hwnd: HWND) {
     if !unsafe { IsWindowVisible(hwnd).as_bool() } {
         return;
     }
-    DOCK_SURFACE.with(|m| {
-        m.borrow_mut().insert(hwnd.0 as isize, DockSurfacePhase::Hide(Instant::now()));
-    });
-    sync_dock_anim_timer(true);
-}
-
-fn dock_hide_immediate(hwnd: HWND) {
-    DOCK_SURFACE.with(|m| {
-        m.borrow_mut().remove(&(hwnd.0 as isize));
-    });
     renderer::clear_window_layered(hwnd);
     // SAFETY: our own dock window.
     unsafe {
@@ -1630,67 +1602,68 @@ fn dock_hide_immediate(hwnd: HWND) {
     }
 }
 
-fn tick_dock_surface() {
-    let edge = dock_edge();
-    let keys: Vec<isize> = DOCK_SURFACE.with(|m| m.borrow().keys().copied().collect());
-    for key in keys {
-        let hwnd = HWND(key as _);
-        let phase = DOCK_SURFACE.with(|m| m.borrow().get(&key).copied());
-        let Some(phase) = phase else { continue };
-        let rest = DOCK_REST.with(|m| m.borrow().get(&key).copied()).unwrap_or((0, 0));
-        let elapsed = match phase {
-            DockSurfacePhase::Show(t) | DockSurfacePhase::Hide(t) => t.elapsed().as_secs_f32(),
-        };
-        let frame = match phase {
-            DockSurfacePhase::Show(_) => ui::anim::surface_in(elapsed),
-            DockSurfacePhase::Hide(_) => ui::anim::surface_out(elapsed),
-        };
-        let (dx, dy) = ui::anim::dock_slide_offset(edge, frame.slide);
-        let dpi_value = dpi::window_dpi(hwnd);
-        let ox = dpi::dip_to_px(dx, dpi_value);
-        let oy = dpi::dip_to_px(dy, dpi_value);
-        // SAFETY: our own dock window; position only.
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                rest.0 + ox,
-                rest.1 + oy,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOACTIVATE,
-            );
-        }
-        let alpha = (frame.opacity * 255.0).round().clamp(0.0, 255.0) as u8;
-        renderer::set_window_alpha(hwnd, alpha);
-        let done = match phase {
-            DockSurfacePhase::Show(_) => !ui::anim::surface_in_running(elapsed),
-            DockSurfacePhase::Hide(_) => !ui::anim::surface_out_running(elapsed),
-        };
-        if done {
-            match phase {
-                DockSurfacePhase::Show(_) => {
-                    // SAFETY: snap back to the AppBar rest position.
-                    unsafe {
-                        let _ = SetWindowPos(
-                            hwnd,
-                            HWND_TOPMOST,
-                            rest.0,
-                            rest.1,
-                            0,
-                            0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
-                        );
-                    }
-                    renderer::clear_window_layered(hwnd);
-                    DOCK_SURFACE.with(|m| {
-                        m.borrow_mut().remove(&key);
-                    });
-                }
-                DockSurfacePhase::Hide(_) => dock_hide_immediate(hwnd),
+fn invalidate_docks(only: Option<HWND>) {
+    APP.with(|a| {
+        let Ok(slot) = a.try_borrow() else { return };
+        let Some(app) = slot.as_ref() else { return };
+        if only.is_none_or(|h| h == app.hwnd) {
+            // SAFETY: our own dock window.
+            unsafe {
+                let _ = InvalidateRect(app.hwnd, None, false);
             }
         }
+        for sec in &app.secondaries {
+            if only.is_none_or(|h| h == sec.hwnd) {
+                // SAFETY: our own dock window.
+                unsafe {
+                    let _ = InvalidateRect(sec.hwnd, None, false);
+                }
+            }
+        }
+    });
+}
+
+/// Coalesced WM_PAINT for dock motion: avoid repainting every monitor when only one dock magnifies.
+fn invalidate_for_dock_anim(hover_moving: bool, mag_moving: bool) {
+    if ui::apps::all_docks_animating() {
+        invalidate_docks(None);
+        return;
     }
+    APP.with(|a| {
+        let Ok(slot) = a.try_borrow() else { return };
+        let Some(app) = slot.as_ref() else { return };
+        let mut any = false;
+        if hover_moving {
+            if app.hover.is_some() {
+                // SAFETY: our own dock window.
+                unsafe {
+                    let _ = InvalidateRect(app.hwnd, None, false);
+                }
+                any = true;
+            }
+            for sec in &app.secondaries {
+                if sec.hover.is_some() {
+                    // SAFETY: our own dock window.
+                    unsafe {
+                        let _ = InvalidateRect(sec.hwnd, None, false);
+                    }
+                    any = true;
+                }
+            }
+        }
+        if mag_moving {
+            if let Some(h) = MAG_DOCK.with(Cell::get) {
+                // SAFETY: our own dock window.
+                unsafe {
+                    let _ = InvalidateRect(h, None, false);
+                }
+                any = true;
+            }
+        }
+        if !any && (hover_moving || mag_moving) {
+            invalidate_docks(None);
+        }
+    });
 }
 
 fn apply_dock_visibility(app: &App) {
@@ -1718,6 +1691,7 @@ fn primary_hwnd() -> Option<HWND> {
 fn sync_dock_anim_timer(keep_alive: bool) {
     let Some(hwnd) = primary_hwnd() else { return };
     if keep_alive || dock_anim_running() {
+        ui::anim::reset_frame_clock();
         // SAFETY: our own primary dock window.
         unsafe {
             SetTimer(hwnd, TIMER_ANIM, 16, None);
@@ -1726,15 +1700,15 @@ fn sync_dock_anim_timer(keep_alive: bool) {
 }
 
 fn tick_dock_anim(hwnd: HWND) {
-    let dt = ui::anim::FRAME_DT;
+    let dt = ui::anim::tick_frame_dt();
     let hover = ui::anim::tick_hover(dt);
     let mag = ui::apps::advance_anim(dt);
-    tick_dock_surface();
     let _popup = popup::tick_vis();
-    if hover || mag || dock_anim_running() {
-        repaint();
+    if hover || mag || ui::apps::all_docks_animating() || ui::anim::hover_animating() {
+        invalidate_for_dock_anim(hover || ui::anim::hover_animating(), mag);
     }
     if !dock_anim_running() {
+        ui::anim::reset_frame_clock();
         // SAFETY: our own primary dock window.
         unsafe {
             let _ = KillTimer(hwnd, TIMER_ANIM);
@@ -3352,7 +3326,6 @@ fn set_docks_released(app: &mut App, released: bool) {
     app.docks_released = released;
     appbar::set_dock_released(released);
     if released {
-        clear_dock_surface_all();
         // SAFETY: our own dock windows.
         unsafe {
             for hwnd in std::iter::once(app.hwnd).chain(app.secondaries.iter().map(|s| s.hwnd)) {
@@ -3785,7 +3758,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             let mut ps = PAINTSTRUCT::default();
             // SAFETY: standard paint cycle for our own window.
             BeginPaint(hwnd, &mut ps);
-            repaint();
+            repaint_docks(Some(hwnd));
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
@@ -3887,6 +3860,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             apps::set_pointer(Some(along(x, y)));
             let hover_changed = set_hover_on(hwnd, Some((x, y)));
             let near = near_apps(hwnd, along(x, y));
+            if near {
+                MAG_DOCK.with(|c| c.set(Some(hwnd)));
+            }
             let was_near = NEAR_APPS.with(|c| c.replace(near));
             update_app_thumbnails(hwnd, x, y);
             if hover_changed || (!near && was_near) || (!was_near && near) {
@@ -3921,8 +3897,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             set_hover_on(hwnd, None);
             thumbnails::cancel_pending(hwnd);
             // Keep peeks if the pointer moved onto the peek host; poll handles leave.
-            repaint();
-            sync_dock_anim_timer(true);
+            invalidate_docks(Some(hwnd));
+            sync_dock_anim_timer(dock_anim_running());
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {

@@ -107,14 +107,14 @@ pub fn vis_animating() -> bool {
     })
 }
 
-/// Applies layered alpha, slide offset, and finishes a close animation.
+/// Applies layered alpha and finishes a close animation (no per-frame D2D repaint).
 pub fn tick_vis() -> bool {
-    let info = POPUP.with(|p| {
+    let hwnd = POPUP.with(|p| {
         p.try_borrow()
             .ok()
-            .and_then(|g| g.as_ref().map(|pw| (pw.hwnd, pw.rest, pw.renderer.dpi())))
+            .and_then(|g| g.as_ref().map(|pw| pw.hwnd))
     });
-    let Some((hwnd, rest, dpi_value)) = info else {
+    let Some(hwnd) = hwnd else {
         VIS.with(|v| v.set(None));
         return false;
     };
@@ -128,22 +128,6 @@ pub fn tick_vis() -> bool {
     if alpha == 255 {
         super::renderer::clear_window_layered(hwnd);
     }
-    let slide_px = dpi::dip_to_px((1.0 - frame.slide) * 8.0, dpi_value);
-    let w = rest.right - rest.left;
-    let h = rest.bottom - rest.top;
-    // SAFETY: our popup window; position/size only.
-    unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            rest.left,
-            rest.top + slide_px,
-            w,
-            h,
-            SWP_NOACTIVATE,
-        );
-    }
-    invalidate();
     if let Some(VisAnim::Out(t)) = VIS.with(Cell::get) {
         if t.elapsed().as_secs_f32() >= SURFACE_SECS {
             VIS.with(|v| v.set(None));

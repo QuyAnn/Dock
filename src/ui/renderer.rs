@@ -422,7 +422,12 @@ impl Renderer {
                 self.release();
                 Ok(())
             }
-            r => r,
+            r => {
+                r?;
+                // Let DWM pick up the frame before the next timer tick (reduces tearing/stutter).
+                let _ = unsafe { windows::Win32::Graphics::Dwm::DwmFlush() };
+                Ok(())
+            }
         }
     }
 

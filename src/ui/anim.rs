@@ -51,10 +51,8 @@ pub fn running(elapsed: f32, duration: f32) -> bool {
     elapsed < duration
 }
 
-/// Duration of popup open/close and dock show/hide surface motion.
-pub const SURFACE_SECS: f32 = 0.22;
-/// Dock slides this many DIPs along the screen-edge axis while fading.
-pub const DOCK_SLIDE_DIP: f32 = 14.0;
+/// Popup open/close fade (layered alpha only; no per-frame repaint).
+pub const SURFACE_SECS: f32 = 0.12;
 
 /// Opacity, content scale, and slide progress (0 = offset, 1 = rest) for a floating surface.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -70,12 +68,12 @@ impl SurfaceFrame {
 
 pub fn surface_in(elapsed: f32) -> SurfaceFrame {
     let t = ease_out_cubic((elapsed / SURFACE_SECS).min(1.0));
-    SurfaceFrame { opacity: t, scale: 0.94 + 0.06 * t, slide: t }
+    SurfaceFrame { opacity: t, scale: 1.0, slide: 1.0 }
 }
 
 pub fn surface_out(elapsed: f32) -> SurfaceFrame {
     let t = ease_out_cubic((elapsed / SURFACE_SECS).min(1.0));
-    SurfaceFrame { opacity: 1.0 - t, scale: 1.0 - 0.06 * t, slide: 1.0 - t }
+    SurfaceFrame { opacity: 1.0 - t, scale: 1.0, slide: 1.0 }
 }
 
 pub fn surface_in_running(elapsed: f32) -> bool {
@@ -88,14 +86,8 @@ pub fn surface_out_running(elapsed: f32) -> bool {
 
 /// Slide offset in DIPs from the dock's rest position (positive `slide` = at rest).
 pub fn dock_slide_offset(edge: crate::win::edge::AbEdge, slide: f32) -> (f32, f32) {
-    use crate::win::edge::AbEdge;
-    let d = DOCK_SLIDE_DIP * (1.0 - slide.clamp(0.0, 1.0));
-    match edge {
-        AbEdge::Bottom => (0.0, d),
-        AbEdge::Top => (0.0, -d),
-        AbEdge::Left => (d, 0.0),
-        AbEdge::Right => (-d, 0.0),
-    }
+    let _ = (edge, slide);
+    (0.0, 0.0)
 }
 
 /// Limited attention bounce (scale offset), zero after `duration`.
@@ -105,7 +97,20 @@ pub fn attn_bounce(elapsed: f32, duration: f32) -> f32 {
     }
     let t = elapsed / duration;
     let env = (1.0 - t).max(0.0);
-    (2.0 * PI * 2.5 * t).sin() * env * 0.12
+    (2.0 * PI * 1.25 * t).sin() * env * 0.07
+}
+
+thread_local! {
+    static FRAME_CLOCK: std::cell::RefCell<FrameClock> = std::cell::RefCell::new(FrameClock::default());
+}
+
+/// Elapsed seconds since the last animation tick (monotonic clock, clamped). Call once per frame.
+pub fn tick_frame_dt() -> f32 {
+    FRAME_CLOCK.with(|c| c.borrow_mut().tick())
+}
+
+pub fn reset_frame_clock() {
+    FRAME_CLOCK.with(|c| *c.borrow_mut() = FrameClock::default());
 }
 
 /// Monotonic frame clock for tests and offscreen renders.
@@ -135,7 +140,7 @@ pub fn hover_animating() -> bool {
 
 pub fn tick_hover(dt: f32) -> bool {
     let target = if HOVER_TARGET.with(std::cell::Cell::get) { 1.0 } else { 0.0 };
-    let next = approach(HOVER_BLEND.with(std::cell::Cell::get), target, dt, 0.07);
+    let next = approach(HOVER_BLEND.with(std::cell::Cell::get), target, dt, 0.06);
     HOVER_BLEND.with(|c| c.set(next));
     !nearly_equal(next, target)
 }
@@ -209,8 +214,8 @@ mod tests {
 
     #[test]
     fn anim_attention_bounce_stops() {
-        assert!(nearly_equal(attn_bounce(2.0, 1.4), 0.0));
-        assert!(attn_bounce(0.1, 1.4).abs() > 0.0);
+        assert!(nearly_equal(attn_bounce(0.5, 0.45), 0.0));
+        assert!(attn_bounce(0.1, 0.45).abs() > 0.0);
     }
 
     #[test]
@@ -223,7 +228,7 @@ mod tests {
     fn anim_popup_open_progress_endpoints() {
         let start = surface_in(0.0);
         assert!(start.opacity < 0.05);
-        assert!(start.scale < 0.95);
+        assert!(nearly_equal(start.scale, 1.0));
         let end = surface_in(SURFACE_SECS);
         assert!(nearly_equal(end.opacity, 1.0));
         assert!(nearly_equal(end.scale, 1.0));
@@ -234,7 +239,7 @@ mod tests {
     fn anim_popup_close_progress_fades_out() {
         let end = surface_out(SURFACE_SECS);
         assert!(nearly_equal(end.opacity, 0.0));
-        assert!(nearly_equal(end.slide, 0.0));
+        assert!(nearly_equal(end.slide, 1.0));
     }
 
     #[test]
