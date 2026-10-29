@@ -34,7 +34,7 @@ jobs:
           }
           Write-Host "TLS wiring OK: native-tls feature + tls_connector in http.rs"
 
-      - name: Unit tests (TLS + monitor selection + dock layout)
+      - name: Unit tests (TLS + monitor selection + dock layout + dock edge)
         # cargo test accepts only one TESTNAME filter per invocation.
         shell: pwsh
         run: |
@@ -45,6 +45,10 @@ jobs:
           cargo test --locked dock_appbar_strip -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked dock_layout_ -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked dock_edge_ -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked git_stats_ -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify static CRT dependencies

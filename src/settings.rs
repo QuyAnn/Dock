@@ -438,6 +438,9 @@ pub struct Settings {
     pub glass_opacity: u8,
     /// "hidden" or "autohide".
     pub taskbar_mode: String,
+    /// Screen edge of the dock: "auto" (follow the Windows taskbar position) or
+    /// "top" / "bottom" / "left" / "right".
+    pub dock_edge: String,
     pub launch_at_startup: bool,
     /// SmartDock's own Shell_TrayWnd listener (tray icons in the ^ popup). Kill switch.
     pub tray_service: bool,
@@ -479,6 +482,8 @@ pub struct Settings {
     pub currency_from: String,
     pub currency_to: String,
     pub currency_amount: f64,
+    /// Control Center modules in order (Edit Controls); None is the default layout.
+    pub cc_modules: Option<Vec<String>>,
 }
 
 impl Default for Settings {
@@ -486,6 +491,7 @@ impl Default for Settings {
         Self {
             glass_opacity: 55,
             taskbar_mode: "hidden".to_owned(),
+            dock_edge: "auto".to_owned(),
             launch_at_startup: false,
             tray_service: true,
             tiles: TileSettings::default(),
@@ -511,6 +517,7 @@ impl Default for Settings {
             currency_from: "USD".into(),
             currency_to: "VND".into(),
             currency_amount: 1.0,
+            cc_modules: None,
         }
     }
 }
@@ -538,6 +545,9 @@ pub fn load() -> Settings {
     settings.layout.normalize();
     if settings.taskbar_mode != "autohide" && settings.taskbar_mode != "hidden" {
         settings.taskbar_mode = "hidden".to_owned();
+    }
+    if !matches!(settings.dock_edge.as_str(), "auto" | "top" | "bottom" | "left" | "right") {
+        settings.dock_edge = "auto".to_owned();
     }
     if settings.weather_location.trim().is_empty() {
         settings.weather_location = "Hanoi".to_owned();

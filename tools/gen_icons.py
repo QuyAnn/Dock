@@ -1,0 +1,100 @@
+import math
+def f(v): 
+    s=f"{v:.2f}".rstrip('0').rstrip('.'); return s if s!='-0' else '0'
+def circ(cx,cy,r):
+    return f"M{f(cx-r)} {f(cy)}A{f(r)} {f(r)} 0 1 0 {f(cx+r)} {f(cy)}A{f(r)} {f(r)} 0 1 0 {f(cx-r)} {f(cy)}Z"
+def arc_up(cx,cy,r,deg):
+    a=math.radians(deg); x0=cx-r*math.sin(a); y=cy-r*math.cos(a); x1=cx+r*math.sin(a)
+    return f"M{f(x0)} {f(y)}A{f(r)} {f(r)} 0 0 1 {f(x1)} {f(y)}"
+def arc_right(cx,cy,r,deg):
+    a=math.radians(deg); x=cx+r*math.cos(a); y0=cy-r*math.sin(a); y1=cy+r*math.sin(a)
+    return f"M{f(x)} {f(y0)}A{f(r)} {f(r)} 0 0 1 {f(x)} {f(y1)}"
+def rrect(x0,y0,x1,y1,r):
+    return (f"M{f(x0+r)} {f(y0)}H{f(x1-r)}A{f(r)} {f(r)} 0 0 1 {f(x1)} {f(y0+r)}V{f(y1-r)}A{f(r)} {f(r)} 0 0 1 {f(x1-r)} {f(y1)}"
+            f"H{f(x0+r)}A{f(r)} {f(r)} 0 0 1 {f(x0)} {f(y1-r)}V{f(y0+r)}A{f(r)} {f(r)} 0 0 1 {f(x0+r)} {f(y0)}Z")
+def gear(cx,cy,ro,ri,n,tw):
+    pts=[]
+    for k in range(n):
+        a=2*math.pi*k/n - math.pi/2
+        half_out=tw/2/ro; half_in=(2*math.pi/n)/2 - 0.04
+        half_base=tw/2/ri+0.12
+        for ang,r in [(a-half_base,ri),(a-half_out,ro),(a+half_out,ro),(a+half_base,ri)]:
+            pts.append((cx+r*math.cos(ang),cy+r*math.sin(ang)))
+    d="M"+" L".join(f"{f(x)} {f(y)}" for x,y in pts)+"Z"
+    return d
+def moon():
+    c1=(11.2,12.8); r1=8.8; c2=(16.6,7.4); r2=6.9
+    dx,dy=c2[0]-c1[0],c2[1]-c1[1]; d=math.hypot(dx,dy)
+    a=(r1*r1-r2*r2+d*d)/(2*d); h=math.sqrt(r1*r1-a*a)
+    px,py=c1[0]+a*dx/d,c1[1]+a*dy/d
+    p1=(px+h*dy/d,py-h*dx/d); p2=(px-h*dy/d,py+h*dx/d)
+    return f"M{f(p1[0])} {f(p1[1])}A{f(r1)} {f(r1)} 0 1 0 {f(p2[0])} {f(p2[1])}A{f(r2)} {f(r2)} 0 0 1 {f(p1[0])} {f(p1[1])}Z"
+def sun(rc, rays_in, rays_out, dots=False):
+    parts=[(circ(12,12,rc),'S')]
+    if dots:
+        parts.append(("".join(circ(12+rays_in*math.cos(k*math.pi/4),12+rays_in*math.sin(k*math.pi/4),1.25) for k in range(8)),'F'))
+    else:
+        parts.append(("".join(f"M{f(12+rays_in*math.cos(k*math.pi/4))} {f(12+rays_in*math.sin(k*math.pi/4))}L{f(12+rays_out*math.cos(k*math.pi/4))} {f(12+rays_out*math.sin(k*math.pi/4))}" for k in range(8)),'S'))
+    return parts
+def u(phi): return (math.sin(phi), -math.cos(phi))
+def add(a,b,k=1): return (a[0]+k*b[0], a[1]+k*b[1])
+def P(p): return f"{f(p[0])} {f(p[1])}"
+def wedge(A, R, th, rc):
+    """Rounded pie sector of outer radius R (incl. rounding), apex rounded with rc; A = sharp apex."""
+    th=math.radians(th)
+    # shrink: inner sector apex A' moved up so offset edges pass through the sharp apex lines
+    Ap = add(A, (0,-1), rc/math.sin(th))
+    Rp = R - rc - rc/math.sin(th)
+    nr=(math.cos(th), math.sin(th)); nl=(-math.cos(th), math.sin(th))
+    El=add(Ap,u(-th),Rp); Er=add(Ap,u(th),Rp)
+    p1=add(El,u(-th),rc); p2=add(Er,u(th),rc); p3=add(Er,nr,rc); p4=add(Ap,nr,rc); p5=add(Ap,nl,rc); p6=add(El,nl,rc)
+    ro=Rp+rc
+    return (f"M{P(p1)}A{f(ro)} {f(ro)} 0 0 1 {P(p2)}A{f(rc)} {f(rc)} 0 0 1 {P(p3)}L{P(p4)}"
+            f"A{f(rc)} {f(rc)} 0 0 1 {P(p5)}L{P(p6)}A{f(rc)} {f(rc)} 0 0 1 {P(p1)}Z")
+def band(A, rm, t, th):
+    th=math.radians(th); rc=t/2
+    El=add(A,u(-th),rm); Er=add(A,u(th),rm)
+    p1=add(A,u(-th),rm+rc); p2=add(A,u(th),rm+rc); p3=add(A,u(th),rm-rc); p4=add(A,u(-th),rm-rc)
+    return (f"M{P(p1)}A{f(rm+rc)} {f(rm+rc)} 0 0 1 {P(p2)}A{f(rc)} {f(rc)} 0 0 1 {P(p3)}"
+            f"A{f(rm-rc)} {f(rm-rc)} 0 0 0 {P(p4)}A{f(rc)} {f(rc)} 0 0 1 {P(p1)}Z")
+# Filled Wi-Fi fan, fitted to the macOS/iOS glyph (IoU 0.92 on the reference): a rounded wedge and
+# two fully rounded bands on one centre; bands sweep +-39 deg, the wedge +-50 deg.
+WIFI_T=2.5; WIFI_GAP=1.9; WIFI_RW=4.1; WIFI_CY=18.55
+WIFI_R2=WIFI_RW+WIFI_GAP+WIFI_T/2; WIFI_R3=WIFI_R2+WIFI_T+WIFI_GAP
+
+ICONS={
+ 'WIFI_DOT':[(wedge((12,WIFI_CY),WIFI_RW,50,0.9),'F')],
+ 'WIFI_ARC1':[(band((12,WIFI_CY),WIFI_R2,WIFI_T,39),'F')],
+ 'WIFI_ARC2':[(band((12,WIFI_CY),WIFI_R3,WIFI_T,39),'F')],
+ 'WIFI_SLASH':[("M4.4 3.6L19.6 21",'B')],
+ 'BLUETOOTH':[("M6.9 7.7L16.9 16.2L12 20.7V3.3L16.9 7.8L6.9 16.3",'B')],
+ 'NETWORK':[("M7.8 6.6L3 12L7.8 17.4M16.2 6.6L21 12L16.2 17.4",'B'),(circ(9.6,12,1.75)+circ(14.4,12,1.75),'F')],
+ 'MOON':[(moon(),'R')],
+ 'SPEAKER':[("M2.8 9.2H6.2L10.8 5.2V18.8L6.2 14.8H2.8Z",'R')],
+ 'WAVE1':[(arc_right(11.2,12,3.4,46),'S')],
+ 'WAVE2':[(arc_right(11.2,12,6.6,46),'S')],
+ 'WAVE3':[(arc_right(11.2,12,9.8,46),'S')],
+ 'MUTE_X':[("M15 9.5L20 14.5M20 9.5L15 14.5",'S')],
+ 'DISPLAY':[(rrect(2.6,3.8,21.4,16.4,2.6),'S'),("M12 16.4V20.2M8.4 20.2H15.6",'S')],
+ 'CALCULATOR':[(rrect(4.8,2.4,19.2,21.6,3.2),'S'),("M8.6 7H15.4",'S'),("".join(circ(x,y,1.15) for y in (11.6,14.8,18) for x in (8.6,12,15.4)),'F')],
+ 'CAMERA':[(rrect(2.4,6.8,21.6,19.6,3.2),'S'),("M8.2 6.8L9.6 4.4H14.4L15.8 6.8",'S'),(circ(12,13.2,3.7),'S')],
+ 'TIMER':[(circ(12,13.6,7.8),'S'),("M12 13.6V9.4M9.6 2.6H14.4M12 2.6V5.8M18.3 6.9L19.8 5.4",'S')],
+ 'GEAR':[(gear(12,12,9.6,7.1,8,3.4),'S'),(circ(12,12,3.1),'S')],
+ 'SUN_MIN':sun(3.9,8.0,0,True),
+ 'SUN_MAX':sun(4.3,7.4,10.0),
+ 'PREV':[("M11.4 6L3.4 12L11.4 18ZM20.4 6L12.4 12L20.4 18Z",'R')],
+ 'NEXT':[("M3.6 6L11.6 12L3.6 18ZM12.6 6L20.6 12L12.6 18Z",'R')],
+ 'PLAY':[("M7.4 4.8L19 12L7.4 19.2Z",'R')],
+ 'PAUSE':[(rrect(5.8,4.6,10,19.4,1.4)+rrect(14,4.6,18.2,19.4,1.4),'F')],
+ 'CHEVRON':[("M9 5.4L15.6 12L9 18.6",'S')],
+ 'BACK':[("M15 5.4L8.4 12L15 18.6",'S')],
+ 'MUSIC':[("M9.2 17.6V6.4L19.4 4.2V15.6",'S'),(circ(6.6,17.6,2.7)+circ(16.8,15.6,2.7),'F')],
+}
+if __name__=='__main__':
+    import sys
+    if sys.argv[1]=='rust':
+        out=["// Generated by tools/gen_icons.py: 24x24 design grid, stroke kinds S (stroke), B (bold stroke), F (fill), R (rounded fill).",""]
+        for k,parts in ICONS.items():
+            items=", ".join(f'("{d}", K::{ {"S":"Stroke","F":"Fill","R":"Round","B":"Bold"}[t]})' for d,t in parts)
+            out.append(f"pub const {k}: &[(&str, K)] = &[{items}];")
+        print("\n".join(out))

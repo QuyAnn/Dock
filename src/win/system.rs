@@ -78,6 +78,9 @@ pub fn set_dark_mode(dark: bool) -> Result<()> {
 }
 
 pub fn open_settings(page: &str) -> Result<()> {
+    // Control actions run on short-lived worker threads; ShellExecute needs COM there to
+    // delegate `ms-settings:` URIs to the protocol handler reliably.
+    let _com = super::com::Apartment::sta();
     let uri = windows::core::HSTRING::from(page);
     let result = unsafe {
         ShellExecuteW(None, w!("open"), &uri, None, None, SW_SHOWNORMAL)
@@ -242,6 +245,64 @@ pub fn set_mute(mute: bool) -> Result<()> {
     unsafe { vol.SetMute(if mute { TRUE } else { FALSE }, ptr::null()) }
 }
 
+// ---------- microphone (default capture endpoint) ----------
+
+fn capture_volume() -> Result<IAudioEndpointVolume> {
+    init_com();
+    // SAFETY: COM is initialized on this thread.
+    unsafe {
+        let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+        let device = enumerator.GetDefaultAudioEndpoint(windows::Win32::Media::Audio::eCapture, eConsole)?;
+        device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
+    }
+}
+
+/// Mute state of the default microphone; None when there is no capture device.
+pub fn mic_muted() -> Option<bool> {
+    let vol = capture_volume().ok()?;
+    // SAFETY: vol is a live IAudioEndpointVolume.
+    unsafe { vol.GetMute().ok().map(|m| m.0 != 0) }
+}
+
+pub fn set_mic_mute(mute: bool) -> Result<()> {
+    let vol = capture_volume()?;
+    // SAFETY: vol is live; a null event context is allowed.
+    unsafe { vol.SetMute(if mute { TRUE } else { FALSE }, ptr::null()) }
+}
+
+// ---------- session ----------
+
+/// Locks the workstation (same as Win+L).
+pub fn lock_screen() -> Result<()> {
+    // SAFETY: plain Win32 call.
+    unsafe { windows::Win32::System::Shutdown::LockWorkStation() }
+}
+
+/// Puts the PC to sleep (not hibernate).
+pub fn sleep_now() -> Result<()> {
+    // SAFETY: plain Win32 call; returns FALSE on failure.
+    let ok = unsafe { windows::Win32::System::Power::SetSuspendState(false, false, false) };
+    if ok.as_bool() { Ok(()) } else { Err(E_FAIL.into()) }
+}
+
+/// Opens the Windows clipboard history (Win+V) for the foreground window.
+pub fn clipboard_history() -> Result<()> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LWIN,
+    };
+    const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
+    let key = |vk: VIRTUAL_KEY, up: bool| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT { wVk: vk, dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() }, ..Default::default() },
+        },
+    };
+    let inputs = [key(VK_LWIN, false), key(VK_V, false), key(VK_V, true), key(VK_LWIN, true)];
+    // SAFETY: the inputs array is valid for the call.
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent == inputs.len() as u32 { Ok(()) } else { Err(E_FAIL.into()) }
+}
+
 // ---------- brightness (DDC/CI, primary monitor) ----------
 
 /// Runs `f` with the first physical monitor of the primary display, then destroys the handles.
@@ -375,6 +436,53 @@ pub fn wifi_signal() -> Option<u8> {
         }
         let _ = WlanCloseHandle(h, None);
         best
+    }
+}
+
+/// SSID of the first connected WLAN interface; None when no interface is connected.
+/// Blocking (WLAN service round trip): call from a background thread only.
+pub fn wifi_ssid() -> Option<String> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::NetworkManagement::WiFi::{
+        wlan_interface_state_connected, wlan_intf_opcode_current_connection, WlanCloseHandle, WlanEnumInterfaces,
+        WlanFreeMemory, WlanOpenHandle, WlanQueryInterface, WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
+    };
+    // SAFETY: as in `wifi_signal`: every WLAN allocation is freed and the handle closed; the SSID
+    // length is clamped to the 32-byte buffer.
+    unsafe {
+        let mut version = 0u32;
+        let mut h = HANDLE::default();
+        if WlanOpenHandle(2, None, &mut version, &mut h) != 0 {
+            return None;
+        }
+        let mut ssid: Option<String> = None;
+        let mut list: *mut WLAN_INTERFACE_INFO_LIST = std::ptr::null_mut();
+        if WlanEnumInterfaces(h, None, &mut list) == 0 && !list.is_null() {
+            let n = (*list).dwNumberOfItems as usize;
+            let items = std::slice::from_raw_parts((*list).InterfaceInfo.as_ptr(), n);
+            for it in items {
+                if ssid.is_some() || it.isState != wlan_interface_state_connected {
+                    continue;
+                }
+                let mut size = 0u32;
+                let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+                if WlanQueryInterface(h, &it.InterfaceGuid, wlan_intf_opcode_current_connection, None, &mut size, &mut data, None) == 0
+                    && !data.is_null()
+                {
+                    let attr = &*(data as *const WLAN_CONNECTION_ATTRIBUTES);
+                    let raw = &attr.wlanAssociationAttributes.dot11Ssid;
+                    let len = (raw.uSSIDLength as usize).min(raw.ucSSID.len());
+                    let name = String::from_utf8_lossy(&raw.ucSSID[..len]).trim().to_string();
+                    if !name.is_empty() {
+                        ssid = Some(name);
+                    }
+                    WlanFreeMemory(data);
+                }
+            }
+            WlanFreeMemory(list as *const std::ffi::c_void);
+        }
+        let _ = WlanCloseHandle(h, None);
+        ssid
     }
 }
 

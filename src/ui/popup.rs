@@ -46,6 +46,8 @@ struct Popup {
     /// Liquid Glass backdrop cut from the wallpaper at this popup's position; None until the
     /// wallpaper is decoded (plain acrylic panel then).
     backdrop: Option<Arc<LiquidBitmap>>,
+    /// Control Center-only mode: body modules float over the transparent window without a panel.
+    floating_modules: bool,
 }
 
 impl Drop for Popup {
@@ -66,6 +68,7 @@ thread_local! {
     static DRAG: Cell<Option<fn(DragPhase, f32, f32) -> bool>> = const { Cell::new(None) };
     static TICK: Cell<Option<fn()>> = const { Cell::new(None) };
     static RCLICK: Cell<Option<fn(f32, f32)>> = const { Cell::new(None) };
+    static ESC: Cell<Option<fn() -> bool>> = const { Cell::new(None) };
     /// True between a captured mouse-down and its mouse-up.
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
     static LAST_POS: Cell<(f32, f32)> = const { Cell::new((0.0, 0.0)) };
@@ -87,6 +90,41 @@ pub enum DragPhase {
 /// every WM_MOUSEMOVE (`Move`) and the release (`Up`) go to it instead of the click handler.
 pub fn set_drag_handler(f: fn(DragPhase, f32, f32) -> bool) {
     DRAG.with(|c| c.set(Some(f)));
+}
+
+/// Called on an Esc press before the popup closes; returning true keeps it open (the handler
+/// consumed Esc, e.g. to leave Control Center edit mode).
+pub fn set_esc_handler(f: fn() -> bool) {
+    ESC.with(|c| c.set(Some(f)));
+}
+
+/// Anchor of the open (or last shown) popup, in screen pixels.
+pub fn anchor() -> Option<RectF> {
+    POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|pw| pw.anchor)))
+}
+
+/// Client size of the popup window in DIPs.
+pub fn size_dip() -> Option<(f32, f32)> {
+    POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|pw| pw.renderer.size())))
+}
+
+/// Tallest popup (DIPs) that fits between `anchor` and the far screen edge.
+pub fn max_height_for(anchor: RectF) -> f32 {
+    let dpi = dpi::system_dpi();
+    let monitor = monitor_rect(anchor);
+    let margin = dpi::dip_to_px(MARGIN, dpi);
+    let gap = dpi::dip_to_px(GAP, dpi);
+    if beside_side_dock(crate::win::edge::current(), anchor, monitor) {
+        // Beside a left/right dock the popup may use the monitor's full height.
+        return (monitor.bottom - monitor.top - 2 * margin).max(1) as f32 * 96.0 / dpi as f32;
+    }
+    let below = anchor.y + anchor.h / 2.0 < (monitor.top + monitor.bottom) as f32 / 2.0;
+    let px = if below {
+        monitor.bottom - margin - ((anchor.y + anchor.h).round() as i32 + gap)
+    } else {
+        anchor.y.round() as i32 - gap - (monitor.top + margin)
+    };
+    px.max(1) as f32 * 96.0 / dpi as f32
 }
 
 /// Receives right clicks (button up) inside the popup, in client DIPs.
@@ -194,6 +232,18 @@ pub fn show_centered(width: f32, height: i32) -> Result<()> {
 /// Opens the popup above (or below, if the anchor is in the top half) `anchor`, centered on it.
 /// `anchor` and the result are in screen coordinates. Replaces any open popup.
 pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
+    show_impl(anchor, width, height, false)
+}
+
+/// Opens the shared popup window without its usual outer panel. The body painter can still sample
+/// the one cached popup backdrop, allowing independent glass modules without per-frame captures.
+pub fn show_floating_modules(anchor: RectF, width: f32, height: i32) -> Result<()> {
+    show_impl(anchor, width, height, true)
+}
+
+fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> Result<()> {
+    // Popups follow the system appearance: smoky dark or milky light glass.
+    super::glass::set_control_dark(crate::win::system::dark_mode());
     let dpi = dpi::system_dpi();
     let width_px = dpi::dip_to_px(width, dpi);
     let height_px = dpi::dip_to_px(height as f32, dpi);
@@ -209,6 +259,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         let mut state = p.borrow_mut();
         let Some(pw) = state.as_mut() else { return false };
         pw.anchor = anchor;
+        pw.floating_modules = floating_modules;
         pw.mouse_down = true;
         pw.esc_down = true;
         // Swapping popups: take the old one off screen first so the grab behind the new one is clean.
@@ -221,7 +272,7 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         }
         pw.renderer.release();
         if let Some(bg) = pw.backdrop.take() { super::glass::release_backdrop(&bg); }
-        pw.backdrop = super::glass::popup_backdrop(rect, monitor, dpi);
+        pw.backdrop = super::glass::popup_backdrop_for(rect, monitor, dpi, true);
         pw.renderer.resize(width_px, height_px, dpi);
         unsafe {
             let _ = SetWindowPos(
@@ -269,7 +320,8 @@ pub fn show(anchor: RectF, width: f32, height: i32) -> Result<()> {
         anchor,
         mouse_down: true,
         esc_down: true,
-        backdrop: super::glass::popup_backdrop(rect, monitor, dpi),
+        backdrop: super::glass::popup_backdrop_for(rect, monitor, dpi, true),
+        floating_modules,
     };
     style_window(hwnd);
     POPUP.with(|p| *p.borrow_mut() = Some(pw));
@@ -316,10 +368,43 @@ fn monitor_rect(anchor: RectF) -> RECT {
 }
 
 fn popup_rect_for(anchor: RectF, width: i32, height: i32, dpi: u32, monitor: RECT) -> RECT {
+    popup_rect_on(crate::win::edge::current(), anchor, width, height, dpi, monitor)
+}
+
+/// True when `anchor` sits on the dock of a left/right `edge` (its centre within the outer
+/// quarter of the monitor on that side): such popups open beside the dock.
+fn beside_side_dock(edge: crate::win::edge::AbEdge, anchor: RectF, monitor: RECT) -> bool {
+    use crate::win::edge::AbEdge;
+    let cx = anchor.x + anchor.w / 2.0;
+    let quarter = (monitor.right - monitor.left) as f32 / 4.0;
+    match edge {
+        AbEdge::Left => cx < monitor.left as f32 + quarter,
+        AbEdge::Right => cx > monitor.right as f32 - quarter,
+        _ => false,
+    }
+}
+
+/// Popup window rect (physical px) for a dock on `edge`: above a bottom dock / below a top dock
+/// (the anchor's half of the monitor decides, as always), beside a left or right dock, centred
+/// on the anchor along the dock and kept `MARGIN` inside the monitor.
+pub(crate) fn popup_rect_on(edge: crate::win::edge::AbEdge, anchor: RectF, width: i32, height: i32, dpi: u32, monitor: RECT) -> RECT {
+    use crate::win::edge::AbEdge;
     let margin = dpi::dip_to_px(MARGIN, dpi);
     let gap = dpi::dip_to_px(GAP, dpi);
     let min_x = monitor.left + margin;
     let max_x = (monitor.right - width - margin).max(min_x);
+    if beside_side_dock(edge, anchor, monitor) {
+        let x = if edge == AbEdge::Left {
+            (anchor.x + anchor.w).round() as i32 + gap
+        } else {
+            anchor.x.round() as i32 - width - gap
+        }
+        .clamp(min_x, max_x);
+        let min_y = monitor.top + margin;
+        let max_y = (monitor.bottom - height - margin).max(min_y);
+        let y = ((anchor.y + anchor.h / 2.0).round() as i32 - height / 2).clamp(min_y, max_y);
+        return RECT { left: x, top: y, right: x + width, bottom: y + height };
+    }
     let x = ((anchor.x + anchor.w / 2.0).round() as i32 - width / 2).clamp(min_x, max_x);
     let below = anchor.y + anchor.h / 2.0 < (monitor.top + monitor.bottom) as f32 / 2.0;
     let preferred_y = if below {
@@ -501,6 +586,48 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
     }
 }
 
+/// Every non-Control-Center popup panel in the Control Center's clear glass: the CC panel layer
+/// (light DPI-correct detail blur, local adaptive smoke, thin lens rim) instead of the milky
+/// popup frost, white text with the brightness-adaptive halo, and dark ink only over a
+/// near-white page (the CC rule, `update_control_ink`). `body` paints the content at `rect`.
+/// Needs the popup backdrop set (`glass::set_backdrop`) and `glass::set_control_dark`.
+pub(crate) fn paint_clear_glass(
+    r: &mut super::renderer::Renderer,
+    rect: RectF,
+    radius: f32,
+    body: impl FnOnce(&mut super::renderer::Renderer, RectF),
+) -> windows::core::Result<()> {
+    use super::{glass, renderer};
+    glass::update_control_ink(rect);
+    glass::set_cc_clear(true);
+    renderer::set_halo_sampler(Some(glass::local_brightness));
+    let ink = glass::control_ink_dark();
+    // Over a near-white page the clear panel would let the page's own text compete with the
+    // popup's (the Control Center has its module cards for that): a light white veil, as macOS
+    // does on bright pages. Darker backdrops keep the pure clear glass and its adaptive smoke.
+    let res = glass::draw_control_panel(r, rect, radius).and_then(|_| {
+        if ink {
+            let rr = radius.min(rect.w / 2.0).min(rect.h / 2.0);
+            r.fill_rounded_rect(rect, rr, 0xFFFF_FF5C)
+        } else {
+            Ok(())
+        }
+    });
+    renderer::set_light_ink(ink);
+    renderer::set_text_shadow(!ink);
+    // Heavier popup type (the Control Center sets its own weights).
+    renderer::set_popup_text(true);
+    if res.is_ok() {
+        body(r, rect);
+    }
+    renderer::set_popup_text(false);
+    renderer::set_text_shadow(false);
+    renderer::set_light_ink(false);
+    renderer::set_halo_sampler(None);
+    glass::set_cc_clear(false);
+    res
+}
+
 fn paint() {
     POPUP.with(|p| {
         // Skip the frame if the state is already borrowed; the next WM_PAINT retries.
@@ -514,18 +641,25 @@ fn paint() {
             let res = pw.renderer.begin().and_then(|_| {
                 // Apple-style continuous-looking corners: the window is fully transparent and the
                 // panel is drawn (anti-aliased) with its own radius.
-                let radius = if super::glass::panel_light() { 24.0 } else { 14.0 };
-                match &backdrop {
-                    Some(bd) => {
-                        super::glass::set_backdrop(Some(bd.clone()), w, h);
-                        super::glass::draw_panel_glass(&mut pw.renderer, rect, radius)?;
+                let radius = if super::glass::panel_light() { 24.0 } else { 18.0 };
+                // Every popup shares the Control Center glass (captured once per open).
+                super::glass::set_backdrop(backdrop.clone(), w, h);
+                let painter = PAINTER.with(Cell::get);
+                let res = if pw.floating_modules {
+                    // The Control Center draws its own panel, ink and halo.
+                    if let Some(f) = painter {
+                        f(&mut pw.renderer, rect);
                     }
-                    None => super::glass::draw_panel(&mut pw.renderer, rect, radius)?,
-                }
-                if let Some(f) = PAINTER.with(Cell::get) {
-                    f(&mut pw.renderer, rect);
-                }
+                    Ok(())
+                } else {
+                    paint_clear_glass(&mut pw.renderer, rect, radius, |r, rc| {
+                        if let Some(f) = painter {
+                            f(r, rc);
+                        }
+                    })
+                };
                 super::glass::set_backdrop(None, w, h);
+                res?;
                 pw.renderer.end()
             });
             if let Err(e) = res {
@@ -547,12 +681,13 @@ fn poll() {
         f();
     }
     let close = POPUP.with(|p| {
-        let Ok(mut g) = p.try_borrow_mut() else { return false };
-        let Some(pw) = g.as_mut() else { return false };
+        let Ok(mut g) = p.try_borrow_mut() else { return None };
+        let Some(pw) = g.as_mut() else { return None };
 
         let esc = key_down(VK_ESCAPE);
         let mouse = key_down(VK_LBUTTON) || key_down(VK_RBUTTON) || key_down(VK_MBUTTON);
-        let mut close = esc && !pw.esc_down;
+        let esc_edge = esc && !pw.esc_down;
+        let mut close = esc_edge;
         if mouse && !pw.mouse_down {
             let mut pt = POINT::default();
             let mut rc = RECT::default();
@@ -569,8 +704,14 @@ fn poll() {
         }
         pw.esc_down = esc;
         pw.mouse_down = mouse;
-        close
+        if esc_edge && close { Some(true) } else if close { Some(false) } else { None }
     });
+    // Esc first goes to the handler (outside the POPUP borrow: it may resize the popup).
+    let close = match close {
+        Some(true) => !ESC.with(Cell::get).is_some_and(|f| f()),
+        Some(false) => true,
+        None => false,
+    };
     if close {
         hide();
     }
@@ -595,6 +736,7 @@ mod memory_tests {
         POPUP.with(|p| *p.borrow_mut() = Some(Popup {
             hwnd, renderer, anchor: RectF::default(), mouse_down: false, esc_down: false,
             backdrop: Some(bg.clone()),
+            floating_modules: false,
         }));
         hide();
         paint();
@@ -606,5 +748,36 @@ mod memory_tests {
         });
         assert_eq!(Arc::strong_count(&bg), 1);
         POPUP.with(|p| { p.borrow_mut().take(); });
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::*;
+    use crate::win::edge::AbEdge;
+
+    const MON: RECT = RECT { left: 0, top: 0, right: 1920, bottom: 1080 };
+
+    #[test]
+    fn dock_edge_popup_opens_toward_the_screen() {
+        // Bottom dock: above the anchor; top dock: below it (unchanged rule).
+        let a = RectF { x: 900.0, y: 1028.0, w: 40.0, h: 52.0 };
+        let r = popup_rect_on(AbEdge::Bottom, a, 300, 200, 96, MON);
+        assert!(r.bottom <= 1028 && r.left == 770);
+        let a = RectF { x: 900.0, y: 0.0, w: 40.0, h: 52.0 };
+        let r = popup_rect_on(AbEdge::Top, a, 300, 200, 96, MON);
+        assert!(r.top >= 52 && r.left == 770);
+        // Left dock: right of the dock, centred on the anchor vertically.
+        let a = RectF { x: 0.0, y: 500.0, w: 52.0, h: 40.0 };
+        let r = popup_rect_on(AbEdge::Left, a, 300, 200, 96, MON);
+        assert!(r.left >= 52 && r.top == 420, "{r:?}");
+        // Right dock: left of the dock, clamped inside the monitor near the bottom.
+        let a = RectF { x: 1868.0, y: 1000.0, w: 52.0, h: 40.0 };
+        let r = popup_rect_on(AbEdge::Right, a, 300, 200, 96, MON);
+        assert!(r.right <= 1868 && r.bottom <= 1080, "{r:?}");
+        // An anchor away from the side dock falls back to the above/below rule.
+        let a = RectF { x: 900.0, y: 100.0, w: 40.0, h: 40.0 };
+        let r = popup_rect_on(AbEdge::Left, a, 300, 200, 96, MON);
+        assert!(r.top >= 140);
     }
 }

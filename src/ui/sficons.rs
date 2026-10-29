@@ -1,14 +1,8 @@
-//! macOS menu-bar style status icons (SF Symbols look) drawn as Direct2D geometry:
-//! `wifi` (dot + 3 concentric arcs, upward fan) and `speaker.wave` / `speaker.slash`.
-//! Strokes are anti-aliased with round caps; sizes are in DIPs so they stay crisp at any DPI.
+//! macOS menu-bar style status icons for the dock's Control Center button. Wi-Fi and the speaker
+//! reuse the Control Center icon paths (`ccicons`) so the dock and the panel draw identical glyphs;
+//! the chevron and `switch.2` are drawn here as Direct2D geometry. Sizes are in DIPs.
 use windows::core::Result;
-use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D_POINT_2F,
-    D2D_SIZE_F,
-};
-use windows::Win32::Graphics::Direct2D::{
-    ID2D1GeometrySink, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_SWEEP_DIRECTION_CLOCKWISE,
-};
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN, D2D_POINT_2F};
 
 use super::dock::RectF;
 use super::renderer::Renderer;
@@ -55,6 +49,15 @@ pub fn bars_for(quality: u8) -> u8 {
 }
 
 /// Volume to speaker waves: 0 when silent, then 1/2/3 by thirds.
+/// Volume at or below this counts as silent: the slider there mutes (as on macOS), and the
+/// speaker shows the muted glyph even when the endpoint itself is not muted.
+pub const MUTE_AT: f32 = 0.005;
+
+/// Whether the speaker should read as muted: muted endpoint, or volume at zero.
+pub fn shows_muted(volume: f32, muted: bool) -> bool {
+    muted || volume <= MUTE_AT
+}
+
 pub fn waves_for(volume: f32) -> u8 {
     let v = volume.clamp(0.0, 1.0);
     if v <= 0.005 {
@@ -67,9 +70,6 @@ pub fn waves_for(volume: f32) -> u8 {
         3
     }
 }
-
-const DIM: f32 = 0.35;
-const STROKE: f32 = 1.6;
 
 fn fade(rgba: u32, k: f32) -> u32 {
     let a = ((rgba & 0xFF) as f32 * k.clamp(0.0, 1.0)).round() as u32;
@@ -90,35 +90,6 @@ impl Map {
     }
     fn p(&self, x: f32, y: f32) -> D2D_POINT_2F {
         D2D_POINT_2F { x: self.ox + x * self.s, y: self.oy + y * self.s }
-    }
-}
-
-/// Arc around (cx, cy) of radius `rad`, from `start` degrees (clockwise from 3 o'clock) by `sweep`.
-fn arc(sink: &ID2D1GeometrySink, m: &Map, cx: f32, cy: f32, rad: f32, start: f32, sweep: f32) {
-    let at = |deg: f32| {
-        let a = deg.to_radians();
-        m.p(cx + rad * a.cos(), cy + rad * a.sin())
-    };
-    // SAFETY: the caller's sink is open for the duration of the build closure.
-    unsafe {
-        sink.BeginFigure(at(start), D2D1_FIGURE_BEGIN_HOLLOW);
-        sink.AddArc(&D2D1_ARC_SEGMENT {
-            point: at(start + sweep),
-            size: D2D_SIZE_F { width: rad * m.s, height: rad * m.s },
-            rotationAngle: 0.0,
-            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-            arcSize: D2D1_ARC_SIZE_SMALL,
-        });
-        sink.EndFigure(D2D1_FIGURE_END_OPEN);
-    }
-}
-
-fn line(sink: &ID2D1GeometrySink, m: &Map, a: (f32, f32), b: (f32, f32)) {
-    // SAFETY: the caller's sink is open for the duration of the build closure.
-    unsafe {
-        sink.BeginFigure(m.p(a.0, a.1), D2D1_FIGURE_BEGIN_HOLLOW);
-        sink.AddLine(m.p(b.0, b.1));
-        sink.EndFigure(D2D1_FIGURE_END_OPEN);
     }
 }
 
@@ -143,54 +114,29 @@ pub fn draw_chevron(r: &mut Renderer, rect: RectF, up: bool, rgba: u32) -> Resul
     )
 }
 
-/// SF `wifi`: a rounded wedge at the bottom plus two concentric 90° arcs opening upward, in a
-/// 16x16 design box (the wedge counts as the first bar, as on macOS).
+/// The dock's Wi-Fi status icon: the same filled fan as the Control Center (`ccicons`: a rounded
+/// wedge plus two rounded bands, unlit bands at 30%), scaled so the fan spans the icon box. Off adds
+/// the bold slash, a radio with no link dims the whole fan, and a wired-only link shows the
+/// Control Center's network glyph.
 pub fn draw_wifi(r: &mut Renderer, rect: RectF, state: Wifi, rgba: u32) -> Result<()> {
-    let m = Map::new(rect, 16.0, 16.0);
+    use super::ccicons::{self, Icon};
+    let (cx, cy) = (rect.x + rect.w / 2.0, rect.y + rect.h / 2.0);
     if state == Wifi::Ethernet {
-        // RJ45 plug: body outline, four contact pins inside, cable stub below.
-        let w = 1.6 * m.s;
-        let p = m.p(2.6, 2.4);
-        r.stroke_rounded_rect(RectF { x: p.x, y: p.y, w: 10.8 * m.s, h: 8.4 * m.s }, 1.8 * m.s, rgba, w)?;
-        for x in [5.2f32, 7.1, 8.9, 10.8] {
-            r.draw_geometry_round(|s| Ok(line(s, &m, (x, 2.9), (x, 5.4))), rgba, Some(1.2 * m.s))?;
-        }
-        return r.draw_geometry_round(|s| Ok(line(s, &m, (8.0, 10.8), (8.0, 14.2))), rgba, Some(w));
+        // Chevrons span 18 of 24 grid units: fit them to the box width.
+        return ccicons::draw(r, Icon::Network, cx, cy, rect.w * 24.0 / 18.0, rgba);
     }
-    let (cx, cy) = (8.0, 13.4);
-    let lit = match state {
-        Wifi::Bars(n) => n.min(3),
-        _ => 0,
+    // The fan spans 16.2 grid units wide and ~13.5 tall, centred at y 11.35 (before the 0.6-unit
+    // lift `ccicons` gives it for round badges): undo both so the fan sits centred in the box.
+    let size = (rect.w * 24.0 / 16.2).min(rect.h * 24.0 / 13.5);
+    let unit = size / 24.0;
+    let cy = cy + (12.0 - 11.35 + 0.6) * unit;
+    let (icon, k) = match state {
+        Wifi::Off => (Icon::Wifi { bars: 3, off: true }, 1.0),
+        Wifi::Disconnected => (Icon::Wifi { bars: 3, off: false }, 0.3),
+        Wifi::Bars(n) => (Icon::Wifi { bars: n.clamp(1, 3), off: false }, 1.0),
+        Wifi::Ethernet => unreachable!(),
     };
-    let width = 1.9 * m.s;
-    for (i, rad) in [7.2f32, 10.8].into_iter().enumerate() {
-        let k = if (i as u8 + 1) < lit { 1.0 } else { DIM };
-        r.draw_geometry_round(|s| Ok(arc(s, &m, cx, cy, rad, 225.0, 90.0)), fade(rgba, k), Some(width))?;
-    }
-    // Wedge: apex at the centre, flaring up to a curved top edge.
-    let wedge_k = if matches!(state, Wifi::Bars(_)) { 1.0 } else { DIM };
-    let pt = |deg: f32, rad: f32| {
-        let a = deg.to_radians();
-        (cx + rad * a.cos(), cy + rad * a.sin())
-    };
-    let wedge = |s: &ID2D1GeometrySink| {
-        let pts = [(cx, cy + 0.3), pt(225.0, 4.4), pt(247.5, 4.8), pt(270.0, 5.0), pt(292.5, 4.8), pt(315.0, 4.4)];
-        // SAFETY: the sink is open for this closure.
-        unsafe {
-            s.BeginFigure(m.p(pts[0].0, pts[0].1), D2D1_FIGURE_BEGIN_FILLED);
-            for &(x, y) in &pts[1..] {
-                s.AddLine(m.p(x, y));
-            }
-            s.EndFigure(D2D1_FIGURE_END_CLOSED);
-        }
-        Ok(())
-    };
-    r.draw_geometry_round(wedge, fade(rgba, wedge_k), None)?;
-    r.draw_geometry_round(wedge, fade(rgba, wedge_k), Some(1.0 * m.s))?;
-    if state == Wifi::Off {
-        r.draw_geometry_round(|s| Ok(line(s, &m, (2.6, 2.2), (13.8, 15.0))), rgba, Some(width))?;
-    }
-    Ok(())
+    ccicons::draw(r, icon, cx, cy, size, fade(rgba, k))
 }
 
 /// SF `switch.2` (the macOS Control Center menu-bar icon): two pill outlines, each with a knob,
@@ -208,41 +154,29 @@ pub fn draw_control_center(r: &mut Renderer, rect: RectF, rgba: u32) -> Result<(
     Ok(())
 }
 
-/// SF `speaker.wave.N` (0..=3 waves by `volume`) or `speaker.slash` when muted, 18x16 box.
+/// The dock's speaker: the Control Center speaker (`ccicons`: rounded cone, 0..=3 waves by
+/// `volume`, a cross when muted) scaled to fill the box width.
 pub fn draw_speaker(r: &mut Renderer, rect: RectF, volume: f32, muted: bool, rgba: u32) -> Result<()> {
-    let m = Map::new(rect, 18.0, 16.0);
-    // Rounded speaker cone: fill plus a round-joined stroke of the same colour softens corners.
-    let cone = |s: &ID2D1GeometrySink| {
-        let pts = [(1.4, 6.0), (4.2, 6.0), (7.8, 2.9), (7.8, 13.1), (4.2, 10.0), (1.4, 10.0)];
-        // SAFETY: the sink is open for this closure.
-        unsafe {
-            s.BeginFigure(m.p(pts[0].0, pts[0].1), D2D1_FIGURE_BEGIN_FILLED);
-            for &(x, y) in &pts[1..] {
-                s.AddLine(m.p(x, y));
-            }
-            s.EndFigure(D2D1_FIGURE_END_CLOSED);
-        }
-        Ok(())
-    };
-    r.draw_geometry_round(cone, rgba, None)?;
-    r.draw_geometry_round(cone, rgba, Some(1.1 * m.s))?;
-    let width = STROKE * m.s;
-    if muted {
-        r.draw_geometry_round(|s| Ok(line(s, &m, (1.6, 1.8), (14.6, 14.6))), rgba, Some(width))?;
-        return Ok(());
-    }
-    let n = waves_for(volume);
-    for (i, rad) in [3.4f32, 6.0, 8.6].into_iter().enumerate() {
-        if (i as u8) < n {
-            r.draw_geometry_round(|s| Ok(arc(s, &m, 8.0, 8.0, rad, 320.0, 80.0)), rgba, Some(width))?;
-        }
-    }
-    Ok(())
+    use super::ccicons::{self, Icon};
+    // Cone plus three waves span ~19.2 of 24 grid units wide and 14.1 tall.
+    let size = (rect.w * 24.0 / 19.2).min(rect.h * 24.0 / 14.1);
+    let muted = shows_muted(volume, muted);
+    let icon = Icon::Speaker { waves: if muted { 0 } else { waves_for(volume) }, muted };
+    ccicons::draw(r, icon, rect.x + rect.w / 2.0, rect.y + rect.h / 2.0, size, rgba)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_volume_reads_as_muted() {
+        assert!(shows_muted(0.0, false));
+        assert!(shows_muted(0.004, false));
+        assert!(!shows_muted(0.01, false));
+        assert!(shows_muted(0.5, true));
+        assert!(!shows_muted(0.34, false));
+    }
 
     #[test]
     fn dock_layout_status_icon_levels() {
