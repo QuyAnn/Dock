@@ -43,6 +43,8 @@ struct Popup {
     hwnd: HWND,
     renderer: Renderer,
     anchor: RectF,
+    /// Screen position when fully open (before open/close slide offset).
+    rest: RECT,
     /// Last polled key states. Start as "down" so the click that opened us is ignored.
     mouse_down: bool,
     esc_down: bool,
@@ -105,9 +107,14 @@ pub fn vis_animating() -> bool {
     })
 }
 
-/// Applies layered alpha and finishes a close animation. Returns true while frames are still needed.
+/// Applies layered alpha, slide offset, and finishes a close animation.
 pub fn tick_vis() -> bool {
-    let Some(hwnd) = POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref().map(|pw| pw.hwnd))) else {
+    let info = POPUP.with(|p| {
+        p.try_borrow()
+            .ok()
+            .and_then(|g| g.as_ref().map(|pw| (pw.hwnd, pw.rest, pw.renderer.dpi())))
+    });
+    let Some((hwnd, rest, dpi_value)) = info else {
         VIS.with(|v| v.set(None));
         return false;
     };
@@ -120,6 +127,21 @@ pub fn tick_vis() -> bool {
     super::renderer::set_window_alpha(hwnd, alpha);
     if alpha == 255 {
         super::renderer::clear_window_layered(hwnd);
+    }
+    let slide_px = dpi::dip_to_px((1.0 - frame.slide) * 8.0, dpi_value);
+    let w = rest.right - rest.left;
+    let h = rest.bottom - rest.top;
+    // SAFETY: our popup window; position/size only.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            rest.left,
+            rest.top + slide_px,
+            w,
+            h,
+            SWP_NOACTIVATE,
+        );
     }
     invalidate();
     if let Some(VisAnim::Out(t)) = VIS.with(Cell::get) {
@@ -323,6 +345,7 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
         let mut state = p.borrow_mut();
         let Some(pw) = state.as_mut() else { return false };
         pw.anchor = anchor;
+        pw.rest = rect;
         pw.floating_modules = floating_modules;
         pw.mouse_down = true;
         pw.esc_down = true;
@@ -357,7 +380,9 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
         }
         begin_vis_in();
         super::renderer::set_window_alpha(pw.hwnd, 0);
-        let _ = InvalidateRect(pw.hwnd, None, false);
+        unsafe {
+            let _ = InvalidateRect(pw.hwnd, None, false);
+        }
         true
     });
     if reused {
@@ -386,6 +411,7 @@ fn show_impl(anchor: RectF, width: f32, height: i32, floating_modules: bool) -> 
         hwnd,
         renderer: Renderer::new(hwnd, width_px, height_px, dpi),
         anchor,
+        rest: rect,
         mouse_down: true,
         esc_down: true,
         backdrop: super::glass::popup_backdrop_for(rect, monitor, dpi, true),
@@ -509,7 +535,7 @@ pub fn hide() {
             return;
         }
     }
-    if POPUP.with(|p| p.try_borrow().ok().and_then(|g| g.as_ref()).is_some()) {
+    if POPUP.with(|p| p.try_borrow().ok().is_some_and(|g| g.is_some())) {
         VIS.with(|v| v.set(Some(VisAnim::Out(Instant::now()))));
         super::arm_frame_timer();
         invalidate();
@@ -576,6 +602,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             LRESULT(0)
         }
         WM_TIMER if wp.0 == TIMER_ID => {
+            let _ = tick_vis();
             poll();
             LRESULT(0)
         }
@@ -725,11 +752,8 @@ fn paint() {
             if !unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(pw.hwnd) }.as_bool() { return; }
             let (w, h) = pw.renderer.size();
             let rect = RectF { x: 0.5, y: 0.5, w: w - 1.0, h: h - 1.0 };
-            let frame = presentation();
-            let slide_y = (1.0 - frame.slide) * 8.0;
             let backdrop = pw.backdrop.clone();
             let res = pw.renderer.begin().and_then(|_| {
-                pw.renderer.set_present_transform(w / 2.0, h / 2.0, frame.scale, slide_y)?;
                 // Apple-style continuous-looking corners: the window is fully transparent and the
                 // panel is drawn (anti-aliased) with its own radius.
                 let radius = if super::glass::panel_light() { 24.0 } else { 18.0 };
@@ -751,7 +775,6 @@ fn paint() {
                 };
                 super::glass::set_backdrop(None, w, h);
                 res?;
-                pw.renderer.reset_transform()?;
                 pw.renderer.end()
             });
             if let Err(e) = res {
@@ -826,7 +849,12 @@ mod memory_tests {
         super::super::glass::draw_panel_glass(&mut renderer, RectF { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, 12.0).unwrap();
         renderer.end().unwrap();
         POPUP.with(|p| *p.borrow_mut() = Some(Popup {
-            hwnd, renderer, anchor: RectF::default(), mouse_down: false, esc_down: false,
+            hwnd,
+            renderer,
+            anchor: RectF::default(),
+            rest: RECT::default(),
+            mouse_down: false,
+            esc_down: false,
             backdrop: Some(bg.clone()),
             floating_modules: false,
         }));

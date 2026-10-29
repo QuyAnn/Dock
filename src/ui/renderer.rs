@@ -464,33 +464,6 @@ impl Renderer {
         Ok(())
     }
 
-    /// Scale around (`cx`, `cy`) for open/close presentation. Call `reset_transform` after the frame.
-    pub fn set_present_transform(&mut self, cx: f32, cy: f32, scale: f32, slide_y: f32) -> Result<()> {
-        use windows::Win32::Graphics::Direct2D::Common::D2D1_MATRIX_3X2_F;
-        let (rt, _) = self.parts()?;
-        let s = scale.max(0.01);
-        let m = D2D1_MATRIX_3X2_F {
-            m11: s,
-            m12: 0.0,
-            m21: 0.0,
-            m22: s,
-            m31: cx * (1.0 - s),
-            m32: cy * (1.0 - s) + slide_y,
-        };
-        // SAFETY: `m` lives for the call.
-        unsafe { rt.SetTransform(&m) };
-        Ok(())
-    }
-
-    pub fn reset_transform(&mut self) -> Result<()> {
-        use windows::Win32::Graphics::Direct2D::Common::D2D1_MATRIX_3X2_F;
-        let (rt, _) = self.parts()?;
-        let m = D2D1_MATRIX_3X2_F { m11: 1.0, m22: 1.0, ..Default::default() };
-        // SAFETY: identity matrix for the call.
-        unsafe { rt.SetTransform(&m) };
-        Ok(())
-    }
-
     pub fn fill_rect(&mut self, rect: RectF, rgba: u32) -> Result<()> {
         let (rt, brush) = self.parts()?;
         Self::set_fill_color(brush, rgba);

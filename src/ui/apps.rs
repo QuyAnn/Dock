@@ -181,9 +181,9 @@ thread_local! {
     /// Pointer x in dock-local DIPs (same space as the tile rects), None when not over the dock.
     static POINTER: Cell<Option<f32>> = const { Cell::new(None) };
     static MAG: std::cell::RefCell<MagState> = std::cell::RefCell::new(MagState { centers: Vec::new(), scales: Vec::new() });
-    static POP_SINCE: std::cell::RefCell<HashMap<isize, Instant>> = const { std::cell::RefCell::new(HashMap::new()) };
-    static ATTN_SINCE: std::cell::RefCell<HashMap<isize, Instant>> = const { std::cell::RefCell::new(HashMap::new()) };
-    static SEEN_HWNDS: std::cell::RefCell<HashSet<isize>> = const { std::cell::RefCell::new(HashSet::new()) };
+    static POP_SINCE: std::cell::RefCell<HashMap<isize, Instant>> = std::cell::RefCell::new(HashMap::new());
+    static ATTN_SINCE: std::cell::RefCell<HashMap<isize, Instant>> = std::cell::RefCell::new(HashMap::new());
+    static SEEN_HWNDS: std::cell::RefCell<HashSet<isize>> = std::cell::RefCell::new(HashSet::new());
 }
 
 struct MagState {

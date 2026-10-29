@@ -1579,8 +1579,8 @@ enum DockSurfacePhase {
 }
 
 thread_local! {
-    static DOCK_REST: RefCell<HashMap<isize, (i32, i32)>> = const { RefCell::new(HashMap::new()) };
-    static DOCK_SURFACE: RefCell<HashMap<isize, DockSurfacePhase>> = const { RefCell::new(HashMap::new()) };
+    static DOCK_REST: RefCell<HashMap<isize, (i32, i32)>> = RefCell::new(HashMap::new());
+    static DOCK_SURFACE: RefCell<HashMap<isize, DockSurfacePhase>> = RefCell::new(HashMap::new());
 }
 
 fn note_dock_rest(hwnd: HWND, x: i32, y: i32) {
